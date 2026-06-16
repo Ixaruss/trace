@@ -3,10 +3,8 @@
 using namespace std;
 
 int main() {
-    Bin bin;
-    Bin::build_matrix();
-    Bin::build_elevation_matrix();
-
+    auto k = Bin::getFeasibleGrid(WRITE);
+    Bin::verifyMatrixBin<FeasibleCell>("./feasable.bin",1,k.cells.size());
     return 0;
 }
 

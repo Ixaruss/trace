@@ -1,7 +1,6 @@
 #include "../bin.h"
 #include <cstdint>
 #include <gdal_utils.h>
-#include <filesystem>
 
 using namespace std;
 

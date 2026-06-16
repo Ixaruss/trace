@@ -149,46 +149,15 @@ BoundingBox Bin::getMinimumBoundingBox() {
   #define _FILE_OFFSET_BITS 64
 #endif
 
-FeasibleGrid Bin::getFeasibleGrid(short op, short opt, short limit_ram) {
+FeasibleGrid Bin::getFeasibleGrid(short op, short opt) {
     FeasibleGrid result;
 
     // load vec + elev + slope
-    init({ ALL });
-    if (!vector_loaded) {
+    Bin b;
+    b.init();
+    if (!b.vector_loaded) {
         cerr << "[feasible] ERROR: vec_matrix not loaded\n";
         return result;
-    }
-
-    // ── load slope.bin locally if not already cached ───────────────────────
-    string slope_path = Config::is_available()
-        ? Config::load().output.slope_file
-        : DEFAULT_SLOPE_MATRIX;
-
-    if (!slope_loaded) {
-        size_t slope_n        = (size_t)VEC_ROWS * VEC_COLS;
-        size_t expected_bytes = slope_n * sizeof(float);
-        ifstream sf(slope_path, ios::binary);
-        if (!sf.is_open()) {
-            cerr << "[feasible] WARN: cannot open " << slope_path
-                 << " — slope filter disabled\n";
-        } else {
-            sf.seekg(0, ios::end);
-            size_t file_bytes = (size_t)sf.tellg();
-            sf.seekg(0, ios::beg);
-            if (file_bytes != expected_bytes) {
-                cerr << "[feasible] WARN: slope.bin size mismatch — slope disabled\n";
-            } else {
-                slope_matrix.resize(slope_n);
-                sf.read(reinterpret_cast<char*>(slope_matrix.data()), expected_bytes);
-                if ((size_t)sf.gcount() == expected_bytes) {
-                    slope_loaded = true;
-                    cout << "[feasible] Slope loaded: " << file_bytes / 1e6 << " MB\n";
-                } else {
-                    cerr << "[feasible] WARN: short read on slope.bin — slope disabled\n";
-                    slope_matrix.clear();
-                }
-            }
-        }
     }
 
     // ── grid bounds ────────────────────────────────────────────────────────
@@ -198,26 +167,26 @@ FeasibleGrid Bin::getFeasibleGrid(short op, short opt, short limit_ram) {
 
     if (opt == 1) {
         r_min = 0; c_min = 0;
-        r_max = VEC_ROWS; c_max = VEC_COLS;
+        r_max = b.VEC_ROWS; c_max = b.VEC_COLS;
         cout << "[feasible] opt=1 — scanning entire grid: "
-             << VEC_ROWS << " x " << VEC_COLS << "\n";
+             << b.VEC_ROWS << " x " << b.VEC_COLS << "\n";
     } else {
-        BoundingBox mbr = getMinimumBoundingBox();
-        if (!getGridCoords(mbr.max_lat, mbr.min_lon, r_min, c_min)) {
+        BoundingBox mbr = b.getMinimumBoundingBox();
+        if (!b.getGridCoords(mbr.max_lat, mbr.min_lon, r_min, c_min)) {
             cerr << "[feasible] ERROR: top-left corner out of grid\n";
             return result;
         }
-        if (!getGridCoords(mbr.min_lat, mbr.max_lon, r_max, c_max)) {
+        if (!b.getGridCoords(mbr.min_lat, mbr.max_lon, r_max, c_max)) {
             cerr << "[feasible] ERROR: bottom-right corner out of grid\n";
             return result;
         }
         cout << "[feasible] AABB → rows: [" << r_min << " → " << r_max
              << "] cols: [" << c_min << " → " << c_max << "]\n";
 
-        proj_poly.reserve(conf.area_op.size());
-        for (auto& [lat, lon] : conf.area_op) {
+        proj_poly.reserve(b.conf.area_op.size());
+        for (auto& [lat, lon] : b.conf.area_op) {
             double px, py;
-            if (!latlon_to_projected(lat, lon, px, py)) {
+            if (!b.latlon_to_projected(lat, lon, px, py)) {
                 cerr << "[feasible] ERROR: failed to project polygon vertex\n";
                 return result;
             }
@@ -226,7 +195,7 @@ FeasibleGrid Bin::getFeasibleGrid(short op, short opt, short limit_ram) {
         use_polygon = true;
     }
 
-    bool need_infra = flag_road || flag_rail;
+    bool need_infra = b.flag_road || b.flag_rail;
 
     result.origin_r = r_min;
     result.origin_c = c_min;
@@ -246,36 +215,31 @@ FeasibleGrid Bin::getFeasibleGrid(short op, short opt, short limit_ram) {
         for (int c = c_min; c < c_max; c++) {
 
             if (use_polygon) {
-                double cx = conf.grid.origin_x + (c + 0.5) * RESOLUTION;
-                double cy = conf.grid.origin_y - (r + 0.5) * RESOLUTION;
+                double cx = b.conf.grid.origin_x + (c + 0.5) * RESOLUTION;
+                double cy = b.conf.grid.origin_y - (r + 0.5) * RESOLUTION;
                 if (!Bin::point_in_polygon(cx, cy, proj_poly)) {
                     outside_count++; continue;
                 }
             }
 
-            uint8_t cell = vec_matrix[(size_t)r * VEC_COLS + c];
+            uint8_t cell = b.vec_matrix[(size_t)r * b.VEC_COLS + c];
 
-            if (flag_water_line && (cell & (1 << BIT_WATER_LINE))) { water_count++; continue; }
-            if (flag_water_area && (cell & (1 << BIT_WATER_AREA))) { water_count++; continue; }
-            if (flag_ib         && (cell & (1 << BIT_IB)))         { ib_count++;    continue; }
-
-            if (slope_loaded) {
-                float s = slope_matrix[(size_t)r * VEC_COLS + c];
-                if (s != -9999.0f && s > 10.0f) {
+            if (b.flag_water_line && (cell & (1 << BIT_WATER_LINE))) { water_count++; continue; }
+            if (b.flag_water_area && (cell & (1 << BIT_WATER_AREA))) { water_count++; continue; }
+            if (b.flag_ib         && (cell & (1 << BIT_IB)))         { ib_count++;    continue; }
+            if (b.flag_slope && (cell & (1 << BIT_SLOPE))) {
                     slope_count++; continue;
-                }
             }
 
             if (need_infra) {
-                bool road_ok = flag_road && (cell & (1 << BIT_ROAD));
-                bool rail_ok = flag_rail && (cell & (1 << BIT_RAIL));
+                bool road_ok = b.flag_road && (cell & (1 << BIT_ROAD));
+                bool rail_ok = b.flag_rail && (cell & (1 << BIT_RAIL));
                 if (!road_ok && !rail_ok) { no_infra_count++; continue; }
             }
 
             result.cells.push_back({ r, c, cell });
         }
     }
-
     if (op == WRITE)
         writeBin("./feasable.bin", result.cells);
 
