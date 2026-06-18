@@ -12,8 +12,13 @@ int main(int argc, char** argv) {
     pre_sub->add_flag("-v,--with-images",images,"Generates images for bin visualization");
     pre_sub->add_flag("-c,--count-time",timer,"Counts the time taken for preprocessing");
     pre_sub->add_flag("-a,--all",s,"create all bins");
-    auto viewshed_sub = app.add_subcommand("viewshed", "Calculate viewshed for a given location");
 
+    auto f_sub = app.add_subcommand("feasible", "Build feasible bin for a AOP if no point is provided then . bins & config REQUIRED");
+    f_sub->add_flag("-v,--with-images",images,"Generates images for bin visualization");
+    f_sub->add_flag("-c,--count-time",timer,"Counts the time taken for feasible bin generation");
+    f_sub->add_flag("-a,--full",s,"make feasible bin for full map");
+
+    auto viewshed_sub = app.add_subcommand("viewshed", "Calculate viewshed for a given location");
     double vs_lat = 33.9871;
     double vs_lon = 74.7742;
     float vs_range = 300.0f;
