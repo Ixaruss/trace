@@ -137,14 +137,15 @@ public:
     // could never be initialized — this class wasn't constructible at all.
     ga(ThreadPool& p) : pool(p) {}
 
-    static Chromosome generate_random_chromosome(pair<int,int> range, int length){
+    static Chromosome generate_random_chromosome(FeasibleGrid f,pair<int,int> range, int length){
         random_device rd;
         Chromosome cn(length);
         mt19937 code(rd());
         uniform_int_distribution<int> gen(range.first, range.second);
         for (int i=0; i<length; i++) {
-            cn.radar[i].r = gen(code);
-            cn.radar[i].c = gen(code);
+            // int x = gen(code);
+            // cn.radar[i].r = f.cells[x].r;
+            // cn.radar[i].c = f.cells[x].c;
             // FIX: this called gen(code) twice more here, so it printed
             // different random numbers than what actually got stored above.
             cout << "{" << cn.radar[i].r << "," << cn.radar[i].c << "}" << endl;
@@ -154,6 +155,80 @@ public:
         return cn;
     }
 
+    static std::vector<int> calculate_radar_coverage_overlap(
+        Global&                 g,
+        FeasibleGrid             grid,             // BY VALUE — this chromosome's private copy
+        const std::vector<int>&  radarIndices,      // genes: indices into grid.cells
+        double                   minSpacingCells = 5.0,
+        const std::string&       pngPath = "")
+    {
+        std::vector<int> result(4, 0);
+
+        if (radarIndices.empty() || grid.cells.empty()) return result;
+
+        std::vector<GridPoint> placements;
+        placements.reserve(radarIndices.size());
+        for (int idx : radarIndices) {
+            if (idx < 0 || (size_t)idx >= grid.cells.size()) continue; // guard a stale/out-of-range gene
+            placements.push_back({grid.cells[idx].r, grid.cells[idx].c});
+        }
+        if (placements.empty()) return result;
+
+        // --- [0] spacing gaps: pairwise under-separation within this chromosome ---
+        for (size_t i = 0; i < placements.size(); i++) {
+            for (size_t j = i + 1; j < placements.size(); j++) {
+                double dr = placements[i].r - placements[j].r;
+                double dc = placements[i].c - placements[j].c;
+                if (std::sqrt(dr*dr + dc*dc) < minSpacingCells) result[0]++;
+            }
+        }
+
+        // --- coverage overlap per feasible cell ---
+        for (const auto& p : placements) {
+            // construction lat/lon is a throwaway — position is overwritten
+            // below using the gene's actual (r,c)
+            RadarEngine radar(g, 33.9871, 74.7742, 50.0, 1000.0, 10.0, 30.0, 300.0);
+
+            radar.srcRow = p.r;
+            radar.srcCol = p.c;
+
+            // maxRadiusCells is also position-clamped in the real constructor —
+            // re-derive it here too, or a radar near an edge keeps whatever
+            // radius the throwaway construction position happened to allow.
+            int rawRadius   = (int)std::ceil(radar.maxRangeM / RESOLUTION);
+            int maxPossible = std::min(std::min(p.r, radar.gridRows - p.r - 1),
+                                        std::min(p.c, radar.gridCols - p.c - 1));
+            radar.maxRadiusCells = std::min(rawRadius, std::max(0, maxPossible));
+
+            radar.rowMin = std::max(0, p.r - radar.maxRadiusCells - 1);
+            radar.rowMax = std::min(radar.gridRows, p.r + radar.maxRadiusCells + 2);
+            radar.colMin = std::max(0, p.c - radar.maxRadiusCells - 1);
+            radar.colMax = std::min(radar.gridCols, p.c + radar.maxRadiusCells + 2);
+            short srcTerrain = g.bin.elev_matrix[(size_t)p.r * radar.gridCols + p.c];
+            radar.srcElev = (double)srcTerrain + radar.antennaHeight;
+            radar.boundary = RadarEngine::circleBoundary(p.r, p.c, radar.maxRadiusCells);
+
+            std::vector<uint8_t> mask = radar.computeFast();
+
+            for (auto& cell : grid.cells) {
+                size_t flat = (size_t)cell.r * radar.gridCols + cell.c;
+                if (flat < mask.size() && mask[flat])
+                    cell.overlap++;
+            }
+        }
+
+        // --- bucket final per-cell overlap counts ---
+        for (const auto& cell : grid.cells) {
+            if      (cell.overlap == 1) result[1]++;
+            else if (cell.overlap == 2) result[2]++;
+            else if (cell.overlap >= 3) result[3]++;
+        }
+
+        if (!pngPath.empty())
+            Bin::writeFeasibleGridOverlapPng(grid, pngPath);
+
+        return result;
+    }
     // FIX: Global was passed by value. Global/Bin owns a raw-pointer handle
     // with a custom destructor and no copy ctor, so every call silently
     // shallow-copied it and double-destroyed the handle on return (confirmed
@@ -172,9 +247,7 @@ public:
                 300.0    // max range (km)
         );
         for (size_t k = 0; k < cn.radar.size(); k++){
-            radar.srcRow = cn.radar[k].r;
-            radar.srcCol = cn.radar[k].c;
-            radar.compute(&overlaps);
+            calculate_radar_coverage_overlap(&g,f, const std::vector<int> &radarIndices)
         }
         // FIX: w1..w4 had no initializer and were used immediately — reading
         // uninitialized floats is undefined behavior. Placeholder 1.0s so
@@ -209,7 +282,7 @@ public:
             // FIX: was `population[i] = x` after only reserve() (no resize) —
             // writing into unconstructed memory (confirmed segfault above).
             // push_back is the correct way to grow into reserved capacity.
-            auto x = generate_random_chromosome({0,(int)f.cells.size()-1}, length);
+            auto x = generate_random_chromosome(f,{0,(int)f.cells.size()-1}, length);
             population.push_back(x);
         }
         parallelEvaluatePopulation(population, g);
@@ -234,8 +307,6 @@ public:
 };
 
 int main () {
-    ga::generate_random_chromosome({0, 100}, 5);
-
     ThreadPool pool;
     ga g(pool);
     g.init_population(/*length=*/4);   // radars per chromosome

@@ -237,7 +237,7 @@ public:
 
 class RadarEngine
 {
-private:
+public:
     Global& g;
     int     gridCols, gridRows;
     int     srcRow,   srcCol;

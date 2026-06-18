@@ -65,6 +65,32 @@ public:
                                                       OGRCoordinateTransformation* poForwardCT,
                                                       OGRCoordinateTransformation* poInverseCT,
                                                       double& outLon, double& outLat);
+    static inline FeasibleGrid restrict_to_area_of_operation(Global& g, FeasibleGrid grid) {
+        if (g.bin.conf.area_op.size() < 3) return grid; // no polygon defined, nothing to restrict to
+
+        std::vector<std::pair<double,double>> proj_poly;
+        proj_poly.reserve(g.bin.conf.area_op.size());
+        for (auto& [lat, lon] : g.bin.conf.area_op) {
+            double px, py;
+            if (g.bin.latlon_to_projected(lat, lon, px, py))
+                proj_poly.push_back({px, py});
+        }
+
+        std::vector<FeasibleCell> kept;
+        kept.reserve(grid.cells.size());
+        int dropped = 0;
+        for (auto& cell : grid.cells) {
+            double cx = g.bin.conf.grid.origin_x + (cell.c + 0.5) * RESOLUTION;
+            double cy = g.bin.conf.grid.origin_y - (cell.r + 0.5) * RESOLUTION;
+            if (Bin::point_in_polygon(cx, cy, proj_poly)) kept.push_back(cell);
+            else dropped++;
+        }
+
+        std::cout << "[ao-filter] kept " << kept.size() << " / " << grid.cells.size()
+                  << " (" << dropped << " were bounding-box-but-not-AO)\n";
+        grid.cells = std::move(kept);
+        return grid;
+    }
 
 };
 

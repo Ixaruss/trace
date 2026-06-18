@@ -445,6 +445,53 @@ public:
                 std::cout << "[overlap] PNG written → " << png_path << "\n";
                 return true;
             }
+            public:
+                        // Plots the raw (r,c) of each point as a red dot — presence only,
+                        // no coverage/overlap rendering. Canvas is sized to fit whatever
+                        // coordinates are passed in (same bounding-box approach as the
+                        // FeasibleCell point-cloud branch in verifyMatrixBin), so it works
+                        // for a single chromosome's radars or the whole population's
+                        // combined radars without you having to specify dimensions.
+                        // PointT just needs public `.r`/`.c` int members — GridPoint,
+                        // FeasibleCell, etc. all qualify.
+                        template <typename PointT>
+                        static bool writeRadarScatterPng(const std::vector<PointT>& points, const std::string& png_path) {
+                            if (points.empty()) {
+                                std::cerr << "[radar-viz] FAIL: no points to plot for " << png_path << "\n";
+                                return false;
+                            }
+
+                            int min_r = points[0].r, max_r = points[0].r;
+                            int min_c = points[0].c, max_c = points[0].c;
+                            for (const auto& p : points) {
+                                if (p.r < min_r) min_r = p.r;
+                                if (p.r > max_r) max_r = p.r;
+                                if (p.c < min_c) min_c = p.c;
+                                if (p.c > max_c) max_c = p.c;
+                            }
+
+                            int img_rows = max_r - min_r + 1;
+                            int img_cols = max_c - min_c + 1;
+
+                            std::vector<uint8_t> canvas((size_t)img_rows * img_cols * 3, 0);  // black background
+                            for (const auto& p : points) {
+                                size_t idx = ((size_t)(p.r - min_r) * img_cols + (p.c - min_c)) * 3;
+                                canvas[idx + 0] = 255;  // red — radar present
+                                canvas[idx + 1] = 0;
+                                canvas[idx + 2] = 0;
+                            }
+
+                            bool ok = writeColorPng(png_path, img_cols, img_rows,
+                                                     [&canvas, img_cols](int r, uint8_t* rgbRow) {
+                                                         std::memcpy(rgbRow, &canvas[(size_t)r * img_cols * 3], (size_t)img_cols * 3);
+                                                     });
+                            if (!ok) return false;
+
+                            std::cout << "[radar-viz] PNG written → " << png_path << " (" << points.size()
+                                      << " points, " << img_cols << "x" << img_rows << ")\n";
+                            return true;
+                        }
+
 };
 
 #endif
