@@ -250,7 +250,7 @@ static void print_elev_stats(const int16_t* elevation,const float* slope, size_t
     cout << "[preprocess] nodata    : " << nodata << " (" << (nodata * 100.0 / N) << "%)\n";
 }
 
-void Global::preprocess(bool images, bool timer, bool seperate) {
+void Global::preprocess(bool images, bool timer, bool seperate, int individual) {
     GDALAllRegister();
      chrono::time_point<chrono::steady_clock, chrono::duration<long, ratio<1, 1000000000>>> start,end;
     if (timer){ cout<< ">>> Starting timer count" << endl;
@@ -258,7 +258,7 @@ void Global::preprocess(bool images, bool timer, bool seperate) {
     }
     make_dir("bin");
     if (images) make_dir("image");
-    Bin::build_elevation_matrix();
+    if ( individual == -1 || individual == 6)  Bin::build_elevation_matrix();
     string road_shp, rail_shp, warea_shp, wline_shp, ib_shp, elev_bin_path, opath,slope_path;
     int road_bit, rail_bit, waterarea_bit, waterlines_bit, ib_bit, slope_bit;
     int dist_road, dist_rail, dist_water, dist_ib;
@@ -344,17 +344,28 @@ void Global::preprocess(bool images, bool timer, bool seperate) {
         bool   boundary_only;
         int    index;
     };
+     vector<LayerJob> jobs;
+    if(individual != -1) {
+        switch (individual) {
+            case 1: jobs.push_back({ "road",      road_shp,  dist_road,  false, road_bit }); break;
+            case 2: jobs.push_back({ "rail",      rail_shp,  dist_rail,  false, rail_bit }); break;
+            case 3: jobs.push_back({ "waterarea", warea_shp, dist_water, false, waterarea_bit }); break;
+            case 4: jobs.push_back({ "waterline", wline_shp, dist_water, false, waterlines_bit }); break;
+            case 5: jobs.push_back({ "ib",        ib_shp,    dist_ib,    true, ib_bit  }); break;
+        }
 
-    vector<LayerJob> jobs = {
-        { "road",      road_shp,  dist_road,  false, road_bit },
-        { "rail",      rail_shp,  dist_rail,  false, rail_bit },
-        { "waterarea", warea_shp, dist_water, false, waterarea_bit },
-        { "waterline", wline_shp, dist_water, false, waterlines_bit },
-        { "ib",        ib_shp,    dist_ib,    true, ib_bit  },
-    };
+    }else {
+        jobs.push_back({ "road",      road_shp,  dist_road,  false, road_bit });
+        jobs.push_back({ "rail",      rail_shp,  dist_rail,  false, rail_bit });
+        jobs.push_back({ "waterarea", warea_shp, dist_water, false, waterarea_bit });
+        jobs.push_back({ "waterline", wline_shp, dist_water, false, waterlines_bit });
+        jobs.push_back({ "ib",        ib_shp,    dist_ib,    true, ib_bit  });
+    }
 
-    // ── elevation + slope ──────────────────────────────────────────────────
 
+    // ── elevation + slope
+    int elevTime ;
+    if(individual == 6 || individual ==  -1) {
     cout << "\n=== elevation + slope ===\n";
 
     cout << "[preprocess] reading " << ELEV_C << " x " << ELEV_R << " ElevCell grid from " << elev_bin_path << "\n";
@@ -401,7 +412,7 @@ void Global::preprocess(bool images, bool timer, bool seperate) {
         fclose(sf);
 
         print_elev_stats(elev, slope, read);
-        if (images){
+        if (images || individual){
             uint8_t* rgb_e = elev_to_rgb(elev, read);
             if (rgb_e) {
                 write_png("image/elev.png", ELEV_R, ELEV_C, rgb_e);
@@ -431,11 +442,12 @@ void Global::preprocess(bool images, bool timer, bool seperate) {
     }
 
 
-    int elevTime ;
+
     if(timer){
         end = chrono::steady_clock::now();
        elevTime = chrono::duration_cast<chrono::seconds>(end - start).count();
        start = chrono::steady_clock::now();
+    }
     }
     for (auto& job : jobs) {
         cout << "\n=== " << job.name << " (buffer=" << job.distance << "m) ===\n";
@@ -468,7 +480,7 @@ void Global::preprocess(bool images, bool timer, bool seperate) {
         feasible += final_hits;
         cout << "[preprocess] final hits : " << final_hits << " (" << (final_hits * 100.0 / N) << "%)\n";
 
-        if (seperate) {
+        if (seperate || individual) {
             write_bin_u8("bin/" + job.name + ".bin", buf, N);
         }
 
@@ -482,9 +494,11 @@ void Global::preprocess(bool images, bool timer, bool seperate) {
         free(buf);
     }
 
-    auto f = fopen(opath.c_str(), "wb");
-    fwrite(matrix, 1, N, f);
-    fclose(f);
+   if(individual == -1) {
+       auto f = fopen(opath.c_str(), "wb");
+       fwrite(matrix, 1, N, f);
+       fclose(f);
+   }
 
     int constraintTime;
     if(timer){
@@ -495,12 +509,12 @@ void Global::preprocess(bool images, bool timer, bool seperate) {
     if (images) {
         uint8_t* rgb = mask_to_rgb(matrix, N);
         if (rgb) {
-            write_png("image/combined.png", ROWS, COLS, rgb);
+            if(individual == -1) write_png("image/combined.png", ROWS, COLS, rgb);
             free(rgb);
         }
     }
     if(timer) {
-    cout << "\n>>> Elevation Build took: " << elevTime << " seconds"<< (images ? " (with png writing)" : "") << endl;
+    if (individual == -1) cout << "\n>>> Elevation Build took: " << elevTime << " seconds"<< (images ? " (with png writing)" : "") << endl;
     cout << "\n>>> Combined bin took: " << constraintTime << " seconds" << (images ? " (with png writing)" : "") << endl;
     }
     cout<< "total cells: " << total <<endl;

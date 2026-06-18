@@ -146,7 +146,7 @@ public:
 
     BoundingBox getMinimumBoundingBox();
 
-    static FeasibleGrid getFeasibleGrid(short op = IN_MEM, short opt = 0);
+    static FeasibleGrid getFeasibleGrid(Bin& b, short op = IN_MEM, short opt = 0);
 
     std::pair<double,double> getMapOrigins();
 

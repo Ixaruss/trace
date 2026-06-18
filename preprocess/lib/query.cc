@@ -149,12 +149,9 @@ BoundingBox Bin::getMinimumBoundingBox() {
   #define _FILE_OFFSET_BITS 64
 #endif
 
-FeasibleGrid Bin::getFeasibleGrid(short op, short opt) {
+FeasibleGrid Bin::getFeasibleGrid(Bin& b, short op, short opt) {
     FeasibleGrid result;
 
-    // load vec + elev + slope
-    Bin b;
-    b.init();
     if (!b.vector_loaded) {
         cerr << "[feasible] ERROR: vec_matrix not loaded\n";
         return result;

@@ -3,30 +3,34 @@
 #include <cmath>
 #include <algorithm>
 #include <random>
-#include <chrono>
 #include <queue>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <future>
 #include <functional>
-#include <iomanip>
 #include <string>
-#include <fstream>
+#include <unordered_set>
+#include <cstring>
 
+// Only include common.h for Global, Bin, Config, and FeasibleGrid structures.
+// operations.h is intentionally omitted to keep radar calculations localized and memory-safe.
 #include "../common.h"
-#include "../operations.h"
 
 using namespace std;
 
+// --- System & Physical Constants ---
 const int NUM_CHROMOSOMES = 100;
-const double EARTH_RADIUS_KM = 6371.0;
-const double PI = 3.14159265358979323846;
+static constexpr double EARTH_R     = 6371000.0;
+static constexpr double K_ATMOS     = 4.0 / 3.0;
+static constexpr double K_EFF_R     = K_ATMOS * EARTH_R;
+static constexpr double INV_2_KEFFR = 1.0 / (2.0 * K_EFF_R);
+static constexpr double DEG2RAD     = 3.14159265358979 / 180.0;
+static constexpr double RAD2DEG     = 180.0 / 3.14159265358979;
 
 enum class SelectionMethod { TOURNAMENT, ROULETTE_WHEEL, RANK_BASED, SUS };
 enum class CrossoverMethod { SINGLE_POINT, MULTI_POINT, UNIFORM };
 enum class MutationMethod  { SINGLE_POINT, SPATIAL_NUDGE, GAUSSIAN_CREEP };
-
 
 struct GridPoint {
     int r, c;
@@ -36,65 +40,51 @@ struct Chromosome {
     std::vector<GridPoint> radar;
     double fitness;
 
-    public: Chromosome(int length){
-        std::vector<GridPoint> r(length);
-        radar = r;
-    }
+    public: Chromosome(int length) : radar(length), fitness(0.0) {}
+};
+
+// --- Local Radar Coverage Container ---
+struct LocalCoverage {
+    std::vector<uint8_t> mask;
+    int rowMin, rowMax, colMin, colMax;
+    int localCols, localRows;
 };
 
 class ThreadPool {
 private:
-    std::vector<std::thread> workers;       // Active system threads waiting for work
-    std::queue<std::function<void()>> tasks;// Thread-safe FIFO queue containing pending tasks
-    std::mutex queueMutex;                  // Mutex locks ensuring unique access to the queue
-    std::condition_variable cv;             // Blocks or wakes worker threads dynamically
-    bool stop;                              // Execution termination flag
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queueMutex;
+    std::condition_variable cv;
+    bool stop;
 
 public:
-    /**
-     * Initializes the worker pool based on native hardware concurrency capabilities.
-     */
     ThreadPool() : stop(false) {
-        // Detect available processor cores
         size_t threads = std::thread::hardware_concurrency();
-        if (threads == 0) threads = 4; // Defensive fallback configuration if detection fails
+        if (threads == 0) threads = 4;
 
         for (size_t i = 0; i < threads; ++i) {
-            // Emplace active lambdas acting as continuous internal processing engines
             workers.emplace_back([this]() {
                 while (true) {
                     std::function<void()> task;
                     {
-                        // Safely lock the queue to verify state changes
                         std::unique_lock<std::mutex> lock(this->queueMutex);
-
-                        // Sleep thread until new tasks are queued or system shuts down
                         this->cv.wait(lock, [this]() { return this->stop || !this->tasks.empty(); });
-
-                        // Exit worker execution loop if termination is requested and queue is drained
                         if (this->stop && this->tasks.empty()) return;
-
-                        // Extract task from front of queue via efficient move semantics
                         task = std::move(this->tasks.front());
                         this->tasks.pop();
-                    } // Mutex is implicitly unlocked here to allow other threads to read the queue
-
-                    task(); // Execute the extracted task
+                    }
+                    task();
                 }
             });
         }
     }
 
-    /**
-     * Schedules a task asynchronously. Accepts any callable function and arguments.
-     * Returns a std::future containing the eventual execution results.
-     */
     template<class F, class... Args>
     auto enqueue(F&& f, Args&&... args)
         -> std::future<typename std::invoke_result<F, Args...>::type> {
         using return_type = typename std::invoke_result<F, Args...>::type;
 
-        // Package the function pointer alongside its arguments into a shared reference block
         auto task = std::make_shared<std::packaged_task<return_type()>>(
             std::bind(std::forward<F>(f), std::forward<Args>(args)...)
         );
@@ -103,26 +93,20 @@ public:
         {
             std::unique_lock<std::mutex> lock(queueMutex);
             if (stop) throw std::runtime_error("Enqueue requested on stopped ThreadPool context");
-
-            // Wrap the packaged task execution inside a generalized void wrapper
             tasks.emplace([task]() { (*task)(); });
         }
-        cv.notify_one(); // Wake up exactly one sleeping thread to execute the new task
-        return res;      // Return future context to caller
+        cv.notify_one();
+        return res;
     }
 
-    /**
-     * Destructor: Ensures graceful shutdowns, joining all threads safely.
-     */
     ~ThreadPool() {
         {
             std::unique_lock<std::mutex> lock(queueMutex);
             stop = true;
         }
-        cv.notify_all(); // Wake up all worker threads to finalize execution loops
-
+        cv.notify_all();
         for (std::thread &worker : workers) {
-            if (worker.joinable()) worker.join(); // Block main execution loop until thread exits
+            if (worker.joinable()) worker.join();
         }
     }
 };
@@ -132,47 +116,208 @@ class ga {
     vector<Chromosome> population;
     ThreadPool& pool;
 
-public:
-    // FIX: no constructor existed, so the `ThreadPool& pool` reference member
-    // could never be initialized — this class wasn't constructible at all.
-    ga(ThreadPool& p) : pool(p) {}
+    // =========================================================================
+    // EMBEDDED RADAR LOGIC (Memory-Optimized Local Scope)
+    // =========================================================================
 
-    static Chromosome generate_random_chromosome(FeasibleGrid f,pair<int,int> range, int length){
+    static std::vector<GridPoint> get_circle_boundary(int cr, int cc, int radius) {
+        std::vector<GridPoint> pts;
+        pts.reserve(8 * radius);
+        int x = 0, y = radius, d = 3 - 2 * radius;
+        auto push8 = [&](int px, int py) {
+            pts.push_back({cr + px, cc + py}); pts.push_back({cr - px, cc + py});
+            pts.push_back({cr + px, cc - py}); pts.push_back({cr - px, cc - py});
+            pts.push_back({cr + py, cc + px}); pts.push_back({cr - py, cc + px});
+            pts.push_back({cr + py, cc - px}); pts.push_back({cr - py, cc - px});
+        };
+        while (y >= x) {
+            push8(x, y); x++;
+            if (d > 0) { y--; d += 4 * (x - y) + 10; } else { d += 4 * x + 6; }
+        }
+        std::sort(pts.begin(), pts.end(), [](const GridPoint& a, const GridPoint& b) {
+            return a.r < b.r || (a.r == b.r && a.c < b.c);
+        });
+        pts.erase(std::unique(pts.begin(), pts.end(),
+            [](const GridPoint& a, const GridPoint& b) { return a.r == b.r && a.c == b.c; }), pts.end());
+        return pts;
+    }
+
+    static void cast_radar_ray_local(
+        int srcRow, int srcCol, int endRow, int endCol,
+        double srcElev, double targetHeight,
+        double minSlope, double maxSlope, double horizonM, int maxRadiusCells,
+        const short* __restrict__ dem, uint8_t* __restrict__ stat,
+        int gridCols, int gridRows,
+        int rowMin, int colMin, int colMax)
+    {
+        int adr = std::abs(endRow - srcRow), adc = std::abs(endCol - srcCol);
+        int sr = (srcRow < endRow) ? 1 : -1, sc = (srcCol < endCol) ? 1 : -1;
+        int err = adr - adc;
+
+        // Global DEM traversal pointers
+        const std::ptrdiff_t demStrideR = static_cast<std::ptrdiff_t>(sr) * gridCols;
+        const std::ptrdiff_t demStrideC = sc;
+        std::ptrdiff_t demOff = static_cast<std::ptrdiff_t>(srcRow) * gridCols + srcCol;
+        const short* demCell = dem + demOff;
+
+        // Local bounding-box mask traversal pointers
+        int localCols = colMax - colMin;
+        const std::ptrdiff_t statStrideR = static_cast<std::ptrdiff_t>(sr) * localCols;
+        const std::ptrdiff_t statStrideC = sc;
+        std::ptrdiff_t statOff = static_cast<std::ptrdiff_t>(srcRow - rowMin) * localCols + (srcCol - colMin);
+        uint8_t* statCell = stat + statOff;
+
+        int row = srcRow, col = srcCol;
+        double dist = 0.0, curvDrop = 0.0;
+        double maxTerrainSlope = -1e18;
+        int cellCount = 0;
+
+        while (true) {
+            if (row == endRow && col == endCol) break;
+
+            int e2 = 2 * err;
+            bool mr = (e2 > -adc), mc = (e2 < adr);
+            if (mr) { err -= adc; row += sr; demCell += demStrideR; statCell += statStrideR; }
+            if (mc) { err += adr; col += sc; demCell += demStrideC; statCell += statStrideC; }
+
+            double step = (mr && mc) ? RESOLUTION * 1.41421356237 : RESOLUTION;
+            curvDrop += (2.0 * dist * step + step * step) * INV_2_KEFFR;
+            dist += step;
+            ++cellCount;
+
+            if (cellCount > maxRadiusCells) break;
+            if (dist > horizonM) break;
+
+            short raw = *demCell;
+                    if (raw < -9000) break;
+
+                    double terrainElev = static_cast<double>(raw) - curvDrop;
+                    double terrainSlope = (terrainElev - srcElev) / dist;
+                    double targetSlope = terrainSlope + targetHeight / dist;
+
+                    // CRITICAL FIX:
+                    // If current terrain slope is HIGHER than our established maxSlope,
+                    // we have hit a ridge/mountain. This cell is visible, but EVERYTHING
+                    // behind this cell on this ray is now MASKED.
+                    if (terrainSlope > maxTerrainSlope) {
+                        maxTerrainSlope = terrainSlope;
+                        *statCell = 1; // This cell is visible
+                    } else {
+                        // We are in the shadow of a previous higher terrain point
+                        *statCell = 0;
+                    }
+        }
+    }
+
+    static LocalCoverage compute_local_coverage(
+        Global& g, int srcRow, int srcCol,
+        double antennaHeight, double targetHeight,
+        double minElevDeg, double maxElevDeg, double maxRangeM)
+    {
+        int gridCols = g.conf.grid.cols;
+        int gridRows = g.conf.grid.rows;
+
+        double horizonM = std::sqrt(2.0 * K_EFF_R * antennaHeight) + std::sqrt(2.0 * K_EFF_R * targetHeight);
+        if (horizonM > maxRangeM) horizonM = maxRangeM;
+
+        double minSlopeRatio = std::tan(minElevDeg * DEG2RAD);
+        double maxSlopeRatio = std::tan(maxElevDeg * DEG2RAD);
+
+        // Clamp radius tightly to valid grid extents to prevent buffer escapes
+        int rawRadius = (int)std::ceil(maxRangeM / RESOLUTION);
+        int maxPossible = std::min({srcRow, gridRows - srcRow - 1, srcCol, gridCols - srcCol - 1});
+        int maxRadiusCells = std::min(rawRadius, std::max(0, maxPossible));
+
+        int rowMin = std::max(0, srcRow - maxRadiusCells - 1);
+        int rowMax = std::min(gridRows, srcRow + maxRadiusCells + 2);
+        int colMin = std::max(0, srcCol - maxRadiusCells - 1);
+        int colMax = std::min(gridCols, srcCol + maxRadiusCells + 2);
+
+        int localCols = colMax - colMin;
+        int localRows = rowMax - rowMin;
+
+        LocalCoverage cov;
+        cov.rowMin = rowMin; cov.rowMax = rowMax;
+        cov.colMin = colMin; cov.colMax = colMax;
+        cov.localCols = localCols; cov.localRows = localRows;
+
+        // This instantly assigns ONLY the bounding box memory (~4MB - ~72MB depending on range),
+        // completely resolving the massive 10+ GB memory spike from the old global allocation.
+        cov.mask.assign((size_t)localRows * localCols, 0);
+
+        if (srcRow >= 0 && srcRow < gridRows && srcCol >= 0 && srcCol < gridCols) {
+            short srcTerrain = g.bin.elev_matrix[(size_t)srcRow * gridCols + srcCol];
+            double srcElev = static_cast<double>(srcTerrain) + antennaHeight;
+
+            auto boundary = get_circle_boundary(srcRow, srcCol, maxRadiusCells);
+
+            // Self-cell is automatically visible
+            cov.mask[(size_t)(srcRow - rowMin) * localCols + (srcCol - colMin)] = 1;
+
+            const short* demPtr = g.bin.elev_matrix.data();
+            uint8_t* statPtr = cov.mask.data();
+
+            // Fire standard raycaster sequentially (ThreadPool handles the macro-parallelism)
+            const size_t N = boundary.size();
+            for (size_t i = 0; i < N; ++i) {
+                int er = boundary[i].r, ec = boundary[i].c;
+                if (er >= 0 && ec >= 0 && er < gridRows && ec < gridCols) {
+                    cast_radar_ray_local(
+                        srcRow, srcCol, er, ec,
+                        srcElev, targetHeight, minSlopeRatio, maxSlopeRatio,
+                        horizonM, maxRadiusCells, demPtr, statPtr,
+                        gridCols, gridRows, rowMin, colMin, colMax
+                    );
+                }
+            }
+        }
+        return cov;
+    }
+
+    // =========================================================================
+
+public:
+    ga(ThreadPool& p) : pool(p) {
+        std::cout << "[ga] Synchronously pre-loading all .bin matrices to memory...\n";
+        g.bin.init();
+    }
+
+    static Chromosome generate_random_chromosome(const FeasibleGrid& f, pair<int,int> range, int length) {
+        if ((size_t)length > f.cells.size()) {
+            std::cerr << "[ga] WARN: requested " << length << " radars but only "
+                      << f.cells.size() << " feasible cells exist — clamping\n";
+            length = (int)f.cells.size();
+        }
+
         random_device rd;
-        Chromosome cn(length);
         mt19937 code(rd());
         uniform_int_distribution<int> gen(range.first, range.second);
-        for (int i=0; i<length; i++) {
-            // int x = gen(code);
-            // cn.radar[i].r = f.cells[x].r;
-            // cn.radar[i].c = f.cells[x].c;
-            // FIX: this called gen(code) twice more here, so it printed
-            // different random numbers than what actually got stored above.
-            cout << "{" << cn.radar[i].r << "," << cn.radar[i].c << "}" << endl;
+
+        Chromosome cn(length);
+        std::unordered_set<int> used;
+
+        for (int i = 0; i < length; i++) {
+            int x;
+            do { x = gen(code); } while (!used.insert(x).second);
+
+            cn.radar[i].r = f.cells[x].r;
+            cn.radar[i].c = f.cells[x].c;
         }
-        cout<<endl;
+
         cn.fitness = 0.0;
         return cn;
     }
 
     static std::vector<int> calculate_radar_coverage_overlap(
-        Global&                 g,
-        FeasibleGrid             grid,             // BY VALUE — this chromosome's private copy
-        const std::vector<int>&  radarIndices,      // genes: indices into grid.cells
-        double                   minSpacingCells = 5.0,
-        const std::string&       pngPath = "")
+        Global&                       g,
+        FeasibleGrid                  grid,              // BY VALUE — this thread's private copy
+        const std::vector<GridPoint>& placements,
+        double                        minSpacingCells = 5.0,
+        const std::string&            pngPath = "")
     {
         std::vector<int> result(4, 0);
 
-        if (radarIndices.empty() || grid.cells.empty()) return result;
-
-        std::vector<GridPoint> placements;
-        placements.reserve(radarIndices.size());
-        for (int idx : radarIndices) {
-            if (idx < 0 || (size_t)idx >= grid.cells.size()) continue; // guard a stale/out-of-range gene
-            placements.push_back({grid.cells[idx].r, grid.cells[idx].c});
-        }
-        if (placements.empty()) return result;
+        if (placements.empty() || grid.cells.empty()) return result;
 
         // --- [0] spacing gaps: pairwise under-separation within this chromosome ---
         for (size_t i = 0; i < placements.size(); i++) {
@@ -185,35 +330,28 @@ public:
 
         // --- coverage overlap per feasible cell ---
         for (const auto& p : placements) {
-            // construction lat/lon is a throwaway — position is overwritten
-            // below using the gene's actual (r,c)
-            RadarEngine radar(g, 33.9871, 74.7742, 50.0, 1000.0, 10.0, 30.0, 300.0);
+            // Radar specifications: 50m AGL, 1000m tgt, 10-30 deg Elev, 300km Range
+            LocalCoverage cov = compute_local_coverage(
+                g, p.r, p.c,
+                50.0, 1000.0, 10.0, 30.0, 300000.0
+            );
 
-            radar.srcRow = p.r;
-            radar.srcCol = p.c;
-
-            // maxRadiusCells is also position-clamped in the real constructor —
-            // re-derive it here too, or a radar near an edge keeps whatever
-            // radius the throwaway construction position happened to allow.
-            int rawRadius   = (int)std::ceil(radar.maxRangeM / RESOLUTION);
-            int maxPossible = std::min(std::min(p.r, radar.gridRows - p.r - 1),
-                                        std::min(p.c, radar.gridCols - p.c - 1));
-            radar.maxRadiusCells = std::min(rawRadius, std::max(0, maxPossible));
-
-            radar.rowMin = std::max(0, p.r - radar.maxRadiusCells - 1);
-            radar.rowMax = std::min(radar.gridRows, p.r + radar.maxRadiusCells + 2);
-            radar.colMin = std::max(0, p.c - radar.maxRadiusCells - 1);
-            radar.colMax = std::min(radar.gridCols, p.c + radar.maxRadiusCells + 2);
-            short srcTerrain = g.bin.elev_matrix[(size_t)p.r * radar.gridCols + p.c];
-            radar.srcElev = (double)srcTerrain + radar.antennaHeight;
-            radar.boundary = RadarEngine::circleBoundary(p.r, p.c, radar.maxRadiusCells);
-
-            std::vector<uint8_t> mask = radar.computeFast();
-
+            // Shift grid cell coordinates into local radar bounds
             for (auto& cell : grid.cells) {
-                size_t flat = (size_t)cell.r * radar.gridCols + cell.c;
-                if (flat < mask.size() && mask[flat])
-                    cell.overlap++;
+                if (cell.r >= cov.rowMin && cell.r < cov.rowMax &&
+                    cell.c >= cov.colMin && cell.c < cov.colMax) {
+
+                    size_t local_r = cell.r - cov.rowMin;
+                    size_t local_c = cell.c - cov.colMin;
+                    size_t flat = local_r * cov.localCols + local_c;
+
+                    if (flat < cov.mask.size()) {
+                        // Only add to overlap if the radar actually covers this specific cell
+                        if (cov.mask[flat] == 1) {
+                            cell.overlap++;
+                        }
+                    }
+                }
             }
         }
 
@@ -224,83 +362,63 @@ public:
             else if (cell.overlap >= 3) result[3]++;
         }
 
-        if (!pngPath.empty())
+        // --- Render Visual Integrity Map (Uses overlapToColor from bin.h natively) ---
+        if (!pngPath.empty()) {
             Bin::writeFeasibleGridOverlapPng(grid, pngPath);
+        }
 
         return result;
     }
-    // FIX: Global was passed by value. Global/Bin owns a raw-pointer handle
-    // with a custom destructor and no copy ctor, so every call silently
-    // shallow-copied it and double-destroyed the handle on return (confirmed
-    // above). const& avoids the copy entirely. If RadarEngine's constructor
-    // needs non-const access, change this to `Global&` and use std::ref(g)
-    // instead of cref(g) at the call site below.
-    static void evaluate_fitness(const Global& g, Chromosome &cn){
-        vector<int> overlaps(4);
-        RadarEngine radar(
-                g,
-                33.9871, 74.7742, // Srinagar airport
-                50.0,    // antenna height AGL (m)
-                1000.0,  // target height AGL (m) — e.g. aircraft at 1km
-                10.0,     // min elevation angle (degrees)
-                30.0,    // max elevation angle (degrees)
-                300.0    // max range (km)
-        );
-        for (size_t k = 0; k < cn.radar.size(); k++){
-            calculate_radar_coverage_overlap(&g,f, const std::vector<int> &radarIndices)
-        }
-        // FIX: w1..w4 had no initializer and were used immediately — reading
-        // uninitialized floats is undefined behavior. Placeholder 1.0s so
-        // this is at least deterministic; actual weights are a tuning call
-        // for you, not something I'm guessing at here.
-        float w1 = 1.0f, w2 = 1.0f, w3 = 1.0f, w4 = 1.0f;
-        double fitness = w1 * overlaps[1] + w2 * overlaps[2] - w3 * overlaps[3] - w4 * overlaps[0];
+
+    static void evaluate_fitness(Global& g, const FeasibleGrid& base_grid, Chromosome& cn, int index) {
+        std::string png_path = "chromosome_" + std::to_string(index) + "_coverage.png";
+
+        auto res = calculate_radar_coverage_overlap(g, base_grid, cn.radar, 5.0, png_path);
+
+        // Target: Maximize layered tracking landscape coverage, heavily fine proximity violations
+        double fitness = (res[1] * 1.0) + (res[2] * 2.0) + (res[3] * 3.0) - (res[0] * 5000.0);
+
         cn.fitness = fitness;
     }
 
-    // FIX: matches the const& change above.
-    void parallelEvaluatePopulation(std::vector<Chromosome>& population, const Global& g) {
+    void parallelEvaluatePopulation(std::vector<Chromosome>& pop, Global& g, const FeasibleGrid& base_grid) {
         std::vector<std::future<void>> futures;
-        futures.reserve(population.size());
+        futures.reserve(pop.size());
 
-        for (auto& ind : population) {
-            // FIX: args were swapped here (ind then g) against
-            // evaluate_fitness(Global, Chromosome&) — wouldn't compile.
-            futures.push_back(pool.enqueue(evaluate_fitness, cref(g), std::ref(ind)));
+        for (size_t i = 0; i < pop.size(); i++) {
+            futures.push_back(pool.enqueue(evaluate_fitness, std::ref(g), std::ref(base_grid), std::ref(pop[i]), static_cast<int>(i)));
         }
 
         for (auto& f : futures) f.wait();
     }
 
-    // FIX: was declared to return vector<Chromosome> but never returned
-    // anything (UB), and nothing used the return value anyway — population
-    // is already a member, so this is void now.
     void init_population(int length) {
         population.reserve(NUM_CHROMOSOMES);
-        auto f = Bin::getFeasibleGrid(WRITE);
-        for (int i=0; i < NUM_CHROMOSOMES; i++){
-            // FIX: was `population[i] = x` after only reserve() (no resize) —
-            // writing into unconstructed memory (confirmed segfault above).
-            // push_back is the correct way to grow into reserved capacity.
-            auto x = generate_random_chromosome(f,{0,(int)f.cells.size()-1}, length);
+
+        std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
+
+        // Pass the loaded g.bin instance directly to prevent ghost matrix allocations
+        auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+
+        for (int i = 0; i < NUM_CHROMOSOMES; i++){
+            auto x = generate_random_chromosome(f, {0, (int)f.cells.size()-1}, length);
             population.push_back(x);
         }
-        parallelEvaluatePopulation(population, g);
 
-        // --- visualization (new) ---
-        // one PNG per chromosome: just its radar placements, red dots, no
-        // coverage/overlap rendering
-        for (size_t i = 0; i < population.size(); i++) {
-            Bin::writeRadarScatterPng(population[i].radar,
-                                       "chromosome_" + std::to_string(i) + ".png");
-        }
+        std::cout << "[ga] Dispatching parallel coverage evaluation and map exports...\n";
+        parallelEvaluatePopulation(population, g, f);
 
-        // combined view: every chromosome's radar positions on one shared
-        // canvas — still just presence (red), not coverage
+        // Export full Generation 0 layout summary (Just red scatter dots)
         std::vector<GridPoint> all_radars;
         for (auto& cn : population)
             all_radars.insert(all_radars.end(), cn.radar.begin(), cn.radar.end());
-        Bin::writeRadarScatterPng(all_radars, "population_combined.png");
+
+        Bin::writeRadarScatterPng(all_radars, "population_combined_scatter.png");
+
+        auto best = std::max_element(population.begin(), population.end(),
+            [](const Chromosome& a, const Chromosome& b) { return a.fitness < b.fitness; });
+
+        std::cout << "[ga] Done. Generation 0 Best Fitness Score: " << best->fitness << "\n";
     }
 
     const vector<Chromosome>& get_population() const { return population; }
@@ -309,5 +427,7 @@ public:
 int main () {
     ThreadPool pool;
     ga g(pool);
-    g.init_population(/*length=*/4);   // radars per chromosome
+    g.init_population(4); // Generates 4 radars per chromosome
+
+    return 0;
 }

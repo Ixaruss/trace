@@ -8,10 +8,18 @@ int main(int argc, char** argv) {
     app.require_subcommand(1);
 
     auto pre_sub = app.add_subcommand("build", "Build bin files from corresponding maps. config REQUIRED");
-    bool images = false, timer = false, s = false;
+    bool images = false, timer = false, s = false, road=false, rail = false, waterarea = false, waterline = false, ib = false, slope=false;
+    auto* op_group = pre_sub->add_option_group("individual outputs");
     pre_sub->add_flag("-v,--with-images",images,"Generates images for bin visualization");
     pre_sub->add_flag("-c,--count-time",timer,"Counts the time taken for preprocessing");
-    pre_sub->add_flag("-a,--all",s,"create all bins");
+    op_group->add_flag("-a,--all",s,"create all bins");
+    op_group->add_flag("--road",road,"create road bin");
+    op_group->add_flag("--rail",rail,"create rail bin");
+    op_group->add_flag("--water-areas",waterarea,"create water-areas bin");
+    op_group->add_flag("--water-lines",waterline,"create water-lines bin");
+    op_group->add_flag("-i, --ib",ib,"create ib bin");
+    op_group->add_flag("--slope",slope,"create slope bin");
+    op_group->require_option(1);
 
     auto f_sub = app.add_subcommand("feasible", "Build feasible bin for a AOP if no point is provided then . bins & config REQUIRED");
     f_sub->add_flag("-v,--with-images",images,"Generates images for bin visualization");
@@ -148,7 +156,14 @@ int main(int argc, char** argv) {
         }
     }
     else if (*pre_sub) {
-        Global::preprocess(images,timer,s);
+        int i = -1;
+        if (road) i = 1;
+        else if (rail) i = 2;
+        else if(waterarea) i =3;
+        else if (waterline) i =4;
+        else if (ib) i =5;
+        else if (slope) i =6;
+        Global::preprocess(images,timer,s,i);
     }
     else if (*rlos_sub) {
         Global g;

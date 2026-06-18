@@ -38,7 +38,7 @@ public:
     Global() {
         bin.init({ ELEVATION });
     }
-    public: static void preprocess(bool images = 0, bool timer = false, bool seperate = false);
+    public: static void preprocess(bool images = 0, bool timer = false, bool seperate = false, int individual = -1);
 
     public: std::vector<LOSResult>  lineOfVisibilityopt(double lat0, double lon0, int h0, double lat1, double lon1, int h1);
 
