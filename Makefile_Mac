@@ -1,0 +1,113 @@
+# =====================================================
+# Preprocess
+# =====================================================
+bin:
+	g++ preprocess/preprocess.cc \
+	preprocess/main.cc \
+	preprocess/jsonParser.cc \
+	preprocess/reproject.cc  \
+	preprocess/lib/*.cc \
+	-I/opt/homebrew/include \
+	-I/opt/homebrew/include/jsoncpp \
+	$(gdal-config --cflags) \
+	-std=c++23 \
+	-o preproc \
+	-L/opt/homebrew/lib \
+	-lpng16 \
+	-ljsoncpp \
+	-lgdal && ./preproc
+
+# =====================================================
+# Main Adapt CLI
+# =====================================================
+tool:
+	clang++ \
+	-O3 \
+	-std=c++23 \
+	-march=native \
+	-flto \
+	-Xpreprocessor -fopenmp \
+	-I/opt/homebrew/opt/libomp/include \
+	$(shell pkg-config --cflags jsoncpp) \
+	$(shell pkg-config --cflags libpng) \
+	$(shell gdal-config --cflags) \
+	cli/main.cc \
+	common/lineofsight.cc \
+	common/image.cc \
+	common/coverage.cc \
+	common/angleviewshed.cc \
+	common/radarlos.cc \
+	common/mult.cc \
+	common/operations.cc \
+	preprocess/jsonParser.cc \
+	preprocess/reproject.cc \
+	preprocess/preprocess.cc \
+	preprocess/lib/*.cc \
+	-o adapt \
+	$(shell pkg-config --libs jsoncpp) \
+	$(shell pkg-config --libs libpng) \
+	$(shell gdal-config --libs) \
+	-L/opt/homebrew/opt/libomp/lib \
+	-lomp \
+	-ffast-math \
+	-ffp-contract=fast \
+	-funroll-loops \
+	-fvectorize \
+	-fdata-sections \
+	-ffunction-sections \
+	-Wl,-dead_strip \
+	-w
+
+# =====================================================
+# path-finder
+# =====================================================
+.PHONY: astar
+astar:
+	g++ -O3 path-finder/astar.cc \
+	-I/opt/homebrew/include \
+	-I/opt/homebrew/include/jsoncpp \
+	$(gdal-config --cflags) \
+	-std=c++23 \
+	-o astar_run \
+	-L/opt/homebrew/lib \
+	-ljsoncpp $(gdal-config --libs)
+
+# =====================================================
+# Cleanup
+# =====================================================
+clean:
+	rm -f x test_app adapt
+
+
+# =====================================================
+# pso single radar
+# =====================================================
+.PHONY: pso
+pso:
+	g++ -O3 pso/main.cc \
+	preprocess/jsonParser.cc \
+	preprocess/reproject.cc  \
+	preprocess/lib/*.cc \
+	-I/opt/homebrew/include \
+	-I/opt/homebrew/include/jsoncpp \
+	$(gdal-config --cflags) \
+	-std=c++23 \
+	-o pso_run \
+	-L/opt/homebrew/lib \
+	-lpng16 \
+	-ljsoncpp \
+	-lgdal && ./pso_run
+
+# =====================================================
+# generate bin
+# =====================================================
+.PHONY: astar
+gen_bin:
+	g++ -O3 pso/generate_bin.cc \
+	-I/opt/homebrew/include \
+	-I/opt/homebrew/include/jsoncpp \
+	$(gdal-config --cflags) \
+	-std=c++23 \
+	-o gen_bin \
+	-L/opt/homebrew/lib \
+	-ljsoncpp $(gdal-config --libs) && ./gen_bin
