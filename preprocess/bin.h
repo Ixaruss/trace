@@ -42,6 +42,10 @@ struct FeasibleCell {
     uint8_t value;
     int overlap =0;
 };
+struct GridPoint {
+    int r;
+    int c;
+};
 enum LoadOptions {
     ALL,
     CONSTRAINTS,
@@ -375,71 +379,122 @@ public:
             std::cout << "[verify] PASS: " << path << "\n";
             return true;
         }
-        private:
-            // overlap -> color ramp: 0=white, 2=yellow, 3=orange, 4=red, 5+=dark red.
-            // You didn't specify overlap==1, so it's linearly interpolated between
-            // the 0 and 2 stops (pale yellow) rather than left undefined — easy to
-            // change if you had something else in mind for it.
-            static void overlapToColor(int overlap, uint8_t& red, uint8_t& green, uint8_t& blue) {
-                if (overlap < 0) overlap = 0;
-                switch (overlap) {
-                    case 0: red = 255; green = 255; blue = 255; break;  // white
-                    case 1: red = 0;   green = 200; blue = 0;   break;  // green
-                    case 2: red = 255; green = 255; blue = 0;   break;  // yellow
-                    case 3: red = 255; green = 165; blue = 0;   break;  // orange
-                    case 4: red = 255; green = 0;   blue = 0;   break;  // red
-                    default:                                            // 5 and above
-                        red = 139; green = 0; blue = 0;
-                        break;
-                }
-            }
-
+        static void overlapToColor(int overlap, uint8_t& red, uint8_t& green, uint8_t& blue) {
+                        if (overlap < 0) overlap = 0;
+                        switch (overlap) {
+                            case 0: red = 255; green = 255; blue = 255; break;  // white
+                            case 1: red = 0;   green = 200; blue = 0;   break;  // green
+                            case 2: red = 255; green = 255; blue = 0;   break;  // yellow
+                            case 3: red = 255; green = 165; blue = 0;   break;  // orange
+                            case 4: red = 255; green = 0;   blue = 0;   break;  // red
+                            default:                                            // 5 and above
+                                red = 139; green = 0; blue = 0;
+                                break;
+                        }
+                    }
         public:
-            // Renders a FeasibleGrid's overlap values into a PNG sized grid.width x
-            // grid.height. Cell coordinates are assumed to be in original-matrix
-            // space (per your origin_r/origin_c comment), so each cell is placed at
-            // (cell.r - origin_r, cell.c - origin_c) on the canvas.
-            static bool writeFeasibleGridOverlapPng(const FeasibleGrid& grid, const std::string& png_path) {
+            static bool writeFeasibleGridOverlapPng(
+                const FeasibleGrid&            grid,
+                const std::string&             png_path,
+                const std::vector<GridPoint>&  placements = {})   // ← new param
+            {
                 if (grid.height <= 0 || grid.width <= 0) {
-                    std::cerr << "[overlap] FAIL: invalid grid dimensions " << grid.width
-                              << " x " << grid.height << "\n";
+                    std::cerr << "[overlap] FAIL: invalid grid dimensions "
+                              << grid.width << " x " << grid.height << "\n";
                     return false;
                 }
-
                 std::cout << "[overlap] Rendering " << grid.height << " x " << grid.width
                           << " grid (" << grid.cells.size() << " cells, origin "
                           << grid.origin_r << "," << grid.origin_c << ")\n";
 
-                // background for any cell position with no entry in grid.cells — a
-                // distinct dark gray so it's never confused with an actual
-                // overlap==0 (white) cell. Change this if your cells vector is
-                // already dense over the full AABB and this case can't occur.
+                // Dark-grey background — never confused with overlap==0 (white)
                 std::vector<uint8_t> canvas((size_t)grid.height * grid.width * 3, 30);
 
+                // ── 1. Paint feasible cells ──────────────────────────────────────────
                 int skipped = 0;
                 for (const auto& cell : grid.cells) {
                     int local_r = cell.r - grid.origin_r;
                     int local_c = cell.c - grid.origin_c;
-                    if (local_r < 0 || local_r >= grid.height || local_c < 0 || local_c >= grid.width) {
-                        skipped++;
+                    if (local_r < 0 || local_r >= grid.height ||
+                        local_c < 0 || local_c >= grid.width) {
+                        ++skipped;
                         continue;
                     }
                     uint8_t red, green, blue;
                     overlapToColor(cell.overlap, red, green, blue);
-
                     size_t idx = ((size_t)local_r * grid.width + local_c) * 3;
                     canvas[idx + 0] = red;
                     canvas[idx + 1] = green;
                     canvas[idx + 2] = blue;
                 }
                 if (skipped > 0)
-                    std::cerr << "[overlap] WARN: " << skipped << " cells fell outside the "
-                              << grid.width << "x" << grid.height << " AABB and were skipped\n";
+                    std::cerr << "[overlap] WARN: " << skipped
+                              << " cells fell outside the "
+                              << grid.width << "x" << grid.height
+                              << " AABB and were skipped\n";
 
-                bool ok = writeColorPng(png_path, grid.width, grid.height,
-                                         [&canvas, w = grid.width](int r, uint8_t* rgbRow) {
-                                             std::memcpy(rgbRow, &canvas[(size_t)r * w * 3], (size_t)w * 3);
-                                         });
+                // ── 2. Draw radar centre markers (drawn last → always on top) ────────
+                if (!placements.empty()) {
+                    // Safe single-pixel writer — clips to canvas bounds silently
+                    auto px = [&](int lr, int lc,
+                                  uint8_t r, uint8_t g, uint8_t b) __attribute__((always_inline))
+                    {
+                        if ((unsigned)lr >= (unsigned)grid.height ||
+                            (unsigned)lc >= (unsigned)grid.width) return;
+                        size_t idx = ((size_t)lr * grid.width + lc) * 3;
+                        canvas[idx + 0] = r;
+                        canvas[idx + 1] = g;
+                        canvas[idx + 2] = b;
+                    };
+
+                    constexpr int     ARM    = 5;
+                    constexpr uint8_t MR = 255, MG = 0, MB = 255;   // magenta arms
+                    constexpr uint8_t BR = 0,   BG = 0, BB = 0;     // black border / dot
+
+                    for (const auto& p : placements) {
+                        const int cr = p.r - grid.origin_r;
+                        const int cc = p.c - grid.origin_c;
+                        // Skip placements whose centre maps outside the canvas
+                        if (cr < 0 || cr >= grid.height ||
+                            cc < 0 || cc >= grid.width) continue;
+
+                        // Pass 1 — black halo (1-px border around every arm pixel)
+                        //   Vertical halo: columns cc-1 and cc+1, rows cr±(ARM+1)
+                        //   Horizontal halo: rows cr-1 and cr+1, cols cc±(ARM+1)
+                        for (int d = -(ARM + 1); d <= (ARM + 1); ++d) {
+                            px(cr + d, cc - 1, BR, BG, BB);
+                            px(cr + d, cc + 1, BR, BG, BB);
+                            px(cr - 1, cc + d, BR, BG, BB);
+                            px(cr + 1, cc + d, BR, BG, BB);
+                        }
+                        // End caps (tips of each arm)
+                        px(cr - (ARM + 1), cc, BR, BG, BB);
+                        px(cr + (ARM + 1), cc, BR, BG, BB);
+                        px(cr, cc - (ARM + 1), BR, BG, BB);
+                        px(cr, cc + (ARM + 1), BR, BG, BB);
+
+                        // Pass 2 — magenta crosshair arms
+                        for (int d = -ARM; d <= ARM; ++d) {
+                            px(cr + d, cc, MR, MG, MB);
+                            px(cr, cc + d, MR, MG, MB);
+                        }
+
+                        // Pass 3 — 3×3 black centre dot (marks the exact cell)
+                        for (int dr = -1; dr <= 1; ++dr)
+                            for (int dc = -1; dc <= 1; ++dc)
+                                px(cr + dr, cc + dc, BR, BG, BB);
+                    }
+
+                    std::cout << "[overlap] " << placements.size()
+                              << " radar marker(s) drawn\n";
+                }
+
+                // ── 3. Write PNG ─────────────────────────────────────────────────────
+                bool ok = writeColorPng(
+                    png_path, grid.width, grid.height,
+                    [&canvas, w = grid.width](int r, uint8_t* rgbRow) {
+                        std::memcpy(rgbRow, &canvas[(size_t)r * w * 3], (size_t)w * 3);
+                    });
                 if (!ok) return false;
 
                 std::cout << "[overlap] PNG written → " << png_path << "\n";
