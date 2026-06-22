@@ -32,10 +32,6 @@ enum class SelectionMethod { TOURNAMENT, ROULETTE_WHEEL, RANK_BASED, SUS };
 enum class CrossoverMethod { SINGLE_POINT, MULTI_POINT, UNIFORM };
 enum class MutationMethod  { SINGLE_POINT, SPATIAL_NUDGE, GAUSSIAN_CREEP };
 
-struct GridPoint {
-    int r, c;
-};
-
 struct Chromosome {
     std::vector<GridPoint> radar;
     double fitness;
