@@ -1,18 +1,3 @@
-/**
- * @file ParallelRadarPSO.cpp
- * @brief Multithreaded Particle Swarm Optimization (PSO) Engine for Optimal Radar Placement.
- * * DESIGN PRINCIPLE:
- * This system treats a swarm of "Particles" as competing configuration setups. Each particle
- * holds a collection of coordinates representing 'N' distinct radar units. The fitness function
- * optimizes the geographic "spread" (average pairwise Haversine distance) of these radars
- * within a defined latitude/longitude bounding box.
- * * CONCURRENCY MODEL:
- * Particle fitness evaluations are independent tasks. A worker ThreadPool processes these
- * evaluations in parallel every iteration, maximizing multi-core CPU utilization.
- * * BENCHMARKING ENGINE:
- * Uses high-resolution instrumentation tracks to profile allocation bottlenecks, kinematic
- * overhead, and thread scheduling latencies across diverse optimization runs.
- */
 
 #include <iostream>
 #include <vector>
@@ -21,74 +6,55 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
+#include <string>
+#include <fstream>
+#include <mutex>
+#include <memory>
 #include <queue>
 #include <thread>
-#include <mutex>
 #include <condition_variable>
-#include <future>
 #include <functional>
-#include <string>
+#include <atomic>
 
 // ============================================================================
-// CONFIGURATION ENUMS & MATHEMATICAL CONSTANTS
+// DATA STRUCTURES & DATA MODELS
 // ============================================================================
-
-enum class PSOTopology {
-    GLOBAL_STAR, ///< Every particle pulls toward the absolute best particle in the entire swarm. Fast convergence.
-    LOCAL_RING   ///< Particles only communicate with their immediate neighbors. Slower, but avoids premature local minima traps.
-};
-
-enum class InertiaStrategy {
-    CONSTANT,      ///< Static momentum coefficient throughout the optimization lifecycle.
-    LINEAR_DECAY,  ///< Momentum drops over time; prioritizes exploration early, exploitation late.
-    RANDOM_JITTER  ///< Introduces dynamic stochastic variance to break out of flat optimization plateaus.
-};
-
-enum class BoundaryHandler {
-    ABSORB_CLAMP,   ///< Sticks the particle directly onto the boundary edge and stops momentum.
-    REFLECT_BOUNCE  ///< Bounces the particle back into valid space by flipping its directional velocity vector.
-};
-
-constexpr double EARTH_RADIUS_KM = 6371.0;
-constexpr double PI = 3.14159265358979323846;
-
 struct BoundingBox {
-    double minLat, maxLat, minLon, maxLon;
+    double minX, maxX, minY, maxY;
 };
 
+struct RadarPhysicsConfig {
+    double maxRangeUnits;
+};
+
+struct PsoHyperparameters {
+    double c1;
+    double c2;
+    double defaultW;
+};
+
+#pragma pack(push, 1)
 struct GridPoint {
-    int gridX, gridY;
-    double lat, lon;
+    double x;
+    double y;
 
     double distanceTo(const GridPoint& other) const {
-        double lat1Rad = lat * PI / 180.0;
-        double lat2Rad = other.lat * PI / 180.0;
-        double deltaLat = (other.lat - lat) * PI / 180.0;
-        double deltaLon = (other.lon - lon) * PI / 180.0;
-
-        double a = std::sin(deltaLat / 2.0) * std::sin(deltaLat / 2.0) +
-                   std::cos(lat1Rad) * std::cos(lat2Rad) * std::sin(deltaLon / 2.0) * std::sin(deltaLon / 2.0);
-
-        return EARTH_RADIUS_KM * (2.0 * std::atan2(std::sqrt(a), std::sqrt(1.0 - a)));
+        double dx = other.x - x;
+        double dy = other.y - y;
+        return std::sqrt(dx * dx + dy * dy);
     }
 };
+#pragma pack(pop)
 
-struct ConfigurableParticle {
-    std::vector<GridPoint> positions;
-    std::vector<int> velX;
-    std::vector<int> velY;
-    std::vector<GridPoint> pBestPositions;
+struct ContinuousParticle {
+    GridPoint position;
+    double velX;
+    double velY;
+    GridPoint pBestPosition;
     double pBestFitness;
     double currentFitness;
 };
 
-// ============================================================================
-// PERFORMANCE DATA MATRIX TRACKER
-// ============================================================================
-
-/**
- * @brief Structure holding performance profiling dimensions returned to the leaderboard aggregator.
- */
 struct PSOBenchmarkResult {
     std::string profileName;
     std::string topology;
@@ -96,15 +62,14 @@ struct PSOBenchmarkResult {
     std::string boundary;
     int swarmSize;
     int iterations;
-    double bestSpreadKm;
-    double initTimeMs;
-    double kinematicTimeMs;
-    double fitnessEvalTimeMs;
+    double maxCoveragePercentage;
+    GridPoint bestLocation;
     double totalTimeMs;
+    std::vector<GridPoint> initialPositions;
 };
 
 // ============================================================================
-// WORKER THREAD POOL ENGINE (Task Parallelism)
+// LIGHTWEIGHT WORKER THREAD POOL ENGINE
 // ============================================================================
 class ThreadPool {
 private:
@@ -112,23 +77,18 @@ private:
     std::queue<std::function<void()>> tasks;
     std::mutex queueMutex;
     std::condition_variable cv;
-    bool stop;
+    bool stop = false;
 
 public:
-    ThreadPool() : stop(false) {
-        size_t threads = std::thread::hardware_concurrency();
-        if (threads == 0) threads = 4;
-
+    ThreadPool(size_t threads) {
         for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this]() {
+            workers.emplace_back([this] {
                 while (true) {
                     std::function<void()> task;
                     {
                         std::unique_lock<std::mutex> lock(this->queueMutex);
-                        this->cv.wait(lock, [this]() { return this->stop || !this->tasks.empty(); });
-
+                        this->cv.wait(lock, [this] { return this->stop || !this->tasks.empty(); });
                         if (this->stop && this->tasks.empty()) return;
-
                         task = std::move(this->tasks.front());
                         this->tasks.pop();
                     }
@@ -138,22 +98,13 @@ public:
         }
     }
 
-    template<class F, class... Args>
-    auto enqueue(F&& f, Args&&... args) -> std::future<typename std::invoke_result<F, Args...>::type> {
-        using return_type = typename std::invoke_result<F, Args...>::type;
-
-        auto task = std::make_shared<std::packaged_task<return_type()>>(
-            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-        );
-
-        std::future<return_type> res = task->get_future();
+    template<class F>
+    void enqueue(F&& f) {
         {
             std::unique_lock<std::mutex> lock(queueMutex);
-            if (stop) throw std::runtime_error("Enqueue on stopped ThreadPool Context");
-            tasks.emplace([task]() { (*task)(); });
+            tasks.emplace(std::forward<F>(f));
         }
         cv.notify_one();
-        return res;
     }
 
     ~ThreadPool() {
@@ -169,233 +120,354 @@ public:
 };
 
 // ============================================================================
-// PARALLEL CONFIGURABLE PSO ENGINE WITH INSTRUMENTATION
+// NATIVE CONFIGURATION LOADER
 // ============================================================================
-class ParallelAdvancedPSO {
+struct ConfigLoader {
+    static bool loadConfig(const std::string& filename, RadarPhysicsConfig& physics,
+                            PsoHyperparameters& hyper, int& swarmSize, int& iterations) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << ">> [CONFIG ERROR] Could not open " << filename << ".\n";
+            return false;
+        }
+
+        std::string line;
+        auto extractDouble = [](const std::string& l) {
+            size_t colon = l.find(':');
+            if (colon == std::string::npos) return 0.0;
+            size_t comma = l.find(',');
+            size_t endIdx = (comma == std::string::npos) ? l.find_last_not_of(" \t\r\n}") + 1 : comma;
+            return std::stod(l.substr(colon + 1, endIdx - colon - 1));
+        };
+
+        while (std::getline(file, line)) {
+            if (line.find("max_range_units") != std::string::npos || line.find("max_range_km") != std::string::npos) {
+                physics.maxRangeUnits = extractDouble(line);
+            }
+            else if (line.find("cognitive_weight_c1") != std::string::npos) hyper.c1 = extractDouble(line);
+            else if (line.find("social_weight_c2") != std::string::npos) hyper.c2 = extractDouble(line);
+            else if (line.find("inertia_weight_w") != std::string::npos) hyper.defaultW = extractDouble(line);
+            else if (line.find("swarm_size") != std::string::npos) swarmSize = static_cast<int>(extractDouble(line));
+            else if (line.find("iterations") != std::string::npos) iterations = static_cast<int>(extractDouble(line));
+        }
+
+        std::cout << ">> [CONFIG LOADER] Engine Parameters Configured:\n"
+                  << "   - Max Range Radius: " << physics.maxRangeUnits << " grid units\n"
+                  << "   - Swarm Allocation: " << swarmSize << " particles | Horizon: " << iterations << " generations\n";
+        return true;
+    }
+};
+
+// ============================================================================
+// ABSTRACT POLYMORPHIC STRATEGY INTERFACES
+// ============================================================================
+class IInertiaStrategy {
+public:
+    virtual ~IInertiaStrategy() = default;
+    virtual double computeWeight(int currentIter, int maxIter, double defaultW) = 0;
+    virtual std::string getName() const = 0;
+};
+
+class IBoundaryHandler {
+public:
+    virtual ~IBoundaryHandler() = default;
+    virtual void handle(double& x, double& y, double& vx, double& vy, const BoundingBox& bbox) = 0;
+    virtual std::string getName() const = 0;
+};
+
+class ITopologySelector {
+public:
+    virtual ~ITopologySelector() = default;
+    virtual GridPoint selectTarget(int idx, int swarmSize, const GridPoint& gBest, const std::vector<ContinuousParticle>& swarm) = 0;
+    virtual std::string getName() const = 0;
+};
+
+// ============================================================================
+// CONCRETE STRATEGY IMPLEMENTATIONS
+// ============================================================================
+class ConstantInertia : public IInertiaStrategy {
+public:
+    double computeWeight(int, int, double defaultW) override { return defaultW; }
+    std::string getName() const override { return "Constant"; }
+};
+
+class LinearDecayInertia : public IInertiaStrategy {
+public:
+    double computeWeight(int currentIter, int maxIter, double) override {
+        return 0.9 - (0.5 * (static_cast<double>(currentIter) / maxIter));
+    }
+    std::string getName() const override { return "Linear Decay"; }
+};
+
+class RandomJitterInertia : public IInertiaStrategy {
+private:
+    std::mt19937 rng{1337};
+public:
+    double computeWeight(int, int, double) override {
+        std::uniform_real_distribution<double> jitter(0.4, 0.9);
+        return jitter(rng);
+    }
+    std::string getName() const override { return "Rand Jitter"; }
+};
+
+class AbsorbClampHandler : public IBoundaryHandler {
+public:
+    void handle(double& x, double& y, double&, double&, const BoundingBox& bbox) override {
+        x = std::clamp(x, bbox.minX, bbox.maxX);
+        y = std::clamp(y, bbox.minY, bbox.maxY);
+    }
+    std::string getName() const override { return "Clamp"; }
+};
+
+class ReflectBounceHandler : public IBoundaryHandler {
+public:
+    void handle(double& x, double& y, double& vx, double& vy, const BoundingBox& bbox) override {
+        if (x < bbox.minX) { x = bbox.minX + (bbox.minX - x); vx *= -1.0; }
+        if (x > bbox.maxX) { x = bbox.maxX - (x - bbox.maxX); vx *= -1.0; }
+        if (y < bbox.minY) { y = bbox.minY + (bbox.minY - y); vy *= -1.0; }
+        if (y > bbox.maxY) { y = bbox.maxY - (y - bbox.maxY); vy *= -1.0; }
+        x = std::clamp(x, bbox.minX, bbox.maxX);
+        y = std::clamp(y, bbox.minY, bbox.maxY);
+    }
+    std::string getName() const override { return "Bounce"; }
+};
+
+class GlobalStarTopology : public ITopologySelector {
+public:
+    GridPoint selectTarget(int, int, const GridPoint& gBest, const std::vector<ContinuousParticle>&) override {
+        return gBest;
+    }
+    std::string getName() const override { return "Global (Star)"; }
+};
+
+class LocalRingTopology : public ITopologySelector {
+public:
+    GridPoint selectTarget(int idx, int swarmSize, const GridPoint&, const std::vector<ContinuousParticle>& swarm) override {
+        int leftNeighbor = (idx - 1 + swarmSize) % swarmSize;
+        int rightNeighbor = (idx + 1) % swarmSize;
+
+        double maxLocalBest = swarm[idx].pBestFitness;
+        GridPoint targetPosition = swarm[idx].pBestPosition;
+
+        if (swarm[leftNeighbor].pBestFitness > maxLocalBest) {
+            maxLocalBest = swarm[leftNeighbor].pBestFitness;
+            targetPosition = swarm[leftNeighbor].pBestPosition;
+        }
+        if (swarm[rightNeighbor].pBestFitness > maxLocalBest) {
+            targetPosition = swarm[rightNeighbor].pBestPosition;
+        }
+        return targetPosition;
+    }
+    std::string getName() const override { return "Local (Ring)"; }
+};
+
+// ============================================================================
+// STRATEGY-DRIVEN PARALLEL GRID PSO ENGINE
+// ============================================================================
+class ParallelPolygonRadarPSO {
 private:
     BoundingBox bbox;
-    double latStep, lonStep;
-    int maxGridX, maxGridY;
-    int swarmSize, iterations, numRadars;
-    ThreadPool& pool;
+    int swarmSize, iterations;
+    RadarPhysicsConfig radarPhysics;
+    PsoHyperparameters psoHyper;
     std::mt19937 rng;
 
-    PSOTopology currentTopology     = PSOTopology::GLOBAL_STAR;
-    InertiaStrategy currentInertia  = InertiaStrategy::CONSTANT;
-    BoundaryHandler currentBoundary = BoundaryHandler::ABSORB_CLAMP;
-    std::string profileName         = "Default Profile";
+    std::shared_ptr<ITopologySelector> activeTopology;
+    std::shared_ptr<IInertiaStrategy> activeInertia;
+    std::shared_ptr<IBoundaryHandler> activeBoundary;
+    std::string profileName;
 
-    std::vector<GridPoint> gBestPositions;
+    GridPoint gBestPosition;
     double gBestFitness;
     std::mutex gBestMutex;
 
-    double totalFitnessEvalTimeMs = 0.0;
-    double totalKinematicUpdateTimeMs = 0.0;
+    // Persistent runtime thread pool initialization
+    ThreadPool pool{std::max(1u, std::thread::hardware_concurrency())};
 
-    void calculateGridSteps() {
-        double centerLat = (bbox.minLat + bbox.maxLat) / 2.0;
-        latStep = 100.0 / 111000.0;
-        lonStep = 100.0 / (111000.0 * std::cos(centerLat * PI / 180.0));
+    void initializeSwarm(std::vector<ContinuousParticle>& swarm) {
+        double maxVelX = (bbox.maxX - bbox.minX) * 0.01;
+        double maxVelY = (bbox.maxY - bbox.minY) * 0.01;
 
-        maxGridX = static_cast<int>((bbox.maxLon - bbox.minLon) / lonStep);
-        maxGridY = static_cast<int>((bbox.maxLat - bbox.minLat) / latStep);
+        std::uniform_real_distribution<double> vDistX(-maxVelX, maxVelX);
+        std::uniform_real_distribution<double> vDistY(-maxVelY, maxVelY);
+
+        // Dynamic random selection mapping profile
+        std::uniform_int_distribution<size_t> meshIndexDist(0, filteredSamplingMesh.size() - 1);
+
+        for (int i = 0; i < swarmSize; ++i) {
+            size_t randomIndex = meshIndexDist(rng);
+            swarm[i].position = filteredSamplingMesh[randomIndex];
+            swarm[i].velX = vDistX(rng);
+            swarm[i].velY = vDistY(rng);
+            swarm[i].currentFitness = 0.0;
+            swarm[i].pBestFitness = -1.0;
+        }
     }
 
-    GridPoint createGridPoint(int x, int y) {
-        return {
-            x, y,
-            bbox.minLat + (y * latStep) + (latStep / 2.0),
-            bbox.minLon + (x * lonStep) + (lonStep / 2.0)
-        };
-    }
+    void parallelEvaluateSwarm(std::vector<ContinuousParticle>& swarm) {
+        if (filteredSamplingMesh.empty() || swarm.empty()) return;
 
-    std::string getTopologyString() const {
-        return (currentTopology == PSOTopology::GLOBAL_STAR) ? "Global" : "Ring";
-    }
+        unsigned int numThreads = std::thread::hardware_concurrency();
+        if (numThreads == 0) numThreads = 4;
 
-    std::string getInertiaString() const {
-        if (currentInertia == InertiaStrategy::CONSTANT) return "Constant";
-        if (currentInertia == InertiaStrategy::LINEAR_DECAY) return "Decay";
-        return "Jitter";
-    }
+        size_t totalParticles = swarm.size();
+        size_t chunkSize = totalParticles / numThreads;
+        if (chunkSize == 0) chunkSize = 1;
 
-    std::string getBoundaryString() const {
-        return (currentBoundary == BoundaryHandler::ABSORB_CLAMP) ? "Clamp" : "Bounce";
+        size_t totalPoints = filteredSamplingMesh.size();
+
+        std::atomic<int> completedChunks(0);
+        int expectedChunks = 0;
+
+        for (size_t startParticle = 0; startParticle < totalParticles; startParticle += chunkSize) {
+            size_t endParticle = std::min(startParticle + chunkSize, totalParticles);
+            expectedChunks++;
+
+            pool.enqueue([this, &swarm, startParticle, endParticle, totalPoints, &completedChunks]() {
+                for (size_t p = startParticle; p < endParticle; ++p) {
+                    int localCount = 0;
+                    for (size_t i = 0; i < totalPoints; ++i) {
+                        if (swarm[p].position.distanceTo(filteredSamplingMesh[i]) <= radarPhysics.maxRangeUnits) {
+                            localCount++;
+                        }
+                    }
+                    swarm[p].currentFitness = static_cast<double>(localCount) / totalPoints;
+                }
+                completedChunks++;
+            });
+        }
+
+        while (completedChunks < expectedChunks) {
+            std::this_thread::yield();
+        }
     }
 
 public:
-    ParallelAdvancedPSO(BoundingBox box, int radars, ThreadPool& p)
-        : bbox(box), numRadars(radars), pool(p) {
-        rng.seed(std::chrono::system_clock::now().time_since_epoch().count());
-        gBestFitness = -1.0;
-        calculateGridSteps();
+    std::vector<GridPoint> filteredSamplingMesh;
+
+    ParallelPolygonRadarPSO(RadarPhysicsConfig physics, PsoHyperparameters hyper)
+        : radarPhysics(physics), psoHyper(hyper) {
+        rng.seed(1337);
+        generateSamplingMesh();
     }
 
-    void setRunConfig(const std::string& name, int size, int iters, PSOTopology topo, InertiaStrategy inertia, BoundaryHandler boundary) {
-        profileName = name;
-        swarmSize = size;
-        iterations = iters;
-        currentTopology = topo;
-        currentInertia = inertia;
-        currentBoundary = boundary;
-    }
+    void generateSamplingMesh() {
+        filteredSamplingMesh.clear();
+        std::string binPath = "feasible.bin";
+        std::ifstream binFile(binPath, std::ios::binary | std::ios::ate);
 
-    static void evaluateParticleFitness(ConfigurableParticle& particle) {
-        double totalSpreadDistance = 0.0;
-        int pairs = 0;
+        if (!binFile.is_open()) { binPath = "pso/feasible.bin"; binFile.open(binPath, std::ios::binary | std::ios::ate); }
+        if (!binFile.is_open()) { binPath = "../feasible.bin"; binFile.open(binPath, std::ios::binary | std::ios::ate); }
 
-        for (size_t i = 0; i < particle.positions.size(); ++i) {
-            for (size_t j = i + 1; j < particle.positions.size(); ++j) {
-                totalSpreadDistance += particle.positions[i].distanceTo(particle.positions[j]);
-                pairs++;
+        if (binFile.is_open()) {
+            std::streamsize fileSize = binFile.tellg();
+            binFile.seekg(0, std::ios::beg);
+
+            size_t pointCount = fileSize / sizeof(GridPoint);
+            filteredSamplingMesh.resize(pointCount);
+            binFile.read(reinterpret_cast<char*>(filteredSamplingMesh.data()), fileSize);
+            binFile.close();
+
+            bbox.minX = 0.0;
+            bbox.minY = 0.0;
+            bbox.maxX = 0.0;
+            bbox.maxY = 0.0;
+
+            for (const auto& pt : filteredSamplingMesh) {
+                if (pt.x > bbox.maxX) bbox.maxX = pt.x;
+                if (pt.y > bbox.maxY) bbox.maxY = pt.y;
+            }
+
+            std::cout << ">> [RECTANGLE GRID] Loaded " << pointCount << " spatial nodes from feasible.bin\n"
+                      << "   - Matrix Frame Bounds: [0 to " << bbox.maxX << "] x [0 to " << bbox.maxY << "]\n";
+            return;
+        }
+
+        double fallbackN = 1500.0;
+        double fallbackM = 1500.0;
+        std::cerr << ">> [WARNING] feasible.bin asset skipped. Initializing fallback " << fallbackN << "x" << fallbackM << " matrix.\n";
+        bbox = {0.0, fallbackN, 0.0, fallbackM};
+
+        filteredSamplingMesh.reserve(static_cast<size_t>(fallbackN * fallbackM));
+        for (int x = 0; x < static_cast<int>(fallbackN); ++x) {
+            for (int y = 0; y < static_cast<int>(fallbackM); ++y) {
+                filteredSamplingMesh.push_back({static_cast<double>(x), static_cast<double>(y)});
             }
         }
-        particle.currentFitness = (pairs == 0) ? 0.0 : (totalSpreadDistance / pairs);
     }
 
-    void parallelEvaluateSwarm(std::vector<ConfigurableParticle>& swarm) {
-        auto startTime = std::chrono::high_resolution_clock::now();
+    BoundingBox getDerivedBounds() const { return bbox; }
 
-        std::vector<std::future<void>> futures;
-        futures.reserve(swarm.size());
-
-        for (auto& particle : swarm) {
-            futures.push_back(pool.enqueue(ParallelAdvancedPSO::evaluateParticleFitness, std::ref(particle)));
-        }
-        for (auto& f : futures) f.wait();
-
-        auto endTime = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> duration = endTime - startTime;
-        totalFitnessEvalTimeMs += duration.count();
+    void setRuntimeStrategy(const std::string& name, int size, int iters,
+                            std::shared_ptr<ITopologySelector> topo,
+                            std::shared_ptr<IInertiaStrategy> inertia,
+                            std::shared_ptr<IBoundaryHandler> boundary) {
+        profileName = name; swarmSize = size; iterations = iters;
+        activeTopology = topo; activeInertia = inertia; activeBoundary = boundary;
     }
 
-    /**
-     * @brief Executes the optimization sequence and wraps benchmarking indices for structural return arrays.
-     */
     PSOBenchmarkResult runPSO() {
         gBestFitness = -1.0;
-        totalFitnessEvalTimeMs = 0.0;
-        totalKinematicUpdateTimeMs = 0.0;
-
         auto totalExecutionStart = std::chrono::high_resolution_clock::now();
 
-        // --- Phase 1: Initialization ---
-        auto initStart = std::chrono::high_resolution_clock::now();
+        std::vector<ContinuousParticle> swarm(swarmSize);
+        initializeSwarm(swarm);
 
-        std::vector<ConfigurableParticle> swarm(swarmSize);
-        std::uniform_int_distribution<int> distX(0, maxGridX), distY(0, maxGridY);
-        std::uniform_int_distribution<int> vDistX(-3, 3), vDistY(-3, 3);
-
-        for (int i = 0; i < swarmSize; ++i) {
-            swarm[i].positions.resize(numRadars);
-            swarm[i].velX.resize(numRadars);
-            swarm[i].velY.resize(numRadars);
-            for (int r = 0; r < numRadars; ++r) {
-                swarm[i].positions[r] = createGridPoint(distX(rng), distY(rng));
-                swarm[i].velX[r] = vDistX(rng);
-                swarm[i].velY[r] = vDistY(rng);
-            }
+        std::vector<GridPoint> initialPositionsSnapshot;
+        initialPositionsSnapshot.reserve(swarmSize);
+        for (const auto& p : swarm) {
+            initialPositionsSnapshot.push_back(p.position);
         }
 
         parallelEvaluateSwarm(swarm);
 
+        gBestPosition = swarm[0].position;
+        gBestFitness = swarm[0].currentFitness;
+
         for (int i = 0; i < swarmSize; ++i) {
-            swarm[i].pBestPositions = swarm[i].positions;
+            swarm[i].pBestPosition = swarm[i].position;
             swarm[i].pBestFitness = swarm[i].currentFitness;
             if (swarm[i].pBestFitness > gBestFitness) {
                 gBestFitness = swarm[i].pBestFitness;
-                gBestPositions = swarm[i].pBestPositions;
+                gBestPosition = swarm[i].pBestPosition;
             }
         }
 
-        auto initEnd = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> initDuration = initEnd - initStart;
-
-        // --- Phase 2 & 3: Main Iterative Life Cycle ---
         std::uniform_real_distribution<double> dist01(0.0, 1.0);
-        constexpr double c1 = 1.494;
-        constexpr double c2 = 1.494;
+        double maxVelX = (bbox.maxX - bbox.minX) * 0.01;
+        double maxVelY = (bbox.maxY - bbox.minY) * 0.01;
 
         for (int iter = 1; iter <= iterations; ++iter) {
-            auto kinematicStart = std::chrono::high_resolution_clock::now();
-
-            double w = 0.729;
-            if (currentInertia == InertiaStrategy::LINEAR_DECAY) {
-                w = 0.9 - (0.5 * ((double)iter / iterations));
-            } else if (currentInertia == InertiaStrategy::RANDOM_JITTER) {
-                std::uniform_real_distribution<double> jitter(0.4, 0.9);
-                w = jitter(rng);
-            }
+            double w = activeInertia->computeWeight(iter, iterations, psoHyper.defaultW);
 
             for (int i = 0; i < swarmSize; ++i) {
-                std::vector<GridPoint> targetPositions = gBestPositions;
+                GridPoint targetPosition = activeTopology->selectTarget(i, swarmSize, gBestPosition, swarm);
 
-                if (currentTopology == PSOTopology::LOCAL_RING) {
-                    int leftNeighbor = (i - 1 + swarmSize) % swarmSize;
-                    int rightNeighbor = (i + 1) % swarmSize;
-                    double maxLocalBest = swarm[i].pBestFitness;
-                    targetPositions = swarm[i].pBestPositions;
+                double r1 = dist01(rng), r2 = dist01(rng);
+                swarm[i].velX = w * swarm[i].velX + psoHyper.c1 * r1 * (swarm[i].pBestPosition.x - swarm[i].position.x) + psoHyper.c2 * r2 * (targetPosition.x - swarm[i].position.x);
+                swarm[i].velY = w * swarm[i].velY + psoHyper.c1 * r1 * (swarm[i].pBestPosition.y - swarm[i].position.y) + psoHyper.c2 * r2 * (targetPosition.y - swarm[i].position.y);
 
-                    if (swarm[leftNeighbor].pBestFitness > maxLocalBest) {
-                        maxLocalBest = swarm[leftNeighbor].pBestFitness;
-                        targetPositions = swarm[leftNeighbor].pBestPositions;
-                    }
-                    if (swarm[rightNeighbor].pBestFitness > maxLocalBest) {
-                        targetPositions = swarm[rightNeighbor].pBestPositions;
-                    }
-                }
+                swarm[i].velX = std::clamp(swarm[i].velX, -maxVelX, maxVelX);
+                swarm[i].velY = std::clamp(swarm[i].velY, -maxVelY, maxVelY);
 
-                for (int r = 0; r < numRadars; ++r) {
-                    double r1 = dist01(rng);
-                    double r2 = dist01(rng);
+                swarm[i].position.x += swarm[i].velX;
+                swarm[i].position.y += swarm[i].velY;
 
-                    int nvX = (int)std::round(w * swarm[i].velX[r] +
-                              c1 * r1 * (swarm[i].pBestPositions[r].gridX - swarm[i].positions[r].gridX) +
-                              c2 * r2 * (targetPositions[r].gridX - swarm[i].positions[r].gridX));
-
-                    int nvY = (int)std::round(w * swarm[i].velY[r] +
-                              c1 * r1 * (swarm[i].pBestPositions[r].gridY - swarm[i].positions[r].gridY) +
-                              c2 * r2 * (targetPositions[r].gridY - swarm[i].positions[r].gridY));
-
-                    swarm[i].velX[r] = std::clamp(nvX, -8, 8);
-                    swarm[i].velY[r] = std::clamp(nvY, -8, 8);
-
-                    int nextX = swarm[i].positions[r].gridX + swarm[i].velX[r];
-                    int nextY = swarm[i].positions[r].gridY + swarm[i].velY[r];
-
-                    if (currentBoundary == BoundaryHandler::ABSORB_CLAMP) {
-                        nextX = std::clamp(nextX, 0, maxGridX);
-                        nextY = std::clamp(nextY, 0, maxGridY);
-                    } else if (currentBoundary == BoundaryHandler::REFLECT_BOUNCE) {
-                        if (nextX < 0)         { nextX = -nextX; swarm[i].velX[r] *= -1; }
-                        if (nextX > maxGridX)  { nextX = maxGridX - (nextX - maxGridX); swarm[i].velX[r] *= -1; }
-                        if (nextY < 0)         { nextY = -nextY; swarm[i].velY[r] *= -1; }
-                        if (nextY > maxGridY)  { nextY = maxGridY - (nextY - maxGridY); swarm[i].velY[r] *= -1; }
-
-                        nextX = std::clamp(nextX, 0, maxGridX);
-                        nextY = std::clamp(nextY, 0, maxGridY);
-                    }
-
-                    swarm[i].positions[r] = createGridPoint(nextX, nextY);
-                }
+                activeBoundary->handle(swarm[i].position.x, swarm[i].position.y, swarm[i].velX, swarm[i].velY, bbox);
             }
-            auto kinematicEnd = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::milli> kinematicDuration = kinematicEnd - kinematicStart;
-            totalKinematicUpdateTimeMs += kinematicDuration.count();
 
             parallelEvaluateSwarm(swarm);
 
             for (int i = 0; i < swarmSize; ++i) {
                 if (swarm[i].currentFitness > swarm[i].pBestFitness) {
                     swarm[i].pBestFitness = swarm[i].currentFitness;
-                    swarm[i].pBestPositions = swarm[i].positions;
+                    swarm[i].pBestPosition = swarm[i].position;
                 }
-
-                if (swarm[i].currentFitness > gBestFitness) {
+                if (swarm[i].currentFitness >= gBestFitness) {
                     std::lock_guard<std::mutex> lock(gBestMutex);
-                    if (swarm[i].currentFitness > gBestFitness) {
+                    if (swarm[i].currentFitness >= gBestFitness) {
                         gBestFitness = swarm[i].currentFitness;
-                        gBestPositions = swarm[i].positions;
+                        gBestPosition = swarm[i].position;
                     }
                 }
             }
@@ -404,91 +476,154 @@ public:
         auto totalExecutionEnd = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> totalExecutionDuration = totalExecutionEnd - totalExecutionStart;
 
-        // Build and return data metrics structure tracking state records
-        return {
-            profileName, getTopologyString(), getInertiaString(), getBoundaryString(),
-            swarmSize, iterations, gBestFitness, initDuration.count(),
-            totalKinematicUpdateTimeMs, totalFitnessEvalTimeMs, totalExecutionDuration.count()
-        };
+        return { profileName, activeTopology->getName(), activeInertia->getName(), activeBoundary->getName(),
+                 swarmSize, iterations, (gBestFitness < 0.0 ? 0.0 : gBestFitness * 100.0), gBestPosition,
+                 totalExecutionDuration.count(), initialPositionsSnapshot };
     }
 };
 
 // ============================================================================
-// HELPER SETUP DATA DEF STRUCT
+// CLEAN GEOMETRIC AOI SVG EXPORT MACHINE
 // ============================================================================
-struct TestConfig {
-    std::string name;
-    int pop;
-    int gen;
-    PSOTopology topo;
-    InertiaStrategy inertia;
-    BoundaryHandler boundary;
-};
+void exportTopSolutionToSVG(const std::string& filename, const BoundingBox& box,
+                            const std::vector<GridPoint>&, const GridPoint& radarPos,
+                            const RadarPhysicsConfig& physics, const std::vector<GridPoint>& initialParticles) {
+    std::ofstream svg(filename);
+    if (!svg.is_open()) return;
+
+    int canvasWidth = 1000, canvasHeight = 700, padding = 60;
+    int activeWidthPx = canvasWidth - (2 * padding);
+    int activeHeightPx = canvasHeight - (2 * padding);
+
+    double gridWidth = box.maxX - box.minX;
+    double gridHeight = box.maxY - box.minY;
+
+    if (gridWidth <= 0) gridWidth = 1.0;
+    if (gridHeight <= 0) gridHeight = 1.0;
+
+    double scaleX = static_cast<double>(activeWidthPx) / gridWidth;
+    double scaleY = static_cast<double>(activeHeightPx) / gridHeight;
+    double pixelsPerUnit = std::min(scaleX, scaleY);
+
+    double offsetX = padding + (activeWidthPx - (gridWidth * pixelsPerUnit)) / 2.0;
+    double offsetY = padding + (activeHeightPx - (gridHeight * pixelsPerUnit)) / 2.0;
+
+    auto mapX = [&](double x) { return offsetX + (x - box.minX) * pixelsPerUnit; };
+    auto mapY = [&](double y) { return offsetY + (gridHeight - (y - box.minY)) * pixelsPerUnit; };
+
+    double rangeInPx = physics.maxRangeUnits * pixelsPerUnit;
+
+    svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << canvasWidth << "\" height=\"" << canvasHeight << "\" style=\"background-color:#0F172A;\">\n";
+    svg << "<defs><filter id=\"glow\"><feGaussianBlur stdDeviation=\"2\" result=\"coloredBlur\"/><feMerge><feMergeNode in=\"coloredBlur\"/><feMergeNode in=\"SourceGraphic\"/></feMerge></filter></defs>\n";
+
+    svg << "<text x=\"30\" y=\"35\" fill=\"#F8FAFC\" font-family=\"monospace\" font-size=\"16\" font-weight=\"bold\">PSO PLACEMENT MONITOR</text>\n";
+    svg << "<text x=\"30\" y=\"55\" fill=\"#94A3B8\" font-family=\"monospace\" font-size=\"12\">AOI Bounds: [0 to "
+        << static_cast<int>(box.maxX) << " X] x [0 to " << static_cast<int>(box.maxY) << " Y]</text>\n";
+
+    // 1. DRAW THE AOI (Solid, clean rectangular background area)
+    double bx = mapX(box.minX);
+    double by = mapY(box.maxY);
+    double bw = gridWidth * pixelsPerUnit;
+    double bh = gridHeight * pixelsPerUnit;
+
+    svg << "<rect x=\"" << bx << "\" y=\"" << by << "\" width=\"" << bw << "\" height=\"" << bh
+        << "\" fill=\"#1E293B\" stroke=\"#475569\" stroke-width=\"2\" />\n";
+
+    // 2. DRAW RADAR COVERAGE CIRCLE (Semi-translucent blue bubble)
+    double rx = mapX(radarPos.x), ry = mapY(radarPos.y);
+    svg << "<circle cx=\"" << rx << "\" cy=\"" << ry << "\" r=\"" << rangeInPx
+        << "\" stroke=\"#38BDF8\" stroke-width=\"2.5\" stroke-opacity=\"0.9\" fill=\"#0284C7\" fill-opacity=\"0.2\" />\n";
+
+    // 3. DRAW INITIAL POPULATION PARTICLES (Scattered points inside the AOI)
+    for (const auto& pt : initialParticles) {
+        double px = mapX(pt.x), py = mapY(pt.y);
+        svg << "<circle cx=\"" << px << "\" cy=\"" << py << "\" r=\"5\" fill=\"#38BDF8\" opacity=\"0.4\" filter=\"url(#glow)\"/>\n";
+        svg << "<circle cx=\"" << px << "\" cy=\"" << py << "\" r=\"2.5\" fill=\"#FFFFFF\" stroke=\"#0F172A\" stroke-width=\"1.0\"/>\n";
+    }
+
+    // 4. DRAW FINAL OPTIMIZED RADAR CENTER
+    svg << "<circle cx=\"" << rx << "\" cy=\"" << ry << "\" r=\"7\" fill=\"#F59E0B\" stroke=\"#FFFFFF\" stroke-width=\"2.0\"/>\n";
+    svg << "<circle cx=\"" << rx << "\" cy=\"" << ry << "\" r=\"2\" fill=\"#FFFFFF\"/>\n";
+
+    svg << "</svg>\n";
+    svg.close();
+
+    std::cout << ">> [SVG EXPORT] Clean geometric map saved to: " << filename << "\n";
+}
 
 // ============================================================================
-// ENTRY TESTING DRIVER
+// SYSTEM RUNTIME EXECUTION PIPELINE
 // ============================================================================
 int main() {
-    BoundingBox areaBounds = { 39.0000, 39.3000, -105.3000, -105.0000 };
-    ThreadPool pool;
+    RadarPhysicsConfig physics;
+    PsoHyperparameters hyper;
+    int swarmSize = 40, iterations = 50;
 
-    ParallelAdvancedPSO psoEngine(areaBounds, 4, pool);
-    std::vector<PSOBenchmarkResult> leaderboard;
+    if (!ConfigLoader::loadConfig("pso/pso_config.json", physics, hyper, swarmSize, iterations)) {
+        if (!ConfigLoader::loadConfig("pso_config.json", physics, hyper, swarmSize, iterations)) {
+            return 1;
+        }
+    }
 
-    // Hyperparameter Sweep Setup Formats
-    std::vector<TestConfig> sweepConfigs = {
-        { "Standard Baseline",   120, 100, PSOTopology::GLOBAL_STAR, InertiaStrategy::CONSTANT,      BoundaryHandler::ABSORB_CLAMP },
-        { "Exploratory Ring",    150, 120, PSOTopology::LOCAL_RING,   InertiaStrategy::LINEAR_DECAY,  BoundaryHandler::REFLECT_BOUNCE },
-        { "High-Jitter Flight",  150, 120, PSOTopology::LOCAL_RING,   InertiaStrategy::RANDOM_JITTER, BoundaryHandler::ABSORB_CLAMP },
-        { "Intensive Velocity",  250, 200, PSOTopology::GLOBAL_STAR, InertiaStrategy::LINEAR_DECAY,  BoundaryHandler::REFLECT_BOUNCE },
-        { "Micro-Swarm Quick",    50,  60, PSOTopology::GLOBAL_STAR, InertiaStrategy::CONSTANT,      BoundaryHandler::ABSORB_CLAMP },
-        { "Chaotic Bound Star",  120, 100, PSOTopology::GLOBAL_STAR, InertiaStrategy::RANDOM_JITTER, BoundaryHandler::REFLECT_BOUNCE },
-        { "Heavy Decay Ring",    200, 150, PSOTopology::LOCAL_RING,   InertiaStrategy::LINEAR_DECAY,  BoundaryHandler::ABSORB_CLAMP }
+    ParallelPolygonRadarPSO psoEngine(physics, hyper);
+    BoundingBox derivedBounds = psoEngine.getDerivedBounds();
+
+    std::vector<std::shared_ptr<ITopologySelector>> topologies = {
+        std::make_shared<GlobalStarTopology>(),
+        std::make_shared<LocalRingTopology>()
     };
 
-    std::cout << "===================================================================================================\n";
-    std::cout << " COMMENCING PARALLEL ADVANCED RADAR PSO HYPERPARAMETER SWEEP PERFORMANCE BENCHMARKS\n";
-    std::cout << "===================================================================================================\n";
-    std::cout << ">> Running " << sweepConfigs.size() << " automated optimization variants against thread pool tracks...\n\n";
+    std::vector<std::shared_ptr<IInertiaStrategy>> inertias = {
+        std::make_shared<ConstantInertia>(),
+        std::make_shared<LinearDecayInertia>(),
+        std::make_shared<RandomJitterInertia>()
+    };
 
-    for (const auto& config : sweepConfigs) {
-        std::cout << " -> Processing Execution Strategy profile: [" << config.name << "]...\n";
-        psoEngine.setRunConfig(config.name, config.pop, config.gen, config.topo, config.inertia, config.boundary);
-        PSOBenchmarkResult result = psoEngine.runPSO();
-        leaderboard.push_back(result);
+    std::vector<std::shared_ptr<IBoundaryHandler>> boundaries = {
+        std::make_shared<AbsorbClampHandler>(),
+        std::make_shared<ReflectBounceHandler>()
+    };
+
+    std::vector<PSOBenchmarkResult> globalMetricsTable;
+
+    int profileId = 1;
+    for (auto& topo : topologies) {
+        for (auto& inertia : inertias) {
+            for (auto& bound : boundaries) {
+                std::string label = "Profile_" + std::to_string(profileId++);
+                psoEngine.setRuntimeStrategy(label, swarmSize, iterations, topo, inertia, bound);
+                globalMetricsTable.push_back(psoEngine.runPSO());
+            }
+        }
     }
 
-    // Sort leaderboard primarily by Best Spread Distance (descending order - larger spatial coverage areas win)
-    std::sort(leaderboard.begin(), leaderboard.end(), [](const PSOBenchmarkResult& a, const PSOBenchmarkResult& b) {
-        return a.bestSpreadKm > b.bestSpreadKm;
+    std::sort(globalMetricsTable.begin(), globalMetricsTable.end(), [](const PSOBenchmarkResult& a, const PSOBenchmarkResult& b) {
+        return a.maxCoveragePercentage > b.maxCoveragePercentage;
     });
 
-    // ===================================================================================================
-    // GLOBAL CONSOLIDATED METRICS LEADERBOARD MATRIX OUTPUT
-    // ===================================================================================================
-    std::cout << "\n=========================================================================================================================================\n";
-    std::cout << "                                              FINAL PSO RADAR PLACEMENT PERFORMANCE LEADERBOARD\n";
-    std::cout << "=========================================================================================================================================\n";
-    std::cout << " Rank | Config Profile Name     | Topo   | Inertia  | Bound  | Pop  | Iters | Init (ms) | Kinemat (ms) | Eval (ms) | Best Spread | Total (ms) |\n";
-    std::cout << "------|-------------------------|--------|----------|--------|------|-------|-----------|--------------|-----------|-------------|------------|\n";
+    std::cout << "\n### Strategy Benchmarking Table (Pure Grid-Space View)\n\n";
+    std::cout << "| Rank | Topology Strategy | Inertia Model | Boundary Action | Max Coverage | Compute Time |\n";
+    std::cout << "|:----:|:------------------|:--------------|:----------------|:------------:|:------------:|\n";
 
-    for (size_t i = 0; i < leaderboard.size(); ++i) {
-        const auto& r = leaderboard[i];
-        std::cout << "  " << std::right << std::setw(2) << (i + 1) << "  | "
-                  << std::left << std::setw(23) << r.profileName << " | "
-                  << std::setw(6) << r.topology << " | "
-                  << std::setw(8) << r.inertia << " | "
-                  << std::setw(6) << r.boundary << " | "
-                  << std::right << std::setw(4) << r.swarmSize << " | "
-                  << std::setw(5) << r.iterations << " | "
-                  << std::setw(9) << std::fixed << std::setprecision(1) << r.initTimeMs << " | "
-                  << std::setw(12) << r.kinematicTimeMs << " | "
-                  << std::setw(9) << r.fitnessEvalTimeMs << " | "
-                  << std::setw(9) << std::setprecision(4) << r.bestSpreadKm << " km | "
-                  << std::setw(10) << std::setprecision(1) << r.totalTimeMs << " |\n";
+    int rank = 1;
+    for (const auto& metrics : globalMetricsTable) {
+        std::cout << "| " << std::setw(4) << rank++ << " "
+                  << "| " << std::setw(17) << std::left << metrics.topology
+                  << "| " << std::setw(13) << std::left << metrics.inertia
+                  << "| " << std::setw(14) << std::left << metrics.boundary
+                  << "| " << std::setw(10) << std::right << std::fixed << std::setprecision(2) << metrics.maxCoveragePercentage << "% "
+                  << "| " << std::setw(9) << std::fixed << std::setprecision(1) << metrics.totalTimeMs << " ms |\n";
     }
-    std::cout << "=========================================================================================================================================\n";
-    std::cout << "Note: Summary leaderboard matrix sorted by Best Spatial Distribution Spread (descending, maximal great-circle coverage is best).\n\n";
+    std::cout << "\n";
+
+    if (!globalMetricsTable.empty() && !psoEngine.filteredSamplingMesh.empty()) {
+        exportTopSolutionToSVG("pso/top_solution.svg",
+                               derivedBounds,
+                               psoEngine.filteredSamplingMesh,
+                               globalMetricsTable[0].bestLocation,
+                               physics,
+                               globalMetricsTable[0].initialPositions);
+    }
 
     return 0;
 }
