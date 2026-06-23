@@ -1,0 +1,77 @@
+{
+  "crossover-rate": 0.85,
+  "mutation-rate": 0.08,
+  "num-generation": 100,
+  "num-population": 100,
+  "weights": {
+    "w1": 0.9,
+    "w2": 0.7,
+    "w3": 0.5,
+    "w4": 0.9,
+    "x": 100
+  },
+  "display_solutions": 5,
+  "save_solutions": 15,
+  "output": "result.png",
+  "scatter-output": "scatter.png",
+  "homogenous": {
+    "chromosome-lentgh": 4,
+    "case": true,
+    "radar": {
+      "range": 300,
+      "antenna": 100,
+      "target": 1000,
+      "min-angle": 0.5,
+      "max-angle": 30
+    }
+  },
+  "heterogenous": {
+    "chromosome-lentgh": 4,
+    "case": false,
+    "target": 1000,
+    "radars": [
+      {
+        "radar": {
+          "range": 300,
+          "antenna": 100,
+          "min-angle": 0.5,
+          "max-angle": 30,
+          "quantity": 2
+        }
+      },
+      {
+        "radar": {
+          "range": 150,
+          "antenna": 100,
+          "min-angle": 0.5,
+          "max-angle": 30,
+          "quantity": 2
+        }
+      }
+    ]
+  },
+  "auto": {
+    "min-radar": 3,
+    "max-radar": 8,
+    "radars": [
+      {
+        "radar": {
+          "range": 300,
+          "antenna": 100,
+          "min-angle": 0.5,
+          "max-angle": 30,
+          "quantity": 2
+        }
+      },
+      {
+        "radar": {
+          "range": 150,
+          "antenna": 100,
+          "min-angle": 0.5,
+          "max-angle": 30,
+          "quantity": 2
+        }
+      }
+    ]
+  }
+}
