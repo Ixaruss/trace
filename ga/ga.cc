@@ -41,11 +41,9 @@ struct Chromosome {
     public: Chromosome(int length) : radar(length), fitness(0.0) {}
 };
 
-// --- Local Radar Coverage Container ---
-struct LocalCoverage {
-    std::vector<uint8_t> mask;
-    int rowMin, rowMax, colMin, colMax;
-    int localCols, localRows;
+struct RadarConfig {
+    double rangeKm;
+    int count;
 };
 
 class ThreadPool {
@@ -130,7 +128,8 @@ public:
         std::cout << "[ga] Synchronously pre-loading all .bin matrices to memory...\n";
         g.bin.init();
     }
-        Chromosome generate_random_chromosome(const FeasibleGrid& f, int length) {
+
+    Chromosome generate_random_chromosome(const FeasibleGrid& f, int length) {
             int max_cells = f.cells.size();
             if (length > max_cells) length = max_cells;
 
@@ -145,16 +144,51 @@ public:
                         cn.radar[i] = {f.cells[x].r, f.cells[x].c};
                     }
             return cn;
-        }
+    }
+    Chromosome generate_random_auto_chromosome(const FeasibleGrid& f, int minRadars = 2, int maxRadars = 10) {
+            int max_cells = f.cells.size();
 
+            std::uniform_int_distribution<int> gen(0, max_cells - 1);
+            std::uniform_int_distribution<int> len(minRadars,maxRadars);
+            int length = len(rng);
+            Chromosome cn(length);
+            std::unordered_set<int> used;
+
+            for (int i = 0; i < length; i++) {
+                        int x;
+                        do { x = gen(rng); } while (!used.insert(x).second);
+                        // FIX 4: Explicit assignment
+                        cn.radar[i] = {f.cells[x].r, f.cells[x].c};
+                    }
+            return cn;
+    }
 
     static void evaluate_fitness(Global& g, const FeasibleGrid& base_grid, Chromosome& cn, int index, bool writePng) {
         std::string png_path = writePng ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
         auto res = calculate_radar_coverage_overlap(g, base_grid, cn.radar, 5.0, png_path);
-
+        int total = base_grid.cells.size();
+        float unique = res[1] / total;
+        float low_overlap = res[2] / total;
+        float high_overlap = res[3] / total;
+        float spacing_gaps = res[0] / total;
         // Target: Maximize layered tracking landscape coverage, heavily fine proximity violations
         double w1 = 0.9, w2 = 0.75, w3 = 0.9, w4 = 0.9;
-        double fitness = (res[1] * w1) + (res[2] * w2) - (res[3] * w3) - (res[0] * w4);
+        double fitness = (unique * w1) + (low_overlap * w2) - (high_overlap * w3) - (spacing_gaps * w4);
+        cn.fitness = fitness;
+    }
+
+    static void evaluate_variable_fitness(Global& g, const FeasibleGrid& base_grid, Chromosome& cn, int index, bool writePng) {
+        std::string png_path = writePng ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
+        auto res = calculate_radar_coverage_overlap(g, base_grid, cn.radar, 5.0, png_path);
+        int total = base_grid.cells.size();
+        float unique = res[1] / total;
+        float low_overlap = res[2] / total;
+        float high_overlap = res[3] / total;
+        float spacing_gaps = res[0] / total;
+        float num_r = cn.radar.size();
+        // Target: Maximize layered tracking landscape coverage, heavily fine proximity violations
+        double w1 = 0.9, w2 = 0.75, w3 = 0.9, w4 = 0.9, lambda = 50;
+        double fitness = (unique * w1) + (low_overlap * w2) - (high_overlap * w3) - (spacing_gaps * w4) - (num_r * lambda) ;
         cn.fitness = fitness;
     }
 
@@ -375,7 +409,7 @@ public:
         crossoverRate = cRate;
     }
 
-    void run_evolution(int pathLength, int generations) {
+    void run_homogenous(int pathLength, int generations) {
         population.clear();
         population.reserve(popSize);
 
@@ -451,6 +485,115 @@ public:
         calculate_radar_coverage_overlap(g, f, finalBest->radar, 5.0, "final_optimized_coverage.png");
         Bin::writeRadarScatterPng(finalBest->radar, "final_optimized_scatter.png");
     }
+
+    void run_heterogenous(const std::vector<RadarConfig>& fleetConfig, int generations) {
+        // Flatten the configured fleet into a strict index array mapped directly to meters
+        std::vector<double> flattenedRangesM;
+        for (const auto& config : fleetConfig) {
+            for (int i = 0; i < config.count; ++i) {
+                flattenedRangesM.push_back(config.rangeKm * 1000.0);
+            }
+        }
+
+        int pathLength = flattenedRangesM.size();
+
+        population.clear();
+        population.reserve(popSize);
+
+        std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
+        auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+
+        // --- Init Generation 0 ---
+        for (int i = 0; i < popSize; i++) {
+            population.push_back(generate_random_chromosome(f, pathLength));
+        }
+
+        std::cout << "[ga] Dispatching parallel coverage evaluation for Generation 0...\n";
+        parallelEvaluatePopulation(population, g, f, flattenedRangesM, false);
+
+        std::normal_distribution<double> gaussDist(0.0, 10.0);
+
+        for (int gen = 1; gen <= generations; ++gen) {
+
+            // Sort population (vital for Rank-Based Selection and Elitism extraction)
+            std::sort(population.begin(), population.end(), [](const Chromosome& a, const Chromosome& b) {
+                return a.fitness < b.fitness;
+            });
+
+            std::vector<Chromosome> nextGen;
+            nextGen.reserve(popSize);
+
+            // Carry over the absolute best to prevent regression
+            nextGen.push_back(population.back());
+
+            bool useSUS = (currentSelection == SelectionMethod::SUS);
+            std::vector<Chromosome> matingPool;
+            if (useSUS) {
+                matingPool = stochasticUniversalSampling(population, popSize - 1);
+            }
+
+            size_t poolIdx = 0;
+            while (nextGen.size() < (size_t)popSize) {
+                Chromosome p1(0), p2(0);
+                if (useSUS) {
+                    p1 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
+                    p2 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
+                } else {
+                    p1 = executeSelection(population);
+                    p2 = executeSelection(population);
+                }
+
+                auto [c1, c2] = executeCrossover(p1, p2);
+
+                executeMutation(c1, f, gaussDist);
+                executeMutation(c2, f, gaussDist);
+
+                nextGen.push_back(c1);
+                if (nextGen.size() < (size_t)popSize) nextGen.push_back(c2);
+            }
+
+            // Parallel Evaluate the new breed using the strict locus mapping array
+            parallelEvaluatePopulation(nextGen, g, f, flattenedRangesM, false);
+            population = std::move(nextGen);
+
+            auto bestInd = std::max_element(population.begin(), population.end(),
+                [](const Chromosome& a, const Chromosome& b) { return a.fitness < b.fitness; });
+
+            std::cout << "  -> Gen " << gen << " Best Local Fitness Score: " << bestInd->fitness << "\n";
+        }
+
+        // --- Post-Evolution Cleanup & Export ---
+        auto finalBest = std::max_element(population.begin(), population.end(),
+            [](const Chromosome& a, const Chromosome& b) { return a.fitness < b.fitness; });
+
+        std::cout << "\n[ga] Evolution Complete. Best Lifetime Score: " << finalBest->fitness << "\n";
+
+        // Dump visual matrices for the final absolute best setup
+        calculate_radar_coverage_overlap(g, f, finalBest->radar, flattenedRangesM, 5.0, "final_optimized_coverage.png");
+        Bin::writeRadarScatterPng(finalBest->radar, "final_optimized_scatter.png");
+    }
+
+    void run_auto (const std::vector<RadarConfig>& fleetConfig, int generations){
+        std::vector<double> flattenedRangesM;
+        for (const auto& config : fleetConfig) {
+            for (int i = 0; i < config.count; ++i) {
+                flattenedRangesM.push_back(config.rangeKm * 1000.0);
+            }
+        }
+
+        int pathLength = flattenedRangesM.size();
+
+        population.clear();
+        population.reserve(popSize);
+
+        std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
+        auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+
+        // --- Init Generation 0 ---
+        for (int i = 0; i < popSize; i++) {
+            population.push_back(generate_random_auto_chromosome(f, pathLength));
+        }
+    }
 };
 
 int main () {
@@ -461,7 +604,7 @@ int main () {
     g.setOperators(SelectionMethod::TOURNAMENT, CrossoverMethod::UNIFORM, MutationMethod::SPATIAL_NUDGE, 0.08, 0.85);
 
     // Optimize placement of 4 radars across 50 evolutionary generations
-    g.run_evolution(2, 100);
+    g.run_homogenous(2, 100);
 
     return 0;
 }
