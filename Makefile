@@ -9,3 +9,6 @@ tool:
 
 deploy:
 	g++  deploy.cc preprocess/jsonParser.cc preprocess/reproject.cc  preprocess/lib/*.cc -o x $(gdal-config --cflags --libs) -ljsoncpp -lgdal -lpng16 -std=c++23
+
+ga:
+	g++ -O3 -ffast-math -march=native -fopenmp ga/main.cc  ga/config.cc preprocess/jsonParser.cc preprocess/reproject.cc common/coverage.cc  preprocess/lib/*.cc -o x $(gdal-config --cflags --libs) -ljsoncpp -lgdal -lhdf5  -lpng16 -std=c++23
