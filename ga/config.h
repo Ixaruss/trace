@@ -18,6 +18,7 @@ struct Parameters {
     int numGenerations;
     int numPopulation;
     Weights weights;
+    bool save;
     int displaySolutions;
     int saveSolutions;
     std::string output;
@@ -35,19 +36,22 @@ struct RadarConf {
 
 struct HomogenousConf {
     int chromosomeLength;
-    bool casee;
+    bool is_case;
     RadarConf radar;
 };
 
 struct HeterogenousConf {
     int chromosomeLength;
-    bool casee;
+    bool is_case;
+    int target;
     std::vector<RadarConf> radars;
 };
 
 struct autoGenConf {
     int minRadars;
     int maxRadars;
+    int target;
+    bool is_case;
     std::vector<RadarConf> radars;
 };
 

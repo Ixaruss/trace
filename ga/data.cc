@@ -19,13 +19,11 @@
 #include <H5Cpp.h>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
-#include <numeric>
 #include <random>
 #include <string>
 #include <thread>

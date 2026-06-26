@@ -257,12 +257,17 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     FeasibleGrid                  grid,               // BY VALUE — caller's private copy
     const std::vector<GridPoint>& placements,
     double                        minSpacingCells = 5.0,
-    const std::string&            pngPath         = "")
+    const std::string&            pngPath         = "",
+    const std::vector<double>&    radarRanges     = {},
+    double                        antennaHeight   = 50.0,    // metres AGL
+    double                        minAngle        = 0.5,     // degrees
+    double                        target          = 1000.0,  // metres
+    double                        maxAngle        = 30.0,    // degrees
+    double                        rangeM          = 25000.0 // metres — was wrongly `int range = 25`
+)
 {
     std::vector<int> result(4, 0);
     if (placements.empty() || grid.cells.empty()) return result;
-
-    // ── [0] Under-separation penalty ─────────────────────────────────────
     for (size_t i = 0; i < placements.size(); ++i)
         for (size_t j = i + 1; j < placements.size(); ++j) {
             const double dr = placements[i].r - placements[j].r;
@@ -270,36 +275,70 @@ inline std::vector<int> calculate_radar_coverage_overlap(
             if (std::sqrt(dr*dr + dc*dc) < minSpacingCells) ++result[0];
         }
 
-    // ── Per-placement: build local mask, tally overlap ───────────────────
-    for (const auto& p : placements) {
-        const rc_detail::LocalMask mask =
-            rc_detail::computeLocalMask(
+    if (!radarRanges.empty()) {
+        for (size_t i = 0; i < placements.size(); i++) {
+            const auto& p = placements[i];
+            double maxRangeM = radarRanges[i];
+
+            const rc_detail::LocalMask cov =
+                rc_detail::computeLocalMask(
                 g, p.r, p.c,
-                /*antennaH*/  50.0,
-                /*targetH*/  1'000.0,
-                /*minElev*/   0.5,
-                /*maxElev*/   30.0,
-                /*rangeM*/  300'000.0);
+                antennaHeight,
+                target,
+                minAngle,
+                maxAngle,
+                maxRangeM
+            );
 
-        for (auto& cell : grid.cells) {
-            // Quick bounds check before indexing
-            if (cell.r < mask.rowMin || cell.r >= mask.rowMax ||
-                cell.c < mask.colMin || cell.c >= mask.colMax) continue;
+            for (auto& cell : grid.cells) {
+                if (cell.r >= cov.rowMin && cell.r < cov.rowMax &&
+                    cell.c >= cov.colMin && cell.c < cov.colMax) {
+                    size_t local_r = cell.r - cov.rowMin;
+                    size_t local_c = cell.c - cov.colMin;
+                    size_t flat = local_r * cov.localCols + local_c;
 
-            const size_t flat =
-                static_cast<size_t>(cell.r - mask.rowMin) * mask.localCols +
-                (cell.c - mask.colMin);
-
-            if (mask.buf[flat]) ++cell.overlap;
+                    if (flat < cov.buf.size() && cov.buf[flat] == 1) {
+                        cell.overlap++;
+                    }
+                }
+            }
         }
-        // mask goes out of scope here — bounding-box memory released immediately
+    } else {
+        // Homogenous path — all radars share the same physical spec.
+        // rangeM is in metres (default 300 km); previously this was
+        // `int range = 25` which passed 25 *metres* and produced no coverage.
+        for (const auto& p : placements) {
+            const rc_detail::LocalMask mask =
+                rc_detail::computeLocalMask(
+                    g, p.r, p.c,
+                    antennaHeight,
+                    target,
+                    minAngle,
+                    maxAngle,
+                    rangeM);   // ← was `range` (int 25 = 25 m), now correct metres
+
+            for (auto& cell : grid.cells) {
+                // Quick bounds check before indexing
+                if (cell.r < mask.rowMin || cell.r >= mask.rowMax ||
+                    cell.c < mask.colMin || cell.c >= mask.colMax) continue;
+
+                const size_t flat =
+                    static_cast<size_t>(cell.r - mask.rowMin) * mask.localCols +
+                    (cell.c - mask.colMin);
+
+                if (mask.buf[flat]) ++cell.overlap;
+            }
+            // mask goes out of scope here — bounding-box memory released immediately
+        }
     }
+
 
     // ── Bucket final per-cell overlap counts ─────────────────────────────
     for (const auto& cell : grid.cells) {
         if      (cell.overlap == 1) ++result[1];
         else if (cell.overlap == 2) ++result[2];
         else if (cell.overlap >= 3) ++result[3];
+        // std::cout<< cell.overlap << std::endl;
     }
 
     // ── Optional PNG render ───────────────────────────────────────────────
@@ -307,4 +346,74 @@ inline std::vector<int> calculate_radar_coverage_overlap(
         Bin::writeFeasibleGridOverlapPng(grid, pngPath, placements);
 
     return result;
+}
+
+/**
+ * get_individual_coverage
+ *
+ * actual = feasible cells the radar can see (LOS mask buf == 1)
+ * ideal  = feasible cells within radius R of the placement
+ *          (what a perfectly unobstructed radar would cover)
+ *
+ * Returns  actual / ideal  in [0.0, 1.0].
+ * Returns  0.0             if no feasible cells fall within range.
+ */
+inline double get_individual_coverage(
+    Global&              g,
+    const FeasibleGrid&  grid,
+    int                  srcRow,
+    int                  srcCol,
+    double               antennaHeight = 50.0,
+    double               targetH       = 1000.0,
+    double               minAngle      = 0.5,
+    double               maxAngle      = 30.0,
+    double               maxRangeM     = 25000.0)
+{
+    using namespace rc_detail;
+
+    const int gridRows = g.conf.grid.rows;
+    const int gridCols = g.conf.grid.cols;
+
+    // ── Build local LOS mask ──────────────────────────────────────────────
+    const LocalMask mask = computeLocalMask(
+        g, srcRow, srcCol,
+        antennaHeight, targetH,
+        minAngle, maxAngle,
+        maxRangeM);
+
+    // Reproduce the same R clamping computeLocalMask applies so the
+    // radius we test feasible cells against is identical to the one
+    // used when casting rays.
+    int R = static_cast<int>(std::ceil(maxRangeM / RESOLUTION));
+    R = std::min(R, std::min(
+            std::min(srcRow,         gridRows - srcRow - 1),
+            std::min(srcCol,         gridCols - srcCol - 1)));
+
+    const double R2 = static_cast<double>(R) * R;
+
+    // ── Count over feasible cells only ────────────────────────────────────
+    int actual = 0;
+    int ideal  = 0;
+
+    for (const auto& cell : grid.cells) {
+        // Must fall within the radar's radius
+        const double dr = cell.r - srcRow;
+        const double dc = cell.c - srcCol;
+        if (dr * dr + dc * dc > R2) continue;
+
+        ++ideal;
+
+        // Check LOS mask — also guards against cells outside bounding box
+        if (cell.r < mask.rowMin || cell.r >= mask.rowMax ||
+            cell.c < mask.colMin || cell.c >= mask.colMax) continue;
+
+        const size_t flat =
+            static_cast<size_t>(cell.r - mask.rowMin) * mask.localCols +
+            static_cast<size_t>(cell.c - mask.colMin);
+
+        if (flat < mask.buf.size() && mask.buf[flat] == 1) ++actual;
+    }
+
+    if (ideal == 0) return 0.0;
+    return static_cast<double>(actual) / static_cast<double>(ideal);
 }
