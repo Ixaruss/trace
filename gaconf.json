@@ -1,7 +1,7 @@
 {
   "crossover-rate": 0.85,
   "mutation-rate": 0.08,
-  "num-generation": 100,
+  "num-generation": 50,
   "num-population": 100,
   "weights": {
     "w1": 0.9,
@@ -11,14 +11,15 @@
     "x": 100
   },
   "display_solutions": 5,
-  "save_solutions": 15,
+  "save": true,
+  "save_solutions": 10,
   "output": "result.png",
   "scatter-output": "scatter.png",
   "homogenous": {
     "chromosome-lentgh": 4,
     "case": true,
     "radar": {
-      "range": 300,
+      "range": 100,
       "antenna": 100,
       "target": 1000,
       "min-angle": 0.5,
