@@ -1,36 +1,66 @@
 # =====================================================
-# Preprocess
+# Compiler & Global Flags for macOS
 # =====================================================
-bin:
-	g++ preprocess/preprocess.cc \
-	preprocess/main.cc \
-	preprocess/jsonParser.cc \
-	preprocess/reproject.cc  \
-	preprocess/lib/*.cc \
-	-I/opt/homebrew/include \
-	-I/opt/homebrew/include/jsoncpp \
-	$(gdal-config --cflags) \
-	-std=c++23 \
-	-o preproc \
-	-L/opt/homebrew/lib \
-	-lpng16 \
-	-ljsoncpp \
-	-lgdal && ./preproc
+CXX      := clang++
+CXXFLAGS := -std=c++23 -O3 -march=native -ffast-math -ffp-contract=fast -funroll-loops -fvectorize -w
+
+# Homebrew Includes and Libs
+HOMEBREW_INCLUDES := -I/opt/homebrew/include -I/opt/homebrew/include/jsoncpp
+HOMEBREW_LIBS     := -L/opt/homebrew/lib -ljsoncpp -lgdal -lpng16
+
+# OpenMP configuration for Apple Clang
+OMP_FLAGS := -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include
+OMP_LIBS  := -L/opt/homebrew/opt/libomp/lib -lomp
+
+# macOS Linker Dead-Code Stripping (Replaces Linux --gc-sections)
+MAC_LDFLAGS := -Wl,-dead_strip
+
+# Dynamic configuration flags via packages
+GDAL_CFLAGS := $(shell gdal-config --cflags)
+GDAL_LIBS   := $(shell gdal-config --libs)
+
+JSON_CFLAGS := $(shell pkg-config --cflags jsoncpp)
+JSON_LIBS   := $(shell pkg-config --libs jsoncpp)
+
+PNG_CFLAGS  := $(shell pkg-config --cflags libpng)
+PNG_LIBS    := $(shell pkg-config --libs libpng)
+
+# Common Preprocess Shared Sources
+PREPROCESS_SRC := preprocess/jsonParser.cc preprocess/reproject.cc preprocess/lib/*.cc
+
+.PHONY: all bin test tool deploy ga astar pso gen_bin clean
+
+all: tool
 
 # =====================================================
-# Main Adapt CLI
+# Preprocess & Run
+# =====================================================
+bin:
+	$(CXX) $(CXXFLAGS) preprocess/preprocess.cc \
+	preprocess/main.cc \
+	$(PREPROCESS_SRC) \
+	$(HOMEBREW_INCLUDES) \
+	$(GDAL_CFLAGS) \
+	-o preproc \
+	$(HOMEBREW_LIBS) && ./preproc
+
+# =====================================================
+# Preprocess Test Run
+# =====================================================
+test:
+	$(CXX) $(CXXFLAGS) preprocess/test.cc \
+	$(PREPROCESS_SRC) \
+	$(HOMEBREW_INCLUDES) \
+	$(GDAL_CFLAGS) \
+	-o x_test \
+	$(HOMEBREW_LIBS) && ./x_test
+
+# =====================================================
+# Main Adapt CLI (with Optimized OpenMP parallel processing)
 # =====================================================
 tool:
-	clang++ \
-	-O3 \
-	-std=c++23 \
-	-march=native \
-	-flto \
-	-Xpreprocessor -fopenmp \
-	-I/opt/homebrew/opt/libomp/include \
-	$(shell pkg-config --cflags jsoncpp) \
-	$(shell pkg-config --cflags libpng) \
-	$(shell gdal-config --cflags) \
+	$(CXX) $(CXXFLAGS) -flto $(OMP_FLAGS) \
+	$(JSON_CFLAGS) $(PNG_CFLAGS) $(GDAL_CFLAGS) \
 	cli/main.cc \
 	common/lineofsight.cc \
 	common/image.cc \
@@ -39,75 +69,73 @@ tool:
 	common/radarlos.cc \
 	common/mult.cc \
 	common/operations.cc \
-	preprocess/jsonParser.cc \
-	preprocess/reproject.cc \
 	preprocess/preprocess.cc \
-	preprocess/lib/*.cc \
+	$(PREPROCESS_SRC) \
 	-o adapt \
-	$(shell pkg-config --libs jsoncpp) \
-	$(shell pkg-config --libs libpng) \
-	$(shell gdal-config --libs) \
-	-L/opt/homebrew/opt/libomp/lib \
-	-lomp \
-	-ffast-math \
-	-ffp-contract=fast \
-	-funroll-loops \
-	-fvectorize \
-	-fdata-sections \
-	-ffunction-sections \
-	-Wl,-dead_strip \
-	-w
+	$(JSON_LIBS) $(PNG_LIBS) $(GDAL_LIBS) \
+	$(OMP_LIBS) \
+	-fdata-sections -ffunction-sections \
+	$(MAC_LDFLAGS)
 
 # =====================================================
-# path-finder
+# Deploy Target
 # =====================================================
-.PHONY: astar
+deploy:
+	$(CXX) $(CXXFLAGS) deploy.cc \
+	$(PREPROCESS_SRC) \
+	$(HOMEBREW_INCLUDES) \
+	$(GDAL_CFLAGS) \
+	-o x_deploy \
+	$(HOMEBREW_LIBS)
+
+# =====================================================
+# Genetic Algorithm (GA) Build with HDF5
+# =====================================================
+ga:
+	$(CXX) $(CXXFLAGS) $(OMP_FLAGS) ga/main.cc \
+	ga/config.cc \
+	common/coverage.cc \
+	$(PREPROCESS_SRC) \
+	$(HOMEBREW_INCLUDES) \
+	$(GDAL_CFLAGS) \
+	-o x_ga \
+	$(HOMEBREW_LIBS) -lhdf5 $(OMP_LIBS)
+
+# =====================================================
+# Path Finder (A*)
+# =====================================================
 astar:
-	g++ -O3 path-finder/astar.cc \
-	-I/opt/homebrew/include \
-	-I/opt/homebrew/include/jsoncpp \
-	$(gdal-config --cflags) \
-	-std=c++23 \
+	$(CXX) $(CXXFLAGS) path-finder/astar.cc \
+	$(HOMEBREW_INCLUDES) \
+	$(GDAL_CFLAGS) \
 	-o astar_run \
 	-L/opt/homebrew/lib \
-	-ljsoncpp $(gdal-config --libs)
+	-ljsoncpp $(GDAL_LIBS)
+
+# =====================================================
+# Particle Swarm Optimization (PSO) Single Radar
+# =====================================================
+pso:
+	$(CXX) $(CXXFLAGS) pso/main.cc \
+	$(PREPROCESS_SRC) \
+	$(HOMEBREW_INCLUDES) \
+	$(GDAL_CFLAGS) \
+	-o pso_run \
+	$(HOMEBREW_LIBS) && ./pso_run
+
+# =====================================================
+# Generate Binary Maps / Data
+# =====================================================
+gen_bin:
+	$(CXX) $(CXXFLAGS) pso/generate_bin.cc \
+	$(HOMEBREW_INCLUDES) \
+	$(GDAL_CFLAGS) \
+	-o gen_bin \
+	-L/opt/homebrew/lib \
+	-ljsoncpp $(GDAL_LIBS) && ./gen_bin
 
 # =====================================================
 # Cleanup
 # =====================================================
 clean:
-	rm -f x test_app adapt
-
-
-# =====================================================
-# pso single radar
-# =====================================================
-.PHONY: pso
-pso:
-	g++ -O3 pso/main.cc \
-	preprocess/jsonParser.cc \
-	preprocess/reproject.cc  \
-	preprocess/lib/*.cc \
-	-I/opt/homebrew/include \
-	-I/opt/homebrew/include/jsoncpp \
-	$(gdal-config --cflags) \
-	-std=c++23 \
-	-o pso_run \
-	-L/opt/homebrew/lib \
-	-lpng16 \
-	-ljsoncpp \
-	-lgdal && ./pso_run
-
-# =====================================================
-# generate bin
-# =====================================================
-.PHONY: astar
-gen_bin:
-	g++ -O3 pso/generate_bin.cc \
-	-I/opt/homebrew/include \
-	-I/opt/homebrew/include/jsoncpp \
-	$(gdal-config --cflags) \
-	-std=c++23 \
-	-o gen_bin \
-	-L/opt/homebrew/lib \
-	-ljsoncpp $(gdal-config --libs) && ./gen_bin
+	rm -f preproc x_test adapt x_deploy x_ga astar_run pso_run gen_bin
