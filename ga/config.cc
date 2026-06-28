@@ -11,7 +11,7 @@ bool GaConf::is_available(optional<const string> path) {
 void parseHeteroRadarDetails(const Json::Value& node, RadarConf& r) {
     r.range = node["range"].asDouble();
     r.antennaHeight = node["antenna"].asDouble();
-    r.maxAngle = node["min-angle"].asDouble();
+    r.minAngle = node["min-angle"].asDouble();
     r.maxAngle = node["max-angle"].asDouble();
     r.quantity = node["quantity"].asInt();
 }
@@ -59,7 +59,7 @@ GaConf from_json(const Json::Value& root) {
 
     // --- Heterogenous Settings ---
     Json::Value heteroNode = root["heterogenous"];
-    config.hetero.chromosomeLength = heteroNode["chromosome-lentgh"].asInt();
+    config.hetero.chromosomeLength = heteroNode["chromosome-length"].asInt();
     config.hetero.is_case = heteroNode["case"].asBool();
     config.hetero.target = heteroNode["target"].asInt();
      parseRadarArray(heteroNode["radars"],config.hetero.radars);
@@ -68,6 +68,7 @@ GaConf from_json(const Json::Value& root) {
     Json::Value autoNode = root["auto"];
     config.autoG.minRadars = autoNode["min-radar"].asInt();
     config.autoG.maxRadars = autoNode["max-radar"].asInt();
+    config.autoG.is_case = autoNode["case"].asBool();
     parseRadarArray(autoNode["radars"],config.autoG.radars);
 
 

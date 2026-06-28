@@ -179,6 +179,13 @@ class GaEngine {
     GaConf conf;
     bool confLoaded = false;
 
+    void reloadConfig() {
+        if (GaConf::is_available()) {
+            conf = GaConf::load();
+            confLoaded = true;
+            applyConfig();
+        }
+    }
     // --- Hyperparameters (set from config or defaults) ---
     int    popSize       = NUM_CHROMOSOMES;
     double mutationRate  = 0.08;
@@ -271,32 +278,38 @@ class GaEngine {
         const Weights& w, const RadarPhysParams& rp, bool writePng)
     {
         std::string png_path = writePng
-            ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
+                   ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
 
-        // radarRanges left empty → homogenous path in calculate_radar_coverage_overlap.
-        // All physical params are now sourced from rp (config or defaults), so the
-        // old bug of `int range = 25` (25 metres!) can never fire here.
-        auto res = calculate_radar_coverage_overlap(
-            g, base_grid, cn.radar,
-            5.0,          // minSpacingCells
-            png_path,
-            {},           // radarRanges empty → homogenous branch
-            rp.antennaHeight,
-            rp.minAngleDeg,
-            rp.targetHeight,
-            rp.maxAngleDeg,
-            rp.rangeM);   // metres — e.g. 300 000 not 25
+               auto res = calculate_radar_coverage_overlap(
+                   g, base_grid, cn.radar,
+                   5.0,
+                   png_path,
+                   {},
+                   rp.antennaHeight,
+                   rp.minAngleDeg,
+                   rp.targetHeight,
+                   rp.maxAngleDeg,
+                   rp.rangeM);
 
-        int    total        = (int)base_grid.cells.size();
-        double unique       = (double)res[1] / total;
-        double low_overlap  = (double)res[2] / total;
-        double high_overlap = (double)res[3] / total;
-        double spacing_gaps = (double)res[0] / total;
+               int    total        = (int)base_grid.cells.size();
+               double unique       = (double)res[1] / total;
+               double low_overlap  = (double)res[2] / total;
+               double high_overlap = (double)res[3] / total;
+               double spacing_gaps = (double)res[0] / total;
+               double overlap_factor = (low_overlap + high_overlap) / unique;
+               bool aarush_flag    = false;
 
-        cn.fitness = (unique       * w.w1)
-                   + (low_overlap  * w.w2)
-                   - (high_overlap * w.w3)
-                   - (spacing_gaps * w.w4);
+               if (aarush_flag == true){
+                   cn.fitness = (unique       * w.w1)
+                              + (low_overlap  * w.w2)
+                              - (high_overlap * w.w3)
+                              - (spacing_gaps * w.w4);
+               }
+               else{
+                   double target_error = abs(0.25 - overlap_factor);
+                   double closeness_reward = std::max<double>(0.0, 1.0 - target_error);
+                   cn.fitness = (0.70 * unique) + (0.30 * closeness_reward);
+               }
     }
 
     // Heterogenous fitness — weighted cell-count formula (case 2).
@@ -961,6 +974,88 @@ public:
 
     const vector<Chromosome>& get_population() const { return population; }
 
+    // generate random inputs for heatmap
+    void run_native_random_simulation(int num_experiments) {
+        unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+
+        std::default_random_engine generator(seed);
+        std::uniform_real_distribution<double> dist_range(50.0, 300.0);
+        std::uniform_real_distribution<double> dist_antenna(10.0, 50.0);
+        std::uniform_real_distribution<double> dist_target(500.0, 5000.0);
+        std::uniform_real_distribution<double> dist_min_angle(0.0, 5.0);
+        std::uniform_real_distribution<double> dist_max_angle(40.0, 60.0);
+        std::uniform_real_distribution<double> dist_num_radars(3.0, 8.0);
+
+        std::cout << "--> Starting " << num_experiments << " Native Randomized Homogeneous Simulations..." << std::endl;
+        ThreadPool pool;
+        GaEngine ga(pool);
+
+        ga.setOperators(SelectionMethod::TOURNAMENT, CrossoverMethod::UNIFORM,
+                        MutationMethod::SPATIAL_NUDGE,
+                        /*mRate=*/0.08, /*cRate=*/0.85);
+
+        string CONFIG_FILE = "gaconf.json";
+
+        for (int i = 1; i <= num_experiments; ++i) {
+            std::cout << "\n==================================================" << std::endl;
+            std::cout << " RUN SIMULATION [" << i << " / " << num_experiments << "]" << std::endl;
+            std::cout << "==================================================" << std::endl;
+
+            // 2. Read the current configuration file into a Json::Value object
+            Json::Value root;
+            std::ifstream file_input(CONFIG_FILE);
+            if (!file_input.is_open()) {
+                std::cerr << "❌ Error: Could not open config.json!" << std::endl;
+                return;
+            }
+
+            Json::CharReaderBuilder reader;
+            std::string errs;
+            if (!Json::parseFromStream(reader, file_input, &root, &errs)) {
+                std::cerr << "❌ JSON Parsing Error: " << errs << std::endl;
+                return;
+            }
+            file_input.close(); // Close immediately after reading
+
+            double rand_range    = dist_range(generator);
+            double rand_antenna  = dist_antenna(generator);
+            double rand_target   = dist_target(generator);
+            double rand_min_angle = dist_min_angle(generator);
+            double rand_max_angle = dist_max_angle(generator);
+            double rand_num_radars = dist_num_radars(generator);
+
+            root["heterogenous"]["case"] = false;
+
+            root["homogenous"]["case"] = true;
+            root["homogenous"]["chromosome-length"]  = int(rand_num_radars);
+            root["homogenous"]["radar"]["range"]     = int(rand_range);
+            root["homogenous"]["radar"]["antenna"]   = int(rand_antenna);
+            root["homogenous"]["radar"]["target"]    = int(rand_target);
+            root["homogenous"]["radar"]["min-angle"] = int(rand_min_angle);
+            root["homogenous"]["radar"]["max-angle"] = int(rand_max_angle);
+
+            // Change output file names per run dynamically so they don't overwrite each other
+            root["output"]         = "result_run_" + std::to_string(i) + ".png";
+            root["scatter-output"] = "scatter_run_" + std::to_string(i) + ".png";
+
+            // 5. Write the updated JSON structure back to config.json
+            std::ofstream file_output(CONFIG_FILE);
+            Json::StreamWriterBuilder writer;
+            file_output << Json::writeString(writer, root);
+            file_output.close();
+
+            std::cout << ">> Config updated with random parameters:" << std::endl;
+            std::cout << "   - Range: " << int(rand_range) << " km\n"
+                      << "   - Antenna: " << int(rand_antenna) << " m\n"
+                      << "   - No. of Radars: " << int(rand_num_radars) << " \n"
+                      << "   - Target Threat: " << int(rand_target) << " m\n"
+                      << "   - Min Angle: " << int(rand_min_angle) << " \n"
+                      << "   - Max Angle: " << int(rand_max_angle) << " " << std::endl;
+            ga.reloadConfig();
+            ga.run_homogenous();
+            std::cout << ">> Run [" << i << "] completed and saved successfully." << std::endl;
+        }
+    }
     // ------------------------------------------------------------------
     // run_homogenous
     // All radars share a single fixed range (set in radar.h defaults).
@@ -1327,63 +1422,64 @@ public:
 int main() {
     ThreadPool pool;
     GaEngine ga(pool);
+    ga.run_native_random_simulation(5);
 
-    // Always configure operator enums here.
-    // Numeric rates (mutationRate / crossoverRate) are only used by
-    // setOperators if no config was loaded; otherwise config values win.
-    ga.setOperators(SelectionMethod::TOURNAMENT, CrossoverMethod::UNIFORM,
-                    MutationMethod::SPATIAL_NUDGE,
-                    /*mRate=*/0.08, /*cRate=*/0.85);
+    // // Always configure operator enums here.
+    // // Numeric rates (mutationRate / crossoverRate) are only used by
+    // // setOperators if no config was loaded; otherwise config values win.
+    // ga.setOperators(SelectionMethod::TOURNAMENT, CrossoverMethod::UNIFORM,
+    //                 MutationMethod::SPATIAL_NUDGE,
+    //                 /*mRate=*/0.08, /*cRate=*/0.85);
 
-    // --- Dispatch based on config when present ---
-    if (GaConf::is_available()) {
-        GaConf cfg = GaConf::load();
+    // // --- Dispatch based on config when present ---
+    // if (GaConf::is_available()) {
+    //     GaConf cfg = GaConf::load();
 
-        if (cfg.homo.is_case) {
-            // Parameters (pop, rates, weights, output) already applied in
-            // GaEngine constructor via applyConfig(); just call the runner.
-            ga.run_homogenous();
-        }
-        else if (cfg.hetero.is_case) {
-            // Fleet built inside run_heterogenous() from cfg.hetero.radars
-            ga.run_heterogenous();
-        }
-        else if (cfg.autoG.is_case) {
-            ga.setAutoOperators(SelectionMethod::TOURNAMENT,
-                                AutoCrossoverMethod::RANDOM_SUBSET,
-                                /*mRate=*/0.10, /*cRate=*/0.85);
-            // Fleet built inside run_auto() from cfg.autoG.radars
-            ga.run_auto();
-        }
-        else {
-            std::cerr << "[ga] Config found but no is_case flag is set — "
-                         "falling back to default homogenous run.\n";
-            ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
-                              /*opt=*/false, /*num_top_k=*/15);
-        }
-    }
-    else {
-        // ---- Hardcoded defaults (no config file present) ----
+    //     if (cfg.homo.is_case) {
+    //         // Parameters (pop, rates, weights, output) already applied in
+    //         // GaEngine constructor via applyConfig(); just call the runner.
+    //         ga.run_homogenous();
+    //     }
+    //     else if (cfg.hetero.is_case) {
+    //         // Fleet built inside run_heterogenous() from cfg.hetero.radars
+    //         ga.run_heterogenous();
+    //     }
+    //     else if (cfg.autoG.is_case) {
+    //         ga.setAutoOperators(SelectionMethod::TOURNAMENT,
+    //                             AutoCrossoverMethod::RANDOM_SUBSET,
+    //                             /*mRate=*/0.10, /*cRate=*/0.85);
+    //         // Fleet built inside run_auto() from cfg.autoG.radars
+    //         ga.run_auto();
+    //     }
+    //     else {
+    //         std::cerr << "[ga] Config found but no is_case flag is set — "
+    //                      "falling back to default homogenous run.\n";
+    //         ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
+    //                           /*opt=*/false, /*num_top_k=*/15);
+    //     }
+    // }
+    // else {
+    //     // ---- Hardcoded defaults (no config file present) ----
 
-        // Homogenous
-        ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
-                          /*opt=*/WRITE, /*num_top_k=*/15);
+    //     // Homogenous
+    //     ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
+    //                       /*opt=*/WRITE, /*num_top_k=*/15);
 
-        // Heterogenous (uncomment to use)
-        // std::vector<RadarConfig> fleet = { {50.0, 2}, {150.0, 1}, {300.0, 1} };
-        // ga.run_heterogenous(fleet, /*generations=*/50);
+    //     // Heterogenous (uncomment to use)
+    //     // std::vector<RadarConfig> fleet = { {50.0, 2}, {150.0, 1}, {300.0, 1} };
+    //     // ga.run_heterogenous(fleet, /*generations=*/50);
 
-        // Auto (uncomment to use)
-        // ga.setLambda(0.0);
-        // ga.setAutoOperators(SelectionMethod::TOURNAMENT,
-        //                     AutoCrossoverMethod::RANDOM_SUBSET,
-        //                     0.10, 0.85);
-        // std::vector<FlexRadarConfig> flexFleet = {
-        //     {  50.0, 2, 5 },
-        //     { 300.0, 1, 3 },
-        // };
-        // ga.run_auto(flexFleet, /*generations=*/50);
-    }
+    //     // Auto (uncomment to use)
+    //     // ga.setLambda(0.0);
+    //     // ga.setAutoOperators(SelectionMethod::TOURNAMENT,
+    //     //                     AutoCrossoverMethod::RANDOM_SUBSET,
+    //     //                     0.10, 0.85);
+    //     // std::vector<FlexRadarConfig> flexFleet = {
+    //     //     {  50.0, 2, 5 },
+    //     //     { 300.0, 1, 3 },
+    //     // };
+    //     // ga.run_auto(flexFleet, /*generations=*/50);
+    // }
 
     return 0;
 }
