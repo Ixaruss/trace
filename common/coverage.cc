@@ -4,18 +4,23 @@
  * RADAR COVERAGE ENGINE — with sector coverage support
  *
  * SECTOR COVERAGE:
- *   Sectors are 45° wide, aligned to 45° grid:
- *     0° = North, 45° = NE, 90° = East, 135° = SE,
- *     180° = South, 225° = SW, 270° = West, 315° = NW
+ *   A sector is an arbitrary arc, given as two azimuths (degrees,
+ *   North = 0°, clockwise positive):
  *
- *   Pass sectorAzimuthDeg to compute()/computeFast():
- *     -1  = full 360° (default)
- *     0   = North sector  (337.5° to 22.5°)
- *     45  = NE sector     (22.5° to 67.5°)
- *     90  = East sector   (67.5° to 112.5°)
- *     ... etc in 45° steps
+ *     leftDeg   = start of the arc (left edge, looking outward from source)
+ *     rightDeg  = end of the arc   (right edge)
  *
- *   Any value is accepted and snapped to nearest 45° multiple.
+ *   The scanned region is everything swept going clockwise from leftDeg
+ *   to rightDeg. If leftDeg > rightDeg the arc wraps through North
+ *   (e.g. leftDeg=350°, rightDeg=20° scans 350°→360°→0°→20°, a 30°-wide
+ *   arc straddling North).
+ *
+ *   Pass to compute()/computeFast():
+ *     leftDeg = -1, rightDeg = -1 (default)  → full 360°
+ *     leftDeg = 300, rightDeg = 60           → 120°-wide arc centred on North
+ *     leftDeg = 80,  rightDeg = 100          → narrow 20°-wide arc around East
+ *
+ *   Any azimuth value is accepted (negative or >360 are normalised).
  */
 
 #include "../common.h"
@@ -82,7 +87,6 @@ static void castRadarRayDiag(
     uint8_t*     statCell = stat + off;
 
     int row=srcRow,col=srcCol;
-    double dist=0.0,curvDrop=0.0;
     double maxTerrainSlope=-1e18;
     int cellCount=0;
 
@@ -95,12 +99,17 @@ static void castRadarRayDiag(
         if(mr){err-=adc;row+=sr;demCell+=strideR;statCell+=strideR;}
         if(mc){err+=adr;col+=sc;demCell+=strideC;statCell+=strideC;}
 
-        double step=(mr&&mc)?RESOLUTION*1.41421356237:RESOLUTION;
-        curvDrop+=(2.0*dist*step+step*step)*INV_2_KEFFR;
-        dist+=step;
         ++cellCount;
-
         if(cellCount>maxRadiusCells) break;
+
+        // True straight-line ground distance from source (not the
+        // Bresenham step-accumulated "octile" distance, which traces
+        // an octagon instead of a circle at any fixed threshold).
+        double drow = static_cast<double>(row-srcRow);
+        double dcol = static_cast<double>(col-srcCol);
+        double dist = std::sqrt(drow*drow+dcol*dcol) * RESOLUTION;
+        double curvDrop = (dist*dist) * INV_2_KEFFR;
+
         if(dist>maxRangeM){ *statCell=(uint8_t)CoverageStatus::OUTSIDE_RANGE; continue; }
         if(dist>horizonM) break;  // pre-filled as BEYOND_HORIZON
 
@@ -148,7 +157,6 @@ static void castRadarRayFast(
     uint8_t*     statCell = stat + off;
 
     int row=srcRow,col=srcCol;
-    double dist=0.0,curvDrop=0.0;
     double maxTerrainSlope=-1e18;
     int cellCount=0;
 
@@ -161,12 +169,15 @@ static void castRadarRayFast(
         if(mr){err-=adc;row+=sr;demCell+=strideR;statCell+=strideR;}
         if(mc){err+=adr;col+=sc;demCell+=strideC;statCell+=strideC;}
 
-        double step=(mr&&mc)?RESOLUTION*1.41421356237:RESOLUTION;
-        curvDrop+=(2.0*dist*step+step*step)*INV_2_KEFFR;
-        dist+=step;
         ++cellCount;
-
         if(cellCount>maxRadiusCells) break;
+
+        // True straight-line ground distance from source (see castRadarRayDiag).
+        double drow = static_cast<double>(row-srcRow);
+        double dcol = static_cast<double>(col-srcCol);
+        double dist = std::sqrt(drow*drow+dcol*dcol) * RESOLUTION;
+        double curvDrop = (dist*dist) * INV_2_KEFFR;
+
         if(dist>horizonM) break;
 
         short raw=*demCell;
@@ -189,17 +200,19 @@ static void castRadarRayFast(
 
 
 
-    std::vector<Point2D> RadarEngine::sectorBoundary(int sectorAz) const
+    std::vector<Point2D> RadarEngine::sectorBoundary(double leftDeg, double rightDeg) const
     {
-        if(sectorAz < 0) return boundary;          // full 360
+        if(leftDeg < 0.0 || rightDeg < 0.0) return boundary;   // full 360
 
-        const double halfWidth = 22.5;
         std::vector<Point2D> out;
-        out.reserve(boundary.size() / 8 + 1);
+        // rough reservation based on arc width vs full circle
+        double width = rightDeg - leftDeg;
+        if(width < 0.0) width += 360.0;
+        out.reserve(boundary.size() * (width / 360.0) + 8);
 
         for(const auto& pt : boundary){
             double az = cellAzimuth(srcRow, srcCol, pt.x, pt.y);
-            if(inSectorAz(az, (double)sectorAz, halfWidth))
+            if(inArc(az, leftDeg, rightDeg))
                 out.push_back(pt);
         }
         return out;
@@ -207,13 +220,18 @@ static void castRadarRayFast(
 
     // ------------------------------------------------------------------
     // Pre-fill the active area with BEYOND_HORIZON.
-    // Cells outside the sector get OUTSIDE_SECTOR.
-    // sectorAz < 0 → fill full circle, no OUTSIDE_SECTOR
+    // Cells outside the [leftDeg,rightDeg] arc get OUTSIDE_SECTOR.
+    // leftDeg < 0 || rightDeg < 0 → fill full circle, no OUTSIDE_SECTOR
     // ------------------------------------------------------------------
-    void RadarEngine::prefill(int sectorAz, uint8_t* buf, uint8_t fillInside, uint8_t fillOutside)
+    void RadarEngine::prefill(double leftDeg, double rightDeg, uint8_t* buf, uint8_t fillInside, uint8_t fillOutside)
     {
         const long long rSq = (long long)maxRadiusCells * maxRadiusCells;
-        const double halfWidth = 22.5;
+        const bool fullCircle = (leftDeg < 0.0 || rightDeg < 0.0);
+
+        // Normalise once outside the hot loop.
+        const double L = fullCircle ? 0.0 : normAz(leftDeg);
+        const double R = fullCircle ? 0.0 : normAz(rightDeg);
+        const bool   wraps = (!fullCircle) && (L > R);
 
         #pragma omp parallel for schedule(static,32)
         for(int r=rowMin; r<rowMax; r++){
@@ -227,15 +245,13 @@ static void castRadarRayFast(
                     continue;
                 }
                 // inside circle
-                if(sectorAz < 0){
-                    // full 360
+                if(fullCircle){
                     rowPtr[c - colMin] = fillInside;
                 } else {
                     double az = cellAzimuth(srcRow, srcCol, r, c);
-                    if(inSectorAz(az, (double)sectorAz, halfWidth))
-                        rowPtr[c - colMin] = fillInside;
-                    else
-                        rowPtr[c - colMin] = fillOutside;
+                    bool inside = wraps ? (az >= L || az <= R)
+                                        : (az >= L && az <= R);
+                    rowPtr[c - colMin] = inside ? fillInside : fillOutside;
                 }
             }
         }
@@ -245,24 +261,25 @@ static void castRadarRayFast(
     // ------------------------------------------------------------------
     // DIAGNOSTIC COMPUTE
     //
-    // sectorAzimuthDeg: -1 = full 360
-    //                    0, 45, 90 ... 315 = 45° sector centred on that azimuth
-    //                    any value snapped to nearest 45°
+    // leftDeg/rightDeg: arc swept clockwise from leftDeg to rightDeg,
+    //                    North = 0°. leftDeg < 0 || rightDeg < 0 → full 360.
+    //                    leftDeg > rightDeg wraps through North.
     // ------------------------------------------------------------------
-    RadarCoverageResult RadarEngine::compute(int sectorAzimuthDeg)
+    RadarCoverageResult RadarEngine::compute(double leftDeg, double rightDeg)
     {
-        int sectorAz = (sectorAzimuthDeg < 0) ? -1 : snapTo45(sectorAzimuthDeg);
+        bool fullCircle = (leftDeg < 0.0 || rightDeg < 0.0);
 
-        auto activeBoundary = sectorBoundary(sectorAz);
+        auto activeBoundary = sectorBoundary(leftDeg, rightDeg);
 
         std::cout<<"[RADAR] Sector        : ";
-        if(sectorAz < 0) std::cout<<"360° (full)\n";
-        else std::cout<<sectorAz<<"° ± 22.5°  rays="<<activeBoundary.size()<<"\n";
+        if(fullCircle) std::cout<<"360° (full)\n";
+        else std::cout<<normAz(leftDeg)<<"° -> "<<normAz(rightDeg)
+                      <<"° (clockwise)  rays="<<activeBoundary.size()<<"\n";
 
         auto t0=std::chrono::high_resolution_clock::now();
 
-        // pre-fill: inside sector → BEYOND_HORIZON, outside → OUTSIDE_SECTOR
-        prefill(sectorAz, statusBuf.data(),
+        // pre-fill: inside arc → BEYOND_HORIZON, outside → OUTSIDE_SECTOR
+        prefill(leftDeg, rightDeg, statusBuf.data(),
                 (uint8_t)CoverageStatus::BEYOND_HORIZON,
                 (uint8_t)CoverageStatus::OUTSIDE_SECTOR);
 
@@ -296,7 +313,8 @@ static void castRadarRayFast(
         res.srcRow=srcRow; res.srcCol=srcCol;
         res.radiusCells=maxRadiusCells;
         res.gridCols=gridCols; res.gridRows=gridRows;
-        res.sectorAzimuthDeg=sectorAz;
+        res.sectorLeftDeg  = fullCircle ? -1.0 : normAz(leftDeg);
+        res.sectorRightDeg = fullCircle ? -1.0 : normAz(rightDeg);
         res.countCovered=res.countTerrainMasked=0;
         res.countBelowMinElev=res.countAboveMaxElev=0;
         res.countBeyondHorizon=res.countOutsideRange=res.countOutsideSector=0;
@@ -341,10 +359,10 @@ static void castRadarRayFast(
     // ------------------------------------------------------------------
     // FAST COMPUTE — binary, no diagnostic
     // ------------------------------------------------------------------
-    std::vector<uint8_t> RadarEngine::computeFast(int sectorAzimuthDeg)
+    std::vector<uint8_t> RadarEngine::computeFast(double leftDeg, double rightDeg)
     {
-        int sectorAz=(sectorAzimuthDeg<0)?-1:snapTo45(sectorAzimuthDeg);
-        auto activeBoundary=sectorBoundary(sectorAz);
+        bool fullCircle = (leftDeg < 0.0 || rightDeg < 0.0);
+        auto activeBoundary = sectorBoundary(leftDeg, rightDeg);
 
         auto t0=std::chrono::high_resolution_clock::now();
 
@@ -384,7 +402,8 @@ static void castRadarRayFast(
         }
 
         std::cout<<"[RADAR] Fast ("
-                 <<(sectorAz<0?"360°":std::to_string(sectorAz)+"°")
+                 <<(fullCircle ? std::string("360°")
+                               : std::to_string(normAz(leftDeg))+"->"+std::to_string(normAz(rightDeg))+"°")
                  <<")  : "
                  <<std::chrono::duration<double,std::milli>(t1-t0).count()
                  <<" ms  covered="<<vis<<"\n";
@@ -403,29 +422,29 @@ static void castRadarRayFast(
 
 //     RadarEngine engine(
 //         g,
-//         33.9871, 74.7742, // Srinagar airport
-//         50.0,    // antenna height AGL (m)
-//         1000.0,  // target height AGL (m) — e.g. aircraft at 1km
-//         10.0,     // min elevation angle (degrees)
-//         30.0,    // max elevation angle (degrees)
+//         33.987, 74.7742, // Srinagar airport
+//         20.0,    // antenna height AGL (m)
+//         0.1,  // target height AGL (m) — e.g. aircraft at 1km
+//         0.5,     // min elevation angle (degrees)
+//         75.0,    // max elevation angle (degrees)
 //         300.0    // max range (km)
 //     );
 
-//     // full 360
+//     // // full 360
 //     auto res360 = engine.compute();
 //     engine.writeToSVG(res360, "radar_360.svg");
 
-//     // NE sector (45°)
-//     auto res45 = engine.compute(45);
-//     engine.writeToSVG(res45, "radar_sector_045.svg");
+//     // // 60°-wide arc centred on NE (20° -> 80°)
+//     // auto resNE = engine.compute(20, 80);
+//     // engine.writeToSVG(resNE, "radar_sector_ne.svg");
 
-//     // East sector (90°)
-//     auto res90 = engine.compute(90);
-//     engine.writeToSVG(res90, "radar_sector_090.svg");
+//     // 40°-wide arc straddling North (340° -> 20°)
+//     auto resN = engine.compute(300, 60);
+//     engine.writeToSVG(resN, "330.svg");
 
-//     // fast mode
-//     engine.computeFast();        // 360
-//     engine.computeFast(135);     // SE sector
+//     // // fast mode
+//     // engine.computeFast();          // 360
+//     // engine.computeFast(110, 200);  // SE-ish arc
 
 //     auto t1=std::chrono::high_resolution_clock::now();
 //     std::cout<<"\n==============================================\n"

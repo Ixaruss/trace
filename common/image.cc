@@ -237,33 +237,42 @@ void RadarEngine::writeToSVG(
      <<" stroke-dasharray=\"10,8\" opacity=\"0.5\"/>\n";
 
     // sector boundary lines
-    if(res.sectorAzimuthDeg >= 0){
-        double az  = res.sectorAzimuthDeg * DEG2RAD;
-        double hw  = 22.5 * DEG2RAD;
+    // sectorLeftDeg/sectorRightDeg < 0 means full 360° (no sector, skip lines).
+    // Arc is swept clockwise from left to right; if left > right it wraps
+    // through North, which the midpoint calc below accounts for.
+    if(res.sectorLeftDeg >= 0.0 && res.sectorRightDeg >= 0.0){
+        double azL = res.sectorLeftDeg  * DEG2RAD;
+        double azR = res.sectorRightDeg * DEG2RAD;
         double len = (double)rr;
 
-        // left edge: az - halfWidth (SVG: x=east=col, y=south=row)
-        double az1 = az - hw;
-        double x1  = cx + len * std::sin(az1);
-        double y1  = cy - len * std::cos(az1);
+        // left edge (SVG: x=east=col, y=south=row)
+        double xL = cx + len * std::sin(azL);
+        double yL = cy - len * std::cos(azL);
         // right edge
-        double az2 = az + hw;
-        double x2  = cx + len * std::sin(az2);
-        double y2  = cy - len * std::cos(az2);
+        double xR = cx + len * std::sin(azR);
+        double yR = cy - len * std::cos(azR);
 
         f<<"  <line x1=\""<<cx<<"\" y1=\""<<cy
-         <<"\" x2=\""<<(int)x1<<"\" y2=\""<<(int)y1
+         <<"\" x2=\""<<(int)xL<<"\" y2=\""<<(int)yL
          <<"\" stroke=\"white\" stroke-width=\"2\" opacity=\"0.7\""
          <<" stroke-dasharray=\"12,8\"/>\n"
          <<"  <line x1=\""<<cx<<"\" y1=\""<<cy
-         <<"\" x2=\""<<(int)x2<<"\" y2=\""<<(int)y2
+         <<"\" x2=\""<<(int)xR<<"\" y2=\""<<(int)yR
          <<"\" stroke=\"white\" stroke-width=\"2\" opacity=\"0.7\""
-         <<" stroke-dasharray=\"12,8\"/>\n"
-         // sector label
-         <<"  <text x=\""<<(int)(cx+len*0.55*std::sin(az))
-         <<"\" y=\""<<(int)(cy-len*0.55*std::cos(az))
-         <<"\" fill=\"white\" font-size=\"24\" text-anchor=\"middle\""
-         <<" opacity=\"0.6\">"<<res.sectorAzimuthDeg<<"°</text>\n";
+         <<" stroke-dasharray=\"12,8\"/>\n";
+
+        // mid-angle label, handling wraparound through North
+        double width = res.sectorRightDeg - res.sectorLeftDeg;
+        if(width < 0.0) width += 360.0;
+        double mid = res.sectorLeftDeg + width / 2.0;
+        if(mid >= 360.0) mid -= 360.0;
+        double amid = mid * DEG2RAD;
+
+        f<<"  <text x=\""<<(int)(cx+len*0.55*std::sin(amid))
+         <<"\" y=\""<<(int)(cy-len*0.55*std::cos(amid))
+         <<"\" fill=\"white\" font-size=\"20\" text-anchor=\"middle\""
+         <<" opacity=\"0.6\">"<<res.sectorLeftDeg<<"°-"<<res.sectorRightDeg
+         <<"°</text>\n";
     }
 
     // source marker
@@ -280,6 +289,8 @@ void RadarEngine::writeToSVG(
      <<"AboveElev: "<<res.countAboveMaxElev<<"</text>\n"
      <<"  <text x=\""<<(W-220)<<"\" y=\"92\" fill=\"#9b59b6\" font-size=\"12\">"
      <<"Horizon: "<<res.countBeyondHorizon<<"</text>\n"
+     <<"  <text x=\""<<(W-220)<<"\" y=\"110\" fill=\"#888\" font-size=\"12\">"
+     <<"OutsideSector: "<<res.countOutsideSector<<"</text>\n"
      <<"</svg>\n";
 
     std::cout<<"[RADAR] SVG: "<<filename<<"  "
