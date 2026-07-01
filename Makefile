@@ -1,14 +1,49 @@
+CXX      := g++
+STD      := -std=c++23
+
+# NOTE: original Makefile used $(gdal-config --cflags --libs) which is not
+# valid Make syntax (missing the `shell` function) and silently expanded to
+# nothing. Fixed below.
+GDAL     := $(shell gdal-config --cflags --libs)
+LIBS     := -ljsoncpp -lgdal -lpng16
+HDF5     := -lhdf5
+
+BIN      := x
+ADAPT    := adapt
+
+# Shared preprocessing sources used by every target
+COMMON_SRC := preprocess/jsonParser.cc preprocess/reproject.cc preprocess/lib/*.cc
+
+# Aggressive optimization flags, shared by the perf-sensitive targets (tool, ga)
+OPT_FLAGS := -O3 -ffast-math -flto -ffp-contract=fast -march=native \
+             -funroll-loops -fprefetch-loop-arrays -fdata-sections \
+             -ffunction-sections -Wl,--gc-sections -Wl,-O2
+
+.PHONY: all bin test tool deploy ga clean
+
+all: bin
+
 bin:
-	g++ preprocess/preprocess.cc preprocess/jsonParser.cc preprocess/reproject.cc  preprocess/lib/*.cc -o x $(gdal-config --cflags --libs) -ljsoncpp -lgdal -lpng16 -std=c++23 && ./x
+	$(CXX) preprocess/preprocess.cc $(COMMON_SRC) -o $(BIN) $(GDAL) $(LIBS) $(STD) && ./$(BIN)
 
 test:
-	g++  preprocess/test.cc preprocess/jsonParser.cc preprocess/reproject.cc  preprocess/lib/*.cc -o x $(gdal-config --cflags --libs) -ljsoncpp -lgdal -lpng16 -std=c++23 && ./x
+	$(CXX) preprocess/test.cc $(COMMON_SRC) -o $(BIN) $(GDAL) $(LIBS) $(HDF5) $(STD) && ./$(BIN)
 
 tool:
-	g++ -O3 -ffast-math -flto -ffp-contract=fast -fopenmp  -march=native -funroll-loops -fprefetch-loop-arrays -fdata-sections -ffunction-sections -Wl,--gc-sections -Wl,-O2 cli/main.cc common/lineofsight.cc common/image.cc common/coverage.cc common/angleviewshed.cc common/radarlos.cc common/mult.cc  common/operations.cc preprocess/jsonParser.cc preprocess/reproject.cc preprocess/preprocess.cc preprocess/lib/*.cc -o adapt  -ljsoncpp -lgdal -lpng16 -std=c++23
+	$(CXX) $(OPT_FLAGS) -fopenmp \
+		cli/main.cc common/lineofsight.cc common/image.cc common/coverage.cc \
+		common/angleviewshed.cc common/radarlos.cc common/mult.cc common/operations.cc \
+		preprocess/jsonParser.cc preprocess/reproject.cc preprocess/preprocess.cc \
+		preprocess/lib/*.cc \
+		-o $(ADAPT) $(LIBS) $(STD)
 
 deploy:
-	g++  deploy.cc preprocess/jsonParser.cc preprocess/reproject.cc  preprocess/lib/*.cc -o x $(gdal-config --cflags --libs) -ljsoncpp -lgdal -lpng16 -std=c++23
+	$(CXX) deploy.cc $(COMMON_SRC) -o $(BIN) $(GDAL) $(LIBS) $(STD)
 
 ga:
-	g++ -O3 -ffast-math -march=native -fopenmp ga/main.cc  ga/config.cc preprocess/jsonParser.cc preprocess/reproject.cc common/coverage.cc  preprocess/lib/*.cc -o x $(gdal-config --cflags --libs) -ljsoncpp -lgdal -lhdf5  -lpng16 -std=c++23
+	$(CXX) $(OPT_FLAGS) -pthread \
+		ga/main.cc ga/config.cc $(COMMON_SRC) \
+		-o $(BIN) $(GDAL) $(LIBS) $(HDF5) $(STD) && ./$(BIN)
+
+clean:
+	rm -f $(BIN) $(ADAPT) *.o
