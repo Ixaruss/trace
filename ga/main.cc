@@ -1,3 +1,5 @@
+#include <cstddef>
+#include <iomanip>
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -14,7 +16,6 @@
 #include <cstring>
 #include <chrono>
 #include <numeric>
-
 // Only include common.h for Global, Bin, Config, and FeasibleGrid structures.
 // Local coverage logic has been moved to radar.h — do not re-embed it here.
 #include "../common.h"
@@ -43,17 +44,6 @@ static constexpr double DEFAULT_W3 = 0.9;   // high-overlap penalty
 static constexpr double DEFAULT_W4 = 0.9;   // spacing-gap penalty
 static constexpr double DEFAULT_X  = 0.0;   // lambda (radar-count cost, run_auto)
 
-// Physical radar parameters used by the homogenous evaluator.
-// Populated from HomogenousConf.radar when a config is loaded;
-// otherwise these defaults match radar.h's function-signature defaults.
-struct RadarPhysParams {
-    double antennaHeight = 50.0;     // metres AGL
-    double targetHeight  = 1000.0;   // metres (target to detect)
-    double minAngleDeg   = 0.5;      // minimum elevation angle (degrees)
-    double maxAngleDeg   = 30.0;     // maximum elevation angle (degrees)
-    double rangeM        = 300000.0; // maximum slant range in METRES (300 km)
-};
-
 // ============================================================
 // ENUMS
 // ============================================================
@@ -75,6 +65,34 @@ struct FlexRadarConfig {
     double rangeKm;
     int    minCount;
     int    maxCount;
+};
+
+// Struct representing a configuration case for the hyperparameter search
+struct GAConfig {
+    std::string name;
+    int popSize;
+    int generations;
+    double mutationRate;
+    double crossoverRate;
+    SelectionMethod selection;
+    CrossoverMethod crossover;
+    MutationMethod mutation;
+};
+
+// Struct to keep track of benchmark results for the final leaderboard
+struct BenchmarkResult {
+    std::string name;
+    std::string selection;
+    std::string crossover;
+    std::string mutation;
+    int popSize;
+    int generations;
+    double mutationRate;
+    double crossoverRate;
+    double bestDistance;
+    double totalTimeMs;
+    double evalTimeMs;
+    double evoTimeMs;
 };
 
 // ============================================================
@@ -178,6 +196,8 @@ class GaEngine {
     ThreadPool& pool;
     GaConf conf;
     bool confLoaded = false;
+    double totalFitnessEvalTimeMs = 0.0;
+    double totalEvolutionaryTimeMs = 0.0;
 
     void reloadConfig() {
         if (GaConf::is_available()) {
@@ -198,7 +218,7 @@ class GaEngine {
     std::string scatterOutput  = "final_optimized_scatter.png";
 
     // Physical spec for the homogenous evaluator (all radars share these values)
-    RadarPhysParams homoParams;
+    RadarConf homoParams;
 
     // --- Fixed-length operator selectors ---
     SelectionMethod    currentSelection  = SelectionMethod::TOURNAMENT;
@@ -235,11 +255,11 @@ class GaEngine {
         // Physical radar params for the homogenous run
         if (conf.homo.is_case) {
             const auto& r = conf.homo.radar;
-            if (r.range        > 0) homoParams.rangeM        = r.range * 1000.0; // km → m
+            if (r.range        > 0) homoParams.range        = r.range * 1000.0; // km → m
             if (r.antennaHeight> 0) homoParams.antennaHeight = r.antennaHeight;
-            if (r.target       > 0) homoParams.targetHeight  = r.target;
-            homoParams.minAngleDeg = r.minAngle;  // float, always valid
-            homoParams.maxAngleDeg = r.maxAngle;
+            if (r.target       > 0) homoParams.target  = r.target;
+            homoParams.minAngle = r.minAngle;  // float, always valid
+            homoParams.maxAngle = r.maxAngle;
         }
 
         std::cout << "[ga] Config loaded — "
@@ -275,21 +295,27 @@ class GaEngine {
     static void evaluate_fitness(
         Global& g, const FeasibleGrid& base_grid,
         Chromosome& cn, int index,
-        const Weights& w, const RadarPhysParams& rp, bool writePng)
+        const Weights& w, const RadarConf& rp, bool writePng, vector<RadarConf> radars = {})
     {
         std::string png_path = writePng
                    ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
 
-               auto res = calculate_radar_coverage_overlap(
+         std::vector<int> res;
+        if(radars.empty()) {
+                res = calculate_radar_coverage_overlap(
                    g, base_grid, cn.radar,
                    5.0,
                    png_path,
-                   {},
                    rp.antennaHeight,
-                   rp.minAngleDeg,
-                   rp.targetHeight,
-                   rp.maxAngleDeg,
-                   rp.rangeM);
+                   rp.minAngle,
+                   rp.target,
+                   rp.minAngle,
+                   rp.range);
+        }else
+        {
+            res = calculate_radar_coverage_overlap(
+                g, base_grid, cn.radar, 5.0, png_path,0,0,0,0,0, radars);
+        }
 
                int    total        = (int)base_grid.cells.size();
                double unique       = (double)res[1] / total;
@@ -297,9 +323,9 @@ class GaEngine {
                double high_overlap = (double)res[3] / total;
                double spacing_gaps = (double)res[0] / total;
                double overlap_factor = (low_overlap + high_overlap) / unique;
-               bool aarush_flag    = false;
+               bool f_type_four_weights    = false;
 
-               if (aarush_flag == true){
+               if (f_type_four_weights == true){
                    cn.fitness = (unique       * w.w1)
                               + (low_overlap  * w.w2)
                               - (high_overlap * w.w3)
@@ -315,55 +341,48 @@ class GaEngine {
     // Heterogenous fitness — weighted cell-count formula (case 2).
     // Weights struct kept for interface consistency; case-2 formula uses
     // fixed multipliers by design, but w4 is reused for the proximity penalty.
-    static void evaluate_fitness_hetero(
-        Global& g, const FeasibleGrid& base_grid,
-        Chromosome& cn, int index,
-        const std::vector<double>& radarRanges,
-        const Weights& w, bool writePng)
-    {
-        std::string png_path = writePng
-            ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
-        auto res = calculate_radar_coverage_overlap(
-            g, base_grid, cn.radar, 5.0, png_path, radarRanges);
 
-        // Layered cell-count rewards; proximity penalty scaled by w4
-        const double penaltyScale = (w.w4 > 0.0) ? w.w4 * 5000.0 / DEFAULT_W4 : 5000.0;
-        cn.fitness = (res[1] * 1.0) + (res[2] * 2.0) + (res[3] * 3.0)
-                   - (res[0] * penaltyScale);
-    }
 
     // --- Parallel evaluation (homogenous) ---
     void parallelEvaluatePopulation(
         std::vector<Chromosome>& pop, Global& globalRef,
         const FeasibleGrid& base_grid, bool writePng = false)
     {
-        std::vector<std::future<void>> futures;
-        futures.reserve(pop.size());
-        for (size_t i = 0; i < pop.size(); i++)
-            futures.push_back(pool.enqueue(
-                evaluate_fitness,
-                std::ref(globalRef), std::ref(base_grid),
-                std::ref(pop[i]), (int)i,
-                weights, homoParams, writePng));  // homoParams carries correct rangeM
-        for (auto& f : futures) f.wait();
+        if(conf.homo.is_case) {
+            auto startTime = std::chrono::high_resolution_clock::now();
+           std::vector<std::future<void>> futures;
+           std::vector<RadarConf> empty(0);
+           futures.reserve(pop.size());
+           for (size_t i = 0; i < pop.size(); i++)
+               futures.push_back(pool.enqueue(
+                   evaluate_fitness,
+                   std::ref(globalRef), std::ref(base_grid),
+                   std::ref(pop[i]), (int)i,
+                   weights, homoParams, writePng, empty));
+           for (auto& f : futures) f.wait();
+           auto endTime = std::chrono::high_resolution_clock::now();
+           std::chrono::duration<double, std::milli> duration = endTime - startTime;
+           totalFitnessEvalTimeMs += duration.count();
+        }else {
+            auto startTime = std::chrono::high_resolution_clock::now();
+           std::vector<std::future<void>> futures;
+           futures.reserve(pop.size());
+           for (size_t i = 0; i < pop.size(); i++)
+               futures.push_back(pool.enqueue(
+                   evaluate_fitness,
+                   std::ref(globalRef), std::ref(base_grid),
+                   std::ref(pop[i]), (int)i,
+                   weights, homoParams, writePng, std::ref(conf.hetero.radars)));  // homoParams carries correct rangeM
+           for (auto& f : futures) f.wait();
+           auto endTime = std::chrono::high_resolution_clock::now();
+           std::chrono::duration<double, std::milli> duration = endTime - startTime;
+           totalFitnessEvalTimeMs += duration.count();
+        }
+
     }
 
     // --- Parallel evaluation (heterogenous) ---
-    void parallelEvaluatePopulation(
-        std::vector<Chromosome>& pop, Global& globalRef,
-        const FeasibleGrid& base_grid,
-        const std::vector<double>& radarRanges, bool writePng = false)
-    {
-        std::vector<std::future<void>> futures;
-        futures.reserve(pop.size());
-        for (size_t i = 0; i < pop.size(); i++)
-            futures.push_back(pool.enqueue(
-                evaluate_fitness_hetero,
-                std::ref(globalRef), std::ref(base_grid),
-                std::ref(pop[i]), (int)i,
-                std::ref(radarRanges), weights, writePng));
-        for (auto& f : futures) f.wait();
-    }
+
 
     GridPoint snapToFeasible(int r, int c, const FeasibleGrid& f) {
         int minDistSq = INT_MAX;
@@ -582,44 +601,44 @@ class GaEngine {
 
     // Auto fitness — same layered-count formula as heterogenous, plus λ·n penalty.
     // Weights::w4 scales the proximity penalty; weights::x is λ (radar-count cost).
-    static void evaluate_auto_fitness(
-        Global& g, const FeasibleGrid& base_grid,
-        AutoChromosome& cn, int index,
-        const std::vector<FlexRadarConfig>& configs,
-        const Weights& w, bool writePng)
-    {
-        auto positions = extractPositions(cn.radars);
-        auto ranges    = extractRangesM(cn.radars, configs);
+    // static void evaluate_auto_fitness(
+    //     Global& g, const FeasibleGrid& base_grid,
+    //     AutoChromosome& cn, int index,
+    //     const std::vector<FlexRadarConfig>& configs,
+    //     const Weights& w, bool writePng)
+    // {
+    //     auto positions = extractPositions(cn.radars);
+    //     auto ranges    = extractRangesM(cn.radars, configs);
 
-        std::string png_path = writePng
-            ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
+    //     std::string png_path = writePng
+    //         ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
 
-        auto res = calculate_radar_coverage_overlap(
-            g, base_grid, positions, 5.0, png_path, ranges);
+    //     auto res = calculate_radar_coverage_overlap(
+    //         g, base_grid, positions, 5.0, png_path, ranges);
 
-        const double penaltyScale = (w.w4 > 0.0) ? w.w4 * 5000.0 / DEFAULT_W4 : 5000.0;
-        int n = cn.totalCount();
-        cn.fitness = (res[1] * 1.0) + (res[2] * 2.0) + (res[3] * 3.0)
-                   - (res[0] * penaltyScale)
-                   - w.x * n;           // λ sourced from weights.x
-    }
+    //     const double penaltyScale = (w.w4 > 0.0) ? w.w4 * 5000.0 / DEFAULT_W4 : 5000.0;
+    //     int n = cn.totalCount();
+    //     cn.fitness = (res[1] * 1.0) + (res[2] * 2.0) + (res[3] * 3.0)
+    //                - (res[0] * penaltyScale)
+    //                - w.x * n;           // λ sourced from weights.x
+    // }
 
-    void parallelEvaluateAutoPopulation(
-        std::vector<AutoChromosome>& pop, Global& globalRef,
-        const FeasibleGrid& base_grid,
-        const std::vector<FlexRadarConfig>& configs,
-        bool writePng = false)
-    {
-        std::vector<std::future<void>> futures;
-        futures.reserve(pop.size());
-        for (size_t i = 0; i < pop.size(); i++)
-            futures.push_back(pool.enqueue(
-                evaluate_auto_fitness,
-                std::ref(globalRef), std::ref(base_grid),
-                std::ref(pop[i]), (int)i,
-                std::ref(configs), weights, writePng));
-        for (auto& f : futures) f.wait();
-    }
+    // void parallelEvaluateAutoPopulation(
+    //     std::vector<AutoChromosome>& pop, Global& globalRef,
+    //     const FeasibleGrid& base_grid,
+    //     const std::vector<FlexRadarConfig>& configs,
+    //     bool writePng = false)
+    // {
+    //     std::vector<std::future<void>> futures;
+    //     futures.reserve(pop.size());
+    //     for (size_t i = 0; i < pop.size(); i++)
+    //         futures.push_back(pool.enqueue(
+    //             evaluate_auto_fitness,
+    //             std::ref(globalRef), std::ref(base_grid),
+    //             std::ref(pop[i]), (int)i,
+    //             std::ref(configs), weights, writePng));
+    //     for (auto& f : futures) f.wait();
+    // }
 
     // --- REPAIR ---
     void repairChromosome(
@@ -979,12 +998,12 @@ public:
         unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
 
         std::default_random_engine generator(seed);
-        std::uniform_real_distribution<double> dist_range(50.0, 300.0);
+        std::uniform_real_distribution<double> dist_range(100.0, 150.0);
         std::uniform_real_distribution<double> dist_antenna(10.0, 50.0);
         std::uniform_real_distribution<double> dist_target(500.0, 5000.0);
         std::uniform_real_distribution<double> dist_min_angle(0.0, 5.0);
         std::uniform_real_distribution<double> dist_max_angle(40.0, 60.0);
-        std::uniform_real_distribution<double> dist_num_radars(3.0, 8.0);
+        std::uniform_real_distribution<double> dist_num_radars(3.0, 5.0);
 
         std::cout << "--> Starting " << num_experiments << " Native Randomized Homogeneous Simulations..." << std::endl;
         ThreadPool pool;
@@ -1061,7 +1080,7 @@ public:
     // All radars share a single fixed range (set in radar.h defaults).
     // chromosomeLength and generations sourced from config when available.
     // ------------------------------------------------------------------
-    void run_homogenous(int pathLength   = 2,
+    double run_homogenous(int pathLength   = 2,
                         int generations  = 50,
                         bool opt         = false,
                         int  num_top_k   = 15)
@@ -1070,8 +1089,9 @@ public:
         if (confLoaded && conf.homo.is_case) {
             if (conf.homo.chromosomeLength > 0)
                 pathLength  = conf.homo.chromosomeLength;
-            if (conf.parameters.numGenerations > 0)
+            if (conf.parameters.numGenerations > 0){
                 generations = conf.parameters.numGenerations;
+            }
             if (conf.parameters.save)
                 opt = true;
             if (conf.parameters.saveSolutions > 0)
@@ -1084,6 +1104,140 @@ public:
         std::cout << "[ga] [homogenous] chromosomes=" << pathLength
                   << "  generations=" << generations
                   << "  popSize=" << popSize << "\n";
+        std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
+        auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+         auto initStart = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < popSize; i++)
+            population.push_back(generate_random_chromosome(f, pathLength));
+        auto initEnd = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> initDuration = initEnd - initStart;
+
+        std::cout << "[ga] Dispatching parallel coverage evaluation for Generation 0...\n";
+        parallelEvaluatePopulation(population, g, f, false);
+
+        std::normal_distribution<double> gaussDist(0.0, 10.0);
+
+        for (int gen = 1; gen <= generations; ++gen) {
+
+            auto stepStart = std::chrono::high_resolution_clock::now();
+            std::sort(population.begin(), population.end(),
+                [](const Chromosome& a, const Chromosome& b) {
+                    return a.fitness < b.fitness; });
+
+            std::vector<Chromosome> nextGen;
+            nextGen.reserve(popSize);
+            nextGen.push_back(population.back()); // elitism
+
+            bool useSUS = (currentSelection == SelectionMethod::SUS);
+            std::vector<Chromosome> matingPool;
+            size_t poolIdx = 0;
+            if (useSUS)
+                matingPool = stochasticUniversalSampling(population, popSize - 1);
+
+            while ((int)nextGen.size() < popSize) {
+                Chromosome p1(0), p2(0);
+                if (useSUS) {
+                    p1 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
+                    p2 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
+                } else {
+                    p1 = executeSelection(population);
+                    p2 = executeSelection(population);
+                }
+
+                auto [c1, c2] = executeCrossover(p1, p2);
+                executeMutation(c1, f, gaussDist);
+                executeMutation(c2, f, gaussDist);
+
+                nextGen.push_back(c1);
+                if ((int)nextGen.size() < popSize) nextGen.push_back(c2);
+            }
+
+            auto stepEnd = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double, std::milli> stepDuration = stepEnd - stepStart;
+            totalEvolutionaryTimeMs += stepDuration.count();
+
+            parallelEvaluatePopulation(nextGen, g, f, false);
+            population = std::move(nextGen);
+
+            auto best = std::max_element(population.begin(), population.end(),
+                [](const Chromosome& a, const Chromosome& b) {
+                    return a.fitness < b.fitness; });
+            std::cout << "  -> Gen " << gen
+                      << " Best Fitness: " << best->fitness << "\n";
+        }
+
+        std::sort(population.begin(), population.end(),
+            [](const Chromosome& a, const Chromosome& b) {
+                return a.fitness > b.fitness; });
+
+        if (opt) {
+            vector<GridPoint> top_k;
+            for (int i = 0; i < conf.parameters.saveSolutions && i < (int)population.size(); i++)
+                for (const auto& pt : population[i].radar)
+                    top_k.push_back(pt);
+            write_h5_indiviual(g, f, "data.h5", top_k,homoParams.antennaHeight,
+            homoParams.target,
+            homoParams.minAngle,
+            homoParams.maxAngle,
+            homoParams.range);
+        }
+
+        auto& finalBest = population[0];
+        std::cout << "\n[ga] Evolution Complete. Best Lifetime Score: "
+                  << finalBest.fitness << "\n";
+
+        calculate_radar_coverage_overlap(
+            g, f, finalBest.radar,
+            5.0, coverageOutput,
+            homoParams.antennaHeight,
+            homoParams.minAngle,
+            homoParams.target,
+            homoParams.maxAngle,
+            homoParams.range);
+        Bin::writeRadarScatterPng(finalBest.radar, scatterOutput);
+        return finalBest.fitness;
+    }
+
+    // ------------------------------------------------------------------
+    // run_heterogenous
+    // Fixed fleet; each chromosome locus maps to a specific radar range.
+    // Fleet sourced from config (hetero.radars) when available.
+    // ------------------------------------------------------------------
+    void run_heterogenous(std::vector<RadarConfig> fleetConfig = {},
+                          int generations = 50)
+    {
+        if (confLoaded && conf.hetero.is_case) {
+            if (conf.parameters.numGenerations > 0)
+                generations = conf.parameters.numGenerations;
+
+            // Build fleet from config if none supplied by caller
+            if (fleetConfig.empty()) {
+                for (const auto& rc : conf.hetero.radars)
+                    fleetConfig.push_back({ (double)rc.range, rc.quantity });
+            }
+        }
+
+        if (fleetConfig.empty()) {
+            std::cerr << "[ga] run_heterogenous: no fleet config supplied and "
+                         "config unavailable — aborting.\n";
+            return ;
+        }
+
+        // Flatten fleet into a per-locus range array (metres)
+        std::vector<double> flattenedRangesM;
+        for (const auto& config : fleetConfig)
+            for (int i = 0; i < config.count; ++i)
+                flattenedRangesM.push_back(config.rangeKm * 1000.0);
+
+        int pathLength = (int)flattenedRangesM.size();
+
+        std::cout << "[ga] [heterogenous] total radar loci=" << pathLength
+                  << "  generations=" << generations
+                  << "  popSize=" << popSize << "\n";
+
+        population.clear();
+        population.reserve(popSize);
+
         std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
         auto f = Bin::getFeasibleGrid(g.bin, WRITE);
 
@@ -1138,132 +1292,6 @@ public:
                       << " Best Fitness: " << best->fitness << "\n";
         }
 
-        std::sort(population.begin(), population.end(),
-            [](const Chromosome& a, const Chromosome& b) {
-                return a.fitness > b.fitness; });
-
-        if (opt) {
-            vector<GridPoint> top_k;
-            for (int i = 0; i < conf.parameters.saveSolutions && i < (int)population.size(); i++)
-                for (const auto& pt : population[i].radar)
-                    top_k.push_back(pt);
-            write_h5_indiviual(g, f, "data.h5", top_k,homoParams.antennaHeight,
-            homoParams.targetHeight,
-            homoParams.minAngleDeg,
-            homoParams.maxAngleDeg,
-            homoParams.rangeM);
-        }
-
-        auto& finalBest = population[0];
-        std::cout << "\n[ga] Evolution Complete. Best Lifetime Score: "
-                  << finalBest.fitness << "\n";
-
-        calculate_radar_coverage_overlap(
-            g, f, finalBest.radar,
-            5.0, coverageOutput,
-            {},                      // homogenous — no per-radar ranges
-            homoParams.antennaHeight,
-            homoParams.minAngleDeg,
-            homoParams.targetHeight,
-            homoParams.maxAngleDeg,
-            homoParams.rangeM);
-        Bin::writeRadarScatterPng(finalBest.radar, scatterOutput);
-    }
-
-    // ------------------------------------------------------------------
-    // run_heterogenous
-    // Fixed fleet; each chromosome locus maps to a specific radar range.
-    // Fleet sourced from config (hetero.radars) when available.
-    // ------------------------------------------------------------------
-    void run_heterogenous(std::vector<RadarConfig> fleetConfig = {},
-                          int generations = 50)
-    {
-        if (confLoaded && conf.hetero.is_case) {
-            if (conf.parameters.numGenerations > 0)
-                generations = conf.parameters.numGenerations;
-
-            // Build fleet from config if none supplied by caller
-            if (fleetConfig.empty()) {
-                for (const auto& rc : conf.hetero.radars)
-                    fleetConfig.push_back({ (double)rc.range, rc.quantity });
-            }
-        }
-
-        if (fleetConfig.empty()) {
-            std::cerr << "[ga] run_heterogenous: no fleet config supplied and "
-                         "config unavailable — aborting.\n";
-            return;
-        }
-
-        // Flatten fleet into a per-locus range array (metres)
-        std::vector<double> flattenedRangesM;
-        for (const auto& config : fleetConfig)
-            for (int i = 0; i < config.count; ++i)
-                flattenedRangesM.push_back(config.rangeKm * 1000.0);
-
-        int pathLength = (int)flattenedRangesM.size();
-
-        std::cout << "[ga] [heterogenous] total radar loci=" << pathLength
-                  << "  generations=" << generations
-                  << "  popSize=" << popSize << "\n";
-
-        population.clear();
-        population.reserve(popSize);
-
-        std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
-        auto f = Bin::getFeasibleGrid(g.bin, WRITE);
-
-        for (int i = 0; i < popSize; i++)
-            population.push_back(generate_random_chromosome(f, pathLength));
-
-        std::cout << "[ga] Dispatching parallel coverage evaluation for Generation 0...\n";
-        parallelEvaluatePopulation(population, g, f, flattenedRangesM, false);
-
-        std::normal_distribution<double> gaussDist(0.0, 10.0);
-
-        for (int gen = 1; gen <= generations; ++gen) {
-            std::sort(population.begin(), population.end(),
-                [](const Chromosome& a, const Chromosome& b) {
-                    return a.fitness < b.fitness; });
-
-            std::vector<Chromosome> nextGen;
-            nextGen.reserve(popSize);
-            nextGen.push_back(population.back()); // elitism
-
-            bool useSUS = (currentSelection == SelectionMethod::SUS);
-            std::vector<Chromosome> matingPool;
-            size_t poolIdx = 0;
-            if (useSUS)
-                matingPool = stochasticUniversalSampling(population, popSize - 1);
-
-            while ((int)nextGen.size() < popSize) {
-                Chromosome p1(0), p2(0);
-                if (useSUS) {
-                    p1 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
-                    p2 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
-                } else {
-                    p1 = executeSelection(population);
-                    p2 = executeSelection(population);
-                }
-
-                auto [c1, c2] = executeCrossover(p1, p2);
-                executeMutation(c1, f, gaussDist);
-                executeMutation(c2, f, gaussDist);
-
-                nextGen.push_back(c1);
-                if ((int)nextGen.size() < popSize) nextGen.push_back(c2);
-            }
-
-            parallelEvaluatePopulation(nextGen, g, f, flattenedRangesM, false);
-            population = std::move(nextGen);
-
-            auto best = std::max_element(population.begin(), population.end(),
-                [](const Chromosome& a, const Chromosome& b) {
-                    return a.fitness < b.fitness; });
-            std::cout << "  -> Gen " << gen
-                      << " Best Fitness: " << best->fitness << "\n";
-        }
-
         auto finalBest = std::max_element(population.begin(), population.end(),
             [](const Chromosome& a, const Chromosome& b) {
                 return a.fitness < b.fitness; });
@@ -1271,8 +1299,9 @@ public:
                   << finalBest->fitness << "\n";
 
         calculate_radar_coverage_overlap(g, f, finalBest->radar,
-                                         5.0, coverageOutput, flattenedRangesM);
+                                         5.0, coverageOutput,0,0,0,0,0, conf.hetero.radars);
         Bin::writeRadarScatterPng(finalBest->radar, scatterOutput);
+
     }
 
     // ------------------------------------------------------------------
@@ -1280,206 +1309,349 @@ public:
     // Variable-length, variable-count, heterogeneous fleet.
     // Fleet sourced from config (autoG.radars) when available.
     // ------------------------------------------------------------------
-    void run_auto(std::vector<FlexRadarConfig> configs = {},
-                  int generations = 50)
-    {
-        if (confLoaded && conf.autoG.is_case) {
-            if (conf.parameters.numGenerations > 0)
-                generations = conf.parameters.numGenerations;
+    // void run_auto(std::vector<FlexRadarConfig> configs = {},
+    //               int generations = 50)
+    // {
+    //     if (confLoaded && conf.autoG.is_case) {
+    //         if (conf.parameters.numGenerations > 0)
+    //             generations = conf.parameters.numGenerations;
 
-            // Build flex fleet from config if none supplied by caller.
-            // Each RadarConf.quantity is used as maxCount; minCount is
-            // clamped to at least 0 and at most quantity.
-            if (configs.empty()) {
-                int numTypes = (int)conf.autoG.radars.size();
-                for (const auto& rc : conf.autoG.radars) {
-                    int maxC = rc.quantity;
-                    // Distribute the global min/max evenly across types
-                    int minC = (numTypes > 0)
-                        ? std::max(0, conf.autoG.minRadars / numTypes)
-                        : 0;
-                    minC = std::min(minC, maxC); // sanity clamp
-                    configs.push_back({ (double)rc.range, minC, maxC });
-                }
-            }
+    //         // Build flex fleet from config if none supplied by caller.
+    //         // Each RadarConf.quantity is used as maxCount; minCount is
+    //         // clamped to at least 0 and at most quantity.
+    //         if (configs.empty()) {
+    //             int numTypes = (int)conf.autoG.radars.size();
+    //             for (const auto& rc : conf.autoG.radars) {
+    //                 int maxC = rc.quantity;
+    //                 // Distribute the global min/max evenly across types
+    //                 int minC = (numTypes > 0)
+    //                     ? std::max(0, conf.autoG.minRadars / numTypes)
+    //                     : 0;
+    //                 minC = std::min(minC, maxC); // sanity clamp
+    //                 configs.push_back({ (double)rc.range, minC, maxC });
+    //             }
+    //         }
+    //     }
+
+    //     if (configs.empty()) {
+    //         std::cerr << "[ga] run_auto: no fleet config supplied and "
+    //                      "config unavailable — aborting.\n";
+    //         return;
+    //     }
+
+    //     // Print fleet spec
+    //     int totalMin = 0, totalMax = 0;
+    //     std::cout << "[ga] [auto] Fleet specification:\n";
+    //     for (int t = 0; t < (int)configs.size(); t++) {
+    //         std::cout << "  Type " << t << " : " << configs[t].rangeKm
+    //                   << " km  [" << configs[t].minCount
+    //                   << " – "    << configs[t].maxCount << " units]\n";
+    //         totalMin += configs[t].minCount;
+    //         totalMax += configs[t].maxCount;
+    //     }
+    //     std::cout << "  Total radar range : [" << totalMin << ", " << totalMax << "]\n";
+    //     std::cout << "  Lambda (cost/radar): " << weights.x << "\n";
+    //     std::cout << "  generations=" << generations
+    //               << "  popSize=" << popSize << "\n\n";
+
+    //     std::cout << "[ga] Extracting feasible grid...\n";
+    //     auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+
+    //     // Seed population
+    //     std::vector<AutoChromosome> autoPop;
+    //     autoPop.reserve(popSize);
+    //     for (int i = 0; i < popSize; i++)
+    //         autoPop.push_back(generateAutoChromosome(f, configs));
+
+    //     std::cout << "[ga] Evaluating Generation 0...\n";
+    //     parallelEvaluateAutoPopulation(autoPop, g, f, configs, false);
+
+    //     for (int gen = 1; gen <= generations; ++gen) {
+    //         std::sort(autoPop.begin(), autoPop.end(),
+    //             [](const AutoChromosome& a, const AutoChromosome& b) {
+    //                 return a.fitness < b.fitness; });
+
+    //         std::vector<AutoChromosome> nextGen;
+    //         nextGen.reserve(popSize);
+    //         nextGen.push_back(autoPop.back()); // elitism
+
+    //         bool useSUS = (autoSelection == SelectionMethod::SUS);
+    //         std::vector<AutoChromosome> matingPool;
+    //         size_t poolIdx = 0;
+    //         if (useSUS)
+    //             matingPool = stochasticUniversalSamplingAuto(autoPop, popSize - 1);
+
+    //         while ((int)nextGen.size() < popSize) {
+    //             AutoChromosome p1, p2;
+    //             if (useSUS) {
+    //                 p1 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
+    //                 p2 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
+    //             } else {
+    //                 p1 = executeSelectionAuto(autoPop);
+    //                 p2 = executeSelectionAuto(autoPop);
+    //             }
+
+    //             auto [c1, c2] = executeCrossoverAuto(p1, p2);
+
+    //             repairChromosome(c1, f, configs);
+    //             repairChromosome(c2, f, configs);
+
+    //             executeMutationAuto(c1, f, configs);
+    //             executeMutationAuto(c2, f, configs);
+
+    //             repairChromosome(c1, f, configs);
+    //             repairChromosome(c2, f, configs);
+
+    //             nextGen.push_back(c1);
+    //             if ((int)nextGen.size() < popSize) nextGen.push_back(c2);
+    //         }
+
+    //         parallelEvaluateAutoPopulation(nextGen, g, f, configs, false);
+    //         autoPop = std::move(nextGen);
+
+    //         auto best = std::max_element(autoPop.begin(), autoPop.end(),
+    //             [](const AutoChromosome& a, const AutoChromosome& b) {
+    //                 return a.fitness < b.fitness; });
+
+    //         std::string breakdown;
+    //         for (int t = 0; t < (int)configs.size(); t++)
+    //             breakdown += " [T" + std::to_string(t) + ":"
+    //                        + std::to_string(best->countType(t)) + "]";
+
+    //         std::cout << "  Gen " << gen
+    //                   << " | Fitness: " << best->fitness
+    //                   << " | N=" << best->totalCount()
+    //                   << breakdown << "\n";
+    //     }
+
+    //     auto finalBest = std::max_element(autoPop.begin(), autoPop.end(),
+    //         [](const AutoChromosome& a, const AutoChromosome& b) {
+    //             return a.fitness < b.fitness; });
+
+    //     std::cout << "\n[ga] Evolution complete.\n";
+    //     std::cout << "  Final fitness  : " << finalBest->fitness << "\n";
+    //     std::cout << "  Total radars   : " << finalBest->totalCount() << "\n";
+    //     for (int t = 0; t < (int)configs.size(); t++)
+    //         std::cout << "  Type " << t << " (" << configs[t].rangeKm << " km) : "
+    //                   << finalBest->countType(t) << " units\n";
+
+    //     auto positions = extractPositions(finalBest->radars);
+    //     auto ranges    = extractRangesM(finalBest->radars, configs);
+    //     calculate_radar_coverage_overlap(g, f, positions,
+    //                                      5.0, coverageOutput, ranges);
+    //     Bin::writeRadarScatterPng(positions, scatterOutput);
+    // }
+    int run_benchmark() {
+        BoundingBox areaOfOps = { 34.0522, 34.1022, -118.2437, -118.1937 };
+
+        // 2. Initialize the shared multi-threaded hardware pool
+        ThreadPool sharedPool;
+        GaEngine gaEngine(sharedPool);
+        // 3. Define 16 diverse test case profiles combining different techniques and parameters
+        std::vector<GAConfig> sweepConfigs = {
+            // Control & Baseline
+            {"Baseline Control",     120, 100, 0.08, 0.85, SelectionMethod::TOURNAMENT,     CrossoverMethod::SINGLE_POINT, MutationMethod::SPATIAL_NUDGE},
+
+            // Lightweight / Fast Profiles
+            {"Lightweight (Fast)",    50,  50, 0.05, 0.70, SelectionMethod::TOURNAMENT,     CrossoverMethod::SINGLE_POINT, MutationMethod::SPATIAL_NUDGE},
+            {"Micro-Sweep (SUS)",     40,  60, 0.08, 0.80, SelectionMethod::SUS,            CrossoverMethod::MULTI_POINT,  MutationMethod::GAUSSIAN_CREEP},
+
+            // Intensive Searches (Large populations and generations)
+            {"Intensive Search",     300, 200, 0.05, 0.80, SelectionMethod::TOURNAMENT,     CrossoverMethod::MULTI_POINT,  MutationMethod::SPATIAL_NUDGE},
+            {"Intensive SUS",        250, 150, 0.08, 0.85, SelectionMethod::SUS,            CrossoverMethod::UNIFORM,      MutationMethod::GAUSSIAN_CREEP},
+
+            // Exploration-Heavy (High mutation, uniform crossover, rank-based)
+            {"Uniform Exploration",  150, 120, 0.15, 0.90, SelectionMethod::RANK_BASED,     CrossoverMethod::UNIFORM,      MutationMethod::GAUSSIAN_CREEP},
+            {"SUS High-Mutation",    120, 100, 0.20, 0.75, SelectionMethod::SUS,            CrossoverMethod::UNIFORM,      MutationMethod::GAUSSIAN_CREEP},
+
+            // Exploitation-Heavy (Low mutation, high crossover)
+            {"Exploitation Focus",   150, 100, 0.02, 0.95, SelectionMethod::TOURNAMENT,     CrossoverMethod::MULTI_POINT,  MutationMethod::SPATIAL_NUDGE},
+
+            // Roulette Wheel Variations
+            {"Roulette & Uniform",   120, 100, 0.08, 0.85, SelectionMethod::ROULETTE_WHEEL, CrossoverMethod::UNIFORM,      MutationMethod::GAUSSIAN_CREEP},
+            {"Roulette & Nudge",     120, 100, 0.06, 0.80, SelectionMethod::ROULETTE_WHEEL, CrossoverMethod::MULTI_POINT,  MutationMethod::SPATIAL_NUDGE},
+
+            // Rank-Based Variations
+            {"Rank & Gaussian",      120, 100, 0.08, 0.85, SelectionMethod::RANK_BASED,     CrossoverMethod::MULTI_POINT,  MutationMethod::GAUSSIAN_CREEP},
+            {"Rank & Nudge",         120, 100, 0.06, 0.80, SelectionMethod::RANK_BASED,     CrossoverMethod::SINGLE_POINT, MutationMethod::SPATIAL_NUDGE},
+
+            // Single Point Reset Mutation Variations
+            {"Tournament & Reset",   120, 100, 0.10, 0.80, SelectionMethod::TOURNAMENT,     CrossoverMethod::SINGLE_POINT, MutationMethod::SINGLE_POINT},
+            {"SUS & Reset",          120, 100, 0.10, 0.80, SelectionMethod::SUS,            CrossoverMethod::SINGLE_POINT, MutationMethod::SINGLE_POINT},
+            {"Rank & Reset",         120, 100, 0.10, 0.80, SelectionMethod::RANK_BASED,     CrossoverMethod::SINGLE_POINT, MutationMethod::SINGLE_POINT},
+
+            // High Crossover Exploration
+            {"High-Cross SUS Nudge", 120, 100, 0.05, 0.95, SelectionMethod::SUS,            CrossoverMethod::SINGLE_POINT, MutationMethod::SPATIAL_NUDGE}
+        };
+
+        std::vector<BenchmarkResult> leaderboard;
+        leaderboard.reserve(sweepConfigs.size());
+
+        std::cout << "========================================================================\n";
+        std::cout << "        STARTING HYPERPARAMETER OPTIMIZATION SWEEP (16 Test Profiles)    \n";
+        std::cout << "========================================================================\n";
+        std::cout << "Running evaluation sweep over C++ ThreadPool...\n\n";
+
+        for (size_t idx = 0; idx < sweepConfigs.size(); ++idx) {
+            const auto& c = sweepConfigs[idx];
+            std::cout << " [*] Running Test " << std::setw(2) << (idx + 1) << " / " << sweepConfigs.size()
+                      << ": " << std::left << std::setw(25) << c.name << " ... " << std::flush;
+
+            gaEngine.setOperators(c.selection, c.crossover, c.mutation, c.mutationRate, c.crossoverRate);
+
+            auto start = std::chrono::high_resolution_clock::now();
+            double resultDistance = gaEngine.run_homogenous();
+            auto end = std::chrono::high_resolution_clock::now();
+
+            std::chrono::duration<double, std::milli> elapsed = end - start;
+
+            leaderboard.push_back({
+                c.name,
+                toString(c.selection),
+                toString(c.crossover),
+                toString(c.mutation),
+                c.popSize,
+                c.generations,
+                c.mutationRate,
+                c.crossoverRate,
+                resultDistance,
+                elapsed.count(),
+                gaEngine.getFitnessEvalTime(),
+                gaEngine.getEvolutionaryTime()
+            });
+
+            std::cout << "Done. (Distance: " << std::fixed << std::setprecision(3) << resultDistance
+                      << " km, Time: " << std::setprecision(1) << elapsed.count() << " ms)\n";
         }
 
-        if (configs.empty()) {
-            std::cerr << "[ga] run_auto: no fleet config supplied and "
-                         "config unavailable — aborting.\n";
-            return;
+        // Sort leaderboard by best (shortest) distance ascending
+        std::sort(leaderboard.begin(), leaderboard.end(), [](const BenchmarkResult& a, const BenchmarkResult& b) {
+            return a.bestDistance < b.bestDistance;
+            });
+
+        // Print Ranked Performance Results Leaderboard
+        std::cout << "\n\n";
+        std::cout << "=========================================================================================================================================\n";
+        std::cout << "                                                 HYPERPARAMETER OPTIMIZATION LEADERBOARD                                                 \n";
+        std::cout << "=========================================================================================================================================\n";
+        std::cout << " Rank | " << std::left << std::setw(23) << "Config Profile Name"
+                  << " | " << std::setw(11) << "Selection"
+                  << " | " << std::setw(12) << "Crossover"
+                  << " | " << std::setw(9) << "Mutation"
+                  << " | " << std::right << std::setw(4) << "Pop"
+                  << " | " << std::setw(4) << "Gen"
+                  << " | " << std::setw(5) << "MutR"
+                  << " | " << std::setw(5) << "XOver"
+                  << " | " << std::setw(15) << "Best fitness (km)"
+                  << " | " << std::setw(10) << "Total (ms)"
+                  << " |\n";
+        std::cout << "------|-------------------------|-------------|--------------|-----------|------|------|-------|-------|----------------|------------|\n";
+
+        for (size_t i = 0; i < leaderboard.size(); ++i) {
+            const auto& r = leaderboard[i];
+            std::cout << "  " << std::right << std::setw(2) << (i + 1) << "  | "
+                      << std::left << std::setw(23) << r.name << " | "
+                      << std::setw(11) << r.selection << " | "
+                      << std::setw(12) << r.crossover << " | "
+                      << std::setw(9) << r.mutation << " | "
+                      << std::right << std::setw(4) << r.popSize << " | "
+                      << std::setw(4) << r.generations << " | "
+                      << std::setw(5) << std::fixed << std::setprecision(2) << r.mutationRate << " | "
+                      << std::setw(5) << r.crossoverRate << " | "
+                      << std::setw(15) << std::setprecision(4) << r.bestDistance << " | "
+                      << std::setw(10) << std::setprecision(1) << r.totalTimeMs << " |\n";
         }
+        std::cout << "=========================================================================================================================================\n";
+        std::cout << "Note: Leaderboard is sorted primarily by Best Distance (ascending, shortest is best).\n\n";
 
-        // Print fleet spec
-        int totalMin = 0, totalMax = 0;
-        std::cout << "[ga] [auto] Fleet specification:\n";
-        for (int t = 0; t < (int)configs.size(); t++) {
-            std::cout << "  Type " << t << " : " << configs[t].rangeKm
-                      << " km  [" << configs[t].minCount
-                      << " – "    << configs[t].maxCount << " units]\n";
-            totalMin += configs[t].minCount;
-            totalMax += configs[t].maxCount;
-        }
-        std::cout << "  Total radar range : [" << totalMin << ", " << totalMax << "]\n";
-        std::cout << "  Lambda (cost/radar): " << weights.x << "\n";
-        std::cout << "  generations=" << generations
-                  << "  popSize=" << popSize << "\n\n";
-
-        std::cout << "[ga] Extracting feasible grid...\n";
-        auto f = Bin::getFeasibleGrid(g.bin, WRITE);
-
-        // Seed population
-        std::vector<AutoChromosome> autoPop;
-        autoPop.reserve(popSize);
-        for (int i = 0; i < popSize; i++)
-            autoPop.push_back(generateAutoChromosome(f, configs));
-
-        std::cout << "[ga] Evaluating Generation 0...\n";
-        parallelEvaluateAutoPopulation(autoPop, g, f, configs, false);
-
-        for (int gen = 1; gen <= generations; ++gen) {
-            std::sort(autoPop.begin(), autoPop.end(),
-                [](const AutoChromosome& a, const AutoChromosome& b) {
-                    return a.fitness < b.fitness; });
-
-            std::vector<AutoChromosome> nextGen;
-            nextGen.reserve(popSize);
-            nextGen.push_back(autoPop.back()); // elitism
-
-            bool useSUS = (autoSelection == SelectionMethod::SUS);
-            std::vector<AutoChromosome> matingPool;
-            size_t poolIdx = 0;
-            if (useSUS)
-                matingPool = stochasticUniversalSamplingAuto(autoPop, popSize - 1);
-
-            while ((int)nextGen.size() < popSize) {
-                AutoChromosome p1, p2;
-                if (useSUS) {
-                    p1 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
-                    p2 = matingPool[poolIdx % matingPool.size()]; poolIdx++;
-                } else {
-                    p1 = executeSelectionAuto(autoPop);
-                    p2 = executeSelectionAuto(autoPop);
-                }
-
-                auto [c1, c2] = executeCrossoverAuto(p1, p2);
-
-                repairChromosome(c1, f, configs);
-                repairChromosome(c2, f, configs);
-
-                executeMutationAuto(c1, f, configs);
-                executeMutationAuto(c2, f, configs);
-
-                repairChromosome(c1, f, configs);
-                repairChromosome(c2, f, configs);
-
-                nextGen.push_back(c1);
-                if ((int)nextGen.size() < popSize) nextGen.push_back(c2);
-            }
-
-            parallelEvaluateAutoPopulation(nextGen, g, f, configs, false);
-            autoPop = std::move(nextGen);
-
-            auto best = std::max_element(autoPop.begin(), autoPop.end(),
-                [](const AutoChromosome& a, const AutoChromosome& b) {
-                    return a.fitness < b.fitness; });
-
-            std::string breakdown;
-            for (int t = 0; t < (int)configs.size(); t++)
-                breakdown += " [T" + std::to_string(t) + ":"
-                           + std::to_string(best->countType(t)) + "]";
-
-            std::cout << "  Gen " << gen
-                      << " | Fitness: " << best->fitness
-                      << " | N=" << best->totalCount()
-                      << breakdown << "\n";
-        }
-
-        auto finalBest = std::max_element(autoPop.begin(), autoPop.end(),
-            [](const AutoChromosome& a, const AutoChromosome& b) {
-                return a.fitness < b.fitness; });
-
-        std::cout << "\n[ga] Evolution complete.\n";
-        std::cout << "  Final fitness  : " << finalBest->fitness << "\n";
-        std::cout << "  Total radars   : " << finalBest->totalCount() << "\n";
-        for (int t = 0; t < (int)configs.size(); t++)
-            std::cout << "  Type " << t << " (" << configs[t].rangeKm << " km) : "
-                      << finalBest->countType(t) << " units\n";
-
-        auto positions = extractPositions(finalBest->radars);
-        auto ranges    = extractRangesM(finalBest->radars, configs);
-        calculate_radar_coverage_overlap(g, f, positions,
-                                         5.0, coverageOutput, ranges);
-        Bin::writeRadarScatterPng(positions, scatterOutput);
+        return 0;
     }
+
+    std::string toString(SelectionMethod sm) {
+        switch(sm) {
+            case SelectionMethod::TOURNAMENT:     return "Tournament";
+            case SelectionMethod::ROULETTE_WHEEL: return "Roulette";
+            case SelectionMethod::RANK_BASED:    return "Rank-Based";
+            case SelectionMethod::SUS:           return "SUS";
+        }
+        return "Unknown";
+    }
+
+    std::string toString(CrossoverMethod cm) {
+        switch(cm) {
+            case CrossoverMethod::SINGLE_POINT: return "Single-Point";
+            case CrossoverMethod::MULTI_POINT:  return "Multi-Point";
+            case CrossoverMethod::UNIFORM:      return "Uniform";
+        }
+        return "Unknown";
+    }
+
+    std::string toString(MutationMethod mm) {
+        switch(mm) {
+            case MutationMethod::SINGLE_POINT:  return "Reset";
+            case MutationMethod::SPATIAL_NUDGE:  return "Nudge";
+            case MutationMethod::GAUSSIAN_CREEP: return "Gaussian";
+        }
+         return "Unknown";
+    }
+    double getFitnessEvalTime() const { return totalFitnessEvalTimeMs; }
+    double getEvolutionaryTime() const { return totalEvolutionaryTimeMs; }
 };
 
-// ============================================================
-// ENTRY POINT
-// Config drives which run mode executes when present.
-// Hard-coded calls below act as fallback defaults.
-// ============================================================
+
 int main() {
     ThreadPool pool;
     GaEngine ga(pool);
-    ga.run_native_random_simulation(5);
+    bool run_benchmark = false;
+    bool gen_simdata = false;
+    int num_experiments  = 100;
+    if(run_benchmark) {
+        ga.run_benchmark();
+    }
+    if(gen_simdata) {
+        ga.run_native_random_simulation(num_experiments);
+    } else {
+    // ga.run_native_random_simulation(100);
 
-    // // Always configure operator enums here.
-    // // Numeric rates (mutationRate / crossoverRate) are only used by
-    // // setOperators if no config was loaded; otherwise config values win.
-    // ga.setOperators(SelectionMethod::TOURNAMENT, CrossoverMethod::UNIFORM,
-    //                 MutationMethod::SPATIAL_NUDGE,
-    //                 /*mRate=*/0.08, /*cRate=*/0.85);
+    // Always configure operator enums here.
+    // Numeric rates (mutationRate / crossoverRate) are only used by
+    // setOperators if no config was loaded; otherwise config values win.
+    ga.setOperators(SelectionMethod::TOURNAMENT, CrossoverMethod::UNIFORM,
+                    MutationMethod::SPATIAL_NUDGE,
+                    /*mRate=*/0.08, /*cRate=*/0.85);
 
-    // // --- Dispatch based on config when present ---
-    // if (GaConf::is_available()) {
-    //     GaConf cfg = GaConf::load();
+    // --- Dispatch based on config when present ---
+    if (GaConf::is_available()) {
+        GaConf cfg = GaConf::load();
 
-    //     if (cfg.homo.is_case) {
-    //         // Parameters (pop, rates, weights, output) already applied in
-    //         // GaEngine constructor via applyConfig(); just call the runner.
-    //         ga.run_homogenous();
-    //     }
-    //     else if (cfg.hetero.is_case) {
-    //         // Fleet built inside run_heterogenous() from cfg.hetero.radars
-    //         ga.run_heterogenous();
-    //     }
-    //     else if (cfg.autoG.is_case) {
-    //         ga.setAutoOperators(SelectionMethod::TOURNAMENT,
-    //                             AutoCrossoverMethod::RANDOM_SUBSET,
-    //                             /*mRate=*/0.10, /*cRate=*/0.85);
-    //         // Fleet built inside run_auto() from cfg.autoG.radars
-    //         ga.run_auto();
-    //     }
-    //     else {
-    //         std::cerr << "[ga] Config found but no is_case flag is set — "
-    //                      "falling back to default homogenous run.\n";
-    //         ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
-    //                           /*opt=*/false, /*num_top_k=*/15);
-    //     }
-    // }
-    // else {
-    //     // ---- Hardcoded defaults (no config file present) ----
+        if (cfg.homo.is_case) {
+            // Parameters (pop, rates, weights, output) already applied in
+            // GaEngine constructor via applyConfig(); just call the runner.
+            ga.run_homogenous();
+        }
+        else if (cfg.hetero.is_case) {
+            // Fleet built inside run_heterogenous() from cfg.hetero.radars
+            ga.run_heterogenous();
+        }
+        else if (cfg.autoG.is_case) {
+            ga.setAutoOperators(SelectionMethod::TOURNAMENT,
+                                AutoCrossoverMethod::RANDOM_SUBSET,
+                                /*mRate=*/0.10, /*cRate=*/0.85);
+            // Fleet built inside run_auto() from cfg.autoG.radars
+            // ga.run_auto();
+        }
+        else {
+            std::cerr << "[ga] Config found but no is_case flag is set — "
+                         "falling back to default homogenous run.\n";
+            ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
+                              /*opt=*/false, /*num_top_k=*/15);
+        }
 
-    //     // Homogenous
-    //     ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
-    //                       /*opt=*/WRITE, /*num_top_k=*/15);
-
-    //     // Heterogenous (uncomment to use)
-    //     // std::vector<RadarConfig> fleet = { {50.0, 2}, {150.0, 1}, {300.0, 1} };
-    //     // ga.run_heterogenous(fleet, /*generations=*/50);
-
-    //     // Auto (uncomment to use)
-    //     // ga.setLambda(0.0);
-    //     // ga.setAutoOperators(SelectionMethod::TOURNAMENT,
-    //     //                     AutoCrossoverMethod::RANDOM_SUBSET,
-    //     //                     0.10, 0.85);
-    //     // std::vector<FlexRadarConfig> flexFleet = {
-    //     //     {  50.0, 2, 5 },
-    //     //     { 300.0, 1, 3 },
-    //     // };
-    //     // ga.run_auto(flexFleet, /*generations=*/50);
-    // }
-
+    }
+    else {
+        cerr << "config is not available. provide a config" << endl;
+        return -1;
+    }
+}
     return 0;
 }
