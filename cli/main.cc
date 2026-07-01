@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
     op_group->add_flag("--water-lines",waterline,"create water-lines bin");
     op_group->add_flag("-i, --ib",ib,"create ib bin");
     op_group->add_flag("--slope",slope,"create slope bin");
-    op_group->require_option(1);
+    op_group->require_option(0,1);
 
     auto f_sub = app.add_subcommand("feasible", "Build feasible bin for a AOP if no point is provided then . bins & config REQUIRED");
     f_sub->add_flag("-v,--with-images",images,"Generates images for bin visualization");
