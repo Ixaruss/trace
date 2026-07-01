@@ -14,6 +14,7 @@
  */
 #pragma once
 
+#include "config.h"
 #include <vector>
 #include <cmath>
 #include <string>
@@ -53,6 +54,7 @@ struct LocalMask {
 };
 
 // ── Bresenham circle perimeter ────────────────────────────────────────────
+
 inline std::vector<Pt> circleBoundary(int cr, int cc, int R)
 {
     std::vector<Pt> pts;
@@ -67,17 +69,54 @@ inline std::vector<Pt> circleBoundary(int cr, int cc, int R)
 
     int x = 0, y = R, d = 3 - 2 * R;
     while (y >= x) {
-        push8(x, y); ++x;
-        if (d > 0) { --y; d += 4*(x - y) + 10; } else { d += 4*x + 6; }
+        push8(x, y);
+
+        // FIX: Calculate the decision variable using current x,y
+        // values BEFORE x is incremented.
+        if (d > 0) {
+            d += 4 * (x - y) + 10;
+            --y;
+        } else {
+            d += 4 * x + 6;
+        }
+        ++x; // Increment x safely at the very end of the step iteration
     }
 
+    // Keep your exact sorting & deduplication pipeline intact
     std::sort(pts.begin(), pts.end(), [](const Pt& a, const Pt& b){
         return a.x < b.x || (a.x == b.x && a.y < b.y); });
+
     pts.erase(std::unique(pts.begin(), pts.end(), [](const Pt& a, const Pt& b){
         return a.x == b.x && a.y == b.y; }), pts.end());
+
     return pts;
 }
+inline std::vector<Pt> angularBoundary(int cr, int cc, int R)
+{
+    const double angStep = 1.0 / (double)R;
+    const int    N       = (int)std::ceil(2.0 * M_PI / angStep) + 1;
 
+    std::vector<Pt> pts;
+    pts.reserve(N);
+
+    for (int i = 0; i < N; ++i)
+    {
+        double angle = i * angStep;
+        int er = cr + (int)std::round((double)R * std::cos(angle));
+        int ec = cc + (int)std::round((double)R * std::sin(angle));
+
+        if (!pts.empty() && pts.back().x == er && pts.back().y == ec)
+            continue;
+
+        pts.push_back({er, ec});
+    }
+
+    if (pts.size() > 1 && pts.front().x == pts.back().x
+                       && pts.front().y == pts.back().y)
+        pts.pop_back();
+
+    return pts;
+}
 // ── Binary ray cast into local bounding-box buffer ───────────────────────
 //
 // statBase is a "virtual origin" pointer such that
@@ -96,7 +135,7 @@ inline void castRayFast(
     double minSlope,   double maxSlope,
     double horizonM,   int maxRadiusCells,
     const short* __restrict__ dem,
-    uint8_t*     __restrict__ statBase,
+    uint8_t* __restrict__ statBase,
     int localCols,
     int gridCols)
 {
@@ -111,10 +150,9 @@ inline void castRayFast(
     const auto statStrideR = static_cast<std::ptrdiff_t>(sr) * localCols;
 
     const short* demCell  = dem      + static_cast<std::ptrdiff_t>(srcRow) * gridCols  + srcCol;
-    uint8_t*     statCell = statBase + static_cast<std::ptrdiff_t>(srcRow) * localCols + srcCol;
+    uint8_t* statCell = statBase + static_cast<std::ptrdiff_t>(srcRow) * localCols + srcCol;
 
     int    row = srcRow, col = srcCol;
-    double dist = 0.0, curvDrop = 0.0;
     double maxTerrainSlope = -1e18;
     int    steps = 0;
 
@@ -129,13 +167,16 @@ inline void castRayFast(
         if (mr) { err -= adc; row += sr; demCell += demStrideR;  statCell += statStrideR; }
         if (mc) { err += adr; col += sc; demCell += sc;           statCell += sc;           }
 
-        const double step = (mr && mc) ? RESOLUTION * 1.41421356237 : RESOLUTION;
-        curvDrop += (2.0 * dist * step + step * step) * INV_2_KEFFR;
-        dist     += step;
         ++steps;
-
         if (steps > maxRadiusCells) break;
-        if (dist  > horizonM)       break;
+
+        // True straight-line ground distance from source
+        const double drow = static_cast<double>(row - srcRow);
+        const double dcol = static_cast<double>(col - srcCol);
+        const double dist = std::sqrt(drow * drow + dcol * dcol) * RESOLUTION;
+        const double curvDrop = (dist * dist) * INV_2_KEFFR;
+
+        if (dist > horizonM) break;
 
         const short raw = *demCell;
         if (raw < -9000) break;   // no-data sentinel
@@ -258,12 +299,13 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     const std::vector<GridPoint>& placements,
     double                        minSpacingCells = 5.0,
     const std::string&            pngPath         = "",
-    const std::vector<double>&    radarRanges     = {},
+
     double                        antennaHeight   = 50.0,    // metres AGL
     double                        minAngle        = 0.5,     // degrees
     double                        target          = 1000.0,  // metres
     double                        maxAngle        = 30.0,    // degrees
-    double                        rangeM          = 25000.0 // metres — was wrongly `int range = 25`
+    double                        rangeM          = 25000.0, // metres — was wrongly `int range = 25`
+    const std::vector<RadarConf>& radarRanges = {}
 )
 {
     std::vector<int> result(4, 0);
@@ -276,31 +318,39 @@ inline std::vector<int> calculate_radar_coverage_overlap(
         }
 
     if (!radarRanges.empty()) {
-        for (size_t i = 0; i < placements.size(); i++) {
+        // Build the flattened radar list ONCE.
+        std::vector<RadarConf> radaran;
+        for (const auto& x : radarRanges)
+            for (int k = 0; k < x.quantity; ++k)
+                radaran.push_back(x);
+        if (radaran.empty()) {
+            // Nothing configured — bail out instead of UB out-of-bounds reads.
+            return result;
+        }
+
+        for (size_t i = 0; i < placements.size(); ++i) {
             const auto& p = placements[i];
-            double maxRangeM = radarRanges[i];
+            const auto& r = radaran[i % radaran.size()]; // cycle if fewer radars than placements
 
             const rc_detail::LocalMask cov =
                 rc_detail::computeLocalMask(
-                g, p.r, p.c,
-                antennaHeight,
-                target,
-                minAngle,
-                maxAngle,
-                maxRangeM
-            );
+                    g, p.r, p.c,
+                    r.antennaHeight,
+                    r.target,
+                    r.minAngle,
+                    r.maxAngle,
+                    r.range * 1000);
 
             for (auto& cell : grid.cells) {
-                if (cell.r >= cov.rowMin && cell.r < cov.rowMax &&
-                    cell.c >= cov.colMin && cell.c < cov.colMax) {
-                    size_t local_r = cell.r - cov.rowMin;
-                    size_t local_c = cell.c - cov.colMin;
-                    size_t flat = local_r * cov.localCols + local_c;
+                if (cell.r < cov.rowMin || cell.r >= cov.rowMax ||
+                    cell.c < cov.colMin || cell.c >= cov.colMax) continue;
 
-                    if (flat < cov.buf.size() && cov.buf[flat] == 1) {
-                        cell.overlap++;
-                    }
-                }
+                const size_t local_r = cell.r - cov.rowMin;
+                const size_t local_c = cell.c - cov.colMin;
+                const size_t flat = local_r * cov.localCols + local_c;
+
+                if (flat < cov.buf.size() && cov.buf[flat]) // match homogeneous branch's truthy check
+                    ++cell.overlap;
             }
         }
     } else {
