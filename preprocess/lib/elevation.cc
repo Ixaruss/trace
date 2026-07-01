@@ -262,26 +262,44 @@ int Bin::build_elevation_matrix(bool split) {
         fwrite(out, sizeof(ElevCell), total_cells, f);
         fclose(f);
         free(out);
-    }else{
-        FILE* f = fopen(opath.c_str(), "wb");
-        if (!f) {
-            cerr << "[elevation] ERROR: could not open " << opath << " for writing\n";
-            free(elev_buf);
-            return -1;
+    }else {
+        // ── write elevation first, then free it before slope ──────────────
+        {
+            FILE* f = fopen(opath.c_str(), "wb");
+            if (!f) {
+                cerr << "[elevation] ERROR: could not open " << opath << "\n";
+                free(elev_buf);
+                free(slope);
+                return -1;
+            }
+            // write in 256 MB chunks to avoid single giant syscall
+            const size_t CHUNK = (1 << 28) / sizeof(int16_t); // ~128M int16s
+            for (size_t off = 0; off < total_cells; off += CHUNK) {
+                size_t n = min(CHUNK, total_cells - off);
+                fwrite(elev_buf + off, sizeof(int16_t), n, f);
+            }
+            fclose(f);
+            free(elev_buf);   // ← free BEFORE slope write
+            elev_buf = nullptr;
         }
-        fwrite(elev_buf, sizeof(int16_t), total_cells, f);
-        fclose(f);
-        free(elev_buf);
-        cout<< "[elevation] writing slpoe";
-        f = fopen("./bin/slope.bin", "wb");
-        if (!f) {
-            cerr << "[elevation] ERROR: could not open " << opath << " for writing\n";
+
+        cout << "[elevation] Writing slope...\n";
+
+        {
+            FILE* f = fopen("./bin/slope.bin", "wb");  // ← fixed path in error msg too
+            if (!f) {
+                cerr << "[elevation] ERROR: could not open ./bin/slope.bin\n";
+                free(slope);
+                return -1;
+            }
+            const size_t CHUNK = (1 << 28) / sizeof(float); // ~64M floats
+            for (size_t off = 0; off < total_cells; off += CHUNK) {
+                size_t n = min(CHUNK, total_cells - off);
+                fwrite(slope + off, sizeof(float), n, f);
+            }
+            fclose(f);
             free(slope);
-            return -1;
         }
-        fwrite(slope, sizeof(float), total_cells, f);
-        fclose(f);
-        free(slope);
     }
 
     cout << "[elevation] Written → " << opath << " ("

@@ -1,6 +1,7 @@
 #include "../bin.h"
+#include "hdf5.h"
 #include <vector>
-
+#include "../../ga/h5.h"
 using namespace std;
 using namespace lib;
 
@@ -149,7 +150,7 @@ BoundingBox Bin::getMinimumBoundingBox() {
   #define _FILE_OFFSET_BITS 64
 #endif
 
-FeasibleGrid Bin::getFeasibleGrid(Bin& b, short op, short opt) {
+FeasibleGrid Bin::getFeasibleGrid(Bin& b, short op, short opt, short allCells) {
     FeasibleGrid result;
 
     if (!b.vector_loaded) {
@@ -221,24 +222,26 @@ FeasibleGrid Bin::getFeasibleGrid(Bin& b, short op, short opt) {
 
             uint8_t cell = b.vec_matrix[(size_t)r * b.VEC_COLS + c];
 
-            if (b.flag_water_line && (cell & (1 << BIT_WATER_LINE))) { water_count++; continue; }
-            if (b.flag_water_area && (cell & (1 << BIT_WATER_AREA))) { water_count++; continue; }
-            if (b.flag_ib         && (cell & (1 << BIT_IB)))         { ib_count++;    continue; }
-            if (b.flag_slope && (cell & (1 << BIT_SLOPE))) {
-                    slope_count++; continue;
-            }
+           if(!allCells) {
+               if (b.flag_water_line && (cell & (1 << BIT_WATER_LINE))) { water_count++; continue; }
+               if (b.flag_water_area && (cell & (1 << BIT_WATER_AREA))) { water_count++; continue; }
+               if (b.flag_ib         && (cell & (1 << BIT_IB)))         { ib_count++;    continue; }
+               if (b.flag_slope && (cell & (1 << BIT_SLOPE))) {
+                       slope_count++; continue;
+               }
 
-            if (need_infra) {
-                bool road_ok = b.flag_road && (cell & (1 << BIT_ROAD));
-                bool rail_ok = b.flag_rail && (cell & (1 << BIT_RAIL));
-                if (!road_ok && !rail_ok) { no_infra_count++; continue; }
-            }
+               if (need_infra) {
+                   bool road_ok = b.flag_road && (cell & (1 << BIT_ROAD));
+                   bool rail_ok = b.flag_rail && (cell & (1 << BIT_RAIL));
+                   if (!road_ok && !rail_ok) { no_infra_count++; continue; }
+               }
 
+           }
             result.cells.push_back({ r, c, cell });
         }
     }
     if (op == WRITE)
-        writeBin("./feasable.bin", result.cells);
+        writeBin("./areaofoperation.bin", result.cells);
 
     cout << "[feasible] Outside polygon : " << outside_count  << "\n";
     cout << "[feasible] Water cells     : " << water_count    << "\n";
@@ -256,6 +259,50 @@ int Bin::getTerrianResolution() {
     return conf.grid.resolution;
 }
 
+void Bin::getonlyFeasibleGrid(Bin& b){
+    auto x = getFeasibleGrid(b).cells;
+    cout <<"bin size: " << x.size() <<endl;
+     writeBin("./pso.bin", x);
+}
+
+void Bin::write_heatmap_bin_h5 (){
+    Bin b;
+    b.init({CONSTRAINTS});
+    auto bin = Bin::getFeasibleGrid(b,0,0,WITHALL);
+    auto h5_path = "aoi_cells.h5";
+    H5E_auto2_t old_func;
+    void*       old_data;
+    H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);
+    H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);          // silence
+    hid_t raw_fid = H5Fopen(h5_path, H5F_ACC_RDWR, H5P_DEFAULT);
+    H5Eset_auto2(H5E_DEFAULT, old_func, old_data);        // restore
+
+    if (raw_fid < 0)
+        raw_fid = H5Fcreate(h5_path,
+                             H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    if (raw_fid < 0)
+        throw std::runtime_error(
+            "write_h5_indiviual: cannot open or create file ");
+
+    h5_lib::H5FileGuard fid{ raw_fid };
+
+    H5G_info_t root_info{};
+    H5Gget_info(fid.id, &root_info);
+    const int run_n = static_cast<int>(root_info.nlinks) + 1;
+
+    h5_lib::H5GroupGuard data{
+        H5Gcreate2(fid.id, "aoi",
+                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT) };
+    if (data.id < 0)
+        throw std::runtime_error("write_h5_indiviual: failed to create 'data' group");
+    vector<int> r,c;
+    for (auto x: bin.cells) {
+        r.push_back(x.r);
+        c.push_back(x.c);
+    }
+    h5_lib::write_i32(data.id, "r",        r);
+    h5_lib::write_i32(data.id, "c",        c);
+}
 pair<double,double> Bin::getMapOrigins() {
     if (!Config::is_available()) return { VEC_ORIGIN_X, VEC_ORIGIN_Y };
     return { conf.grid.origin_x, conf.grid.origin_y };

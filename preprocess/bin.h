@@ -21,6 +21,7 @@ const bool USE_MULTI_THREADS = 1;
 const bool FULL_MATRIX = 1;
 const bool LIMIT_MEMORY = 1;
 const bool COMBINE = 0;
+const bool WITHALL = 1;
 
 struct BoundingBox {
     double min_lat;
@@ -78,8 +79,8 @@ class Bin {
     public: bool flag_road = false;
     public: bool flag_rail = false;
     public: bool flag_water_line = true;
-    public: bool flag_water_area = true;
-    public: bool flag_ib = true;
+    public: bool flag_water_area = false;
+    public: bool flag_ib = false;
     public: bool flag_slope = false;
 
     public: BoundingBox mbr;
@@ -128,6 +129,8 @@ public:
 
     public: static bool point_in_polygon(double px, double py, const std::vector<std::pair<double,double>>& proj_poly);
 
+    static void write_heatmap_bin_h5 ();
+
     bool getGridCoords(double lat, double lng, int& out_r, int& out_c);
 
     int16_t getElevation(double lat, double lng);
@@ -150,7 +153,9 @@ public:
 
     BoundingBox getMinimumBoundingBox();
 
-    static FeasibleGrid getFeasibleGrid(Bin& b, short op = IN_MEM, short opt = 0);
+    static void getonlyFeasibleGrid(Bin& b);
+
+    static FeasibleGrid getFeasibleGrid(Bin& b, short op = IN_MEM, short opt = 0, short allCells = 0);
 
     std::pair<double,double> getMapOrigins();
 
@@ -382,7 +387,7 @@ public:
         static void overlapToColor(int overlap, uint8_t& red, uint8_t& green, uint8_t& blue) {
                         if (overlap < 0) overlap = 0;
                         switch (overlap) {
-                            case 0: red = 255; green = 255; blue = 255; break;  // white
+                            case 0: red = 255; green = 255; blue = 255; break;  // white — unused directly now, kept for callers
                             case 1: red = 0;   green = 200; blue = 0;   break;  // green
                             case 2: red = 255; green = 255; blue = 0;   break;  // yellow
                             case 3: red = 255; green = 165; blue = 0;   break;  // orange
@@ -392,46 +397,113 @@ public:
                                 break;
                         }
                     }
+
+        // Terrain colour for a raw cell.value byte — same palette as the vec_matrix verify PNG.
+        // Only bits whose constraint flag is actually ON get colored; a disabled constraint
+        // (flag_* == false) is treated as visually absent even if the physical feature exists,
+        // since it isn't restricting radar placement anymore.
+        static void terrainToColor(uint8_t val, uint8_t& red, uint8_t& green, uint8_t& blue,
+                                    bool flag_road       = true,
+                                    bool flag_rail       = true,
+                                    bool flag_water_line = true,
+                                    bool flag_water_area = true,
+                                    bool flag_ib         = true,
+                                    bool flag_slope      = true) {
+            red = 255; green = 255; blue = 255; // default: plain AOI, no active feature
+            if (flag_slope      && (val & (1 << BIT_SLOPE)))      { red = 139; green = 69;  blue = 19;  } // brown
+            if (flag_ib         && (val & (1 << BIT_IB)))         { red = 80;  green = 0;   blue = 80;  } // purple
+            if (flag_water_area && (val & (1 << BIT_WATER_AREA))) { red = 0;   green = 180; blue = 255; } // light blue
+            if (flag_water_line && (val & (1 << BIT_WATER_LINE))) { red = 0;   green = 100; blue = 255; } // blue
+            if (flag_rail       && (val & (1 << BIT_RAIL)))       { red = 255; green = 255; blue = 0;   } // yellow
+            if (flag_road       && (val & (1 << BIT_ROAD)))       { red = 255; green = 50;  blue = 0;   } // orange
+            if (flag_road && flag_rail &&
+                (val & (1 << BIT_ROAD)) && (val & (1 << BIT_RAIL)))
+                                                                    { red = 0;   green = 255; blue = 255; } // cyan — road/rail crossing
+        }
+
         public:
+            // aoiGrid:      ALL cells in the Area of Operation (Bin::getFeasibleGrid(..., allCells=WITHALL)),
+            //               with `overlap` already computed on it — this is what actually gets rendered.
+            // feasibleGrid: the filtered subset (road/rail-adjacent, water/IB/slope-free) that the GA is
+            //               allowed to place radars on — drawn as a light-blue tint so it stays visible on
+            //               top of the terrain colours without hiding them, but never overrides coverage.
+            // flag_*:       which constraints are actually active (mirrors Bin's flag_road/flag_rail/etc).
+            //               Disabled constraints are rendered as plain AOI even if the physical feature exists.
             static bool writeFeasibleGridOverlapPng(
-                const FeasibleGrid&            grid,
+                const FeasibleGrid&            aoiGrid,
                 const std::string&             png_path,
-                const std::vector<GridPoint>&  placements = {})   // ← new param
+                const std::vector<GridPoint>&  placements   = {},
+                const FeasibleGrid&            feasibleGrid = {},
+                bool                            flag_road       = true,
+                bool                            flag_rail       = true,
+                bool                            flag_water_line = true,
+                bool                            flag_water_area = true,
+                bool                            flag_ib         = true,
+                bool                            flag_slope      = true)
             {
-                if (grid.height <= 0 || grid.width <= 0) {
+                if (aoiGrid.height <= 0 || aoiGrid.width <= 0) {
                     std::cerr << "[overlap] FAIL: invalid grid dimensions "
-                              << grid.width << " x " << grid.height << "\n";
+                              << aoiGrid.width << " x " << aoiGrid.height << "\n";
                     return false;
                 }
-                std::cout << "[overlap] Rendering " << grid.height << " x " << grid.width
-                          << " grid (" << grid.cells.size() << " cells, origin "
-                          << grid.origin_r << "," << grid.origin_c << ")\n";
+                std::cout << "[overlap] Rendering " << aoiGrid.height << " x " << aoiGrid.width
+                          << " grid (" << aoiGrid.cells.size() << " AOI cells, origin "
+                          << aoiGrid.origin_r << "," << aoiGrid.origin_c << ")\n";
 
-                // Dark-grey background — never confused with overlap==0 (white)
-                std::vector<uint8_t> canvas((size_t)grid.height * grid.width * 3, 30);
+                // Dark-grey background — anything never touched (outside AOI / outside AABB)
+                std::vector<uint8_t> canvas((size_t)aoiGrid.height * aoiGrid.width * 3, 30);
 
-                // ── 1. Paint feasible cells ──────────────────────────────────────────
+                // ── 0. Paint the full AOI: terrain colour, or coverage colour where overlap > 0 ──
+                // Radar signal doesn't care about water/slope/IB — coverage always wins when present.
                 int skipped = 0;
-                for (const auto& cell : grid.cells) {
-                    int local_r = cell.r - grid.origin_r;
-                    int local_c = cell.c - grid.origin_c;
-                    if (local_r < 0 || local_r >= grid.height ||
-                        local_c < 0 || local_c >= grid.width) {
+                for (const auto& cell : aoiGrid.cells) {
+                    int local_r = cell.r - aoiGrid.origin_r;
+                    int local_c = cell.c - aoiGrid.origin_c;
+                    if (local_r < 0 || local_r >= aoiGrid.height ||
+                        local_c < 0 || local_c >= aoiGrid.width) {
                         ++skipped;
                         continue;
                     }
                     uint8_t red, green, blue;
-                    overlapToColor(cell.overlap, red, green, blue);
-                    size_t idx = ((size_t)local_r * grid.width + local_c) * 3;
+                    if (cell.overlap > 0) overlapToColor(cell.overlap, red, green, blue);
+                    else                  terrainToColor(cell.value, red, green, blue,
+                                                          flag_road, flag_rail,
+                                                          flag_water_line, flag_water_area,
+                                                          flag_ib, flag_slope);
+
+                    size_t idx = ((size_t)local_r * aoiGrid.width + local_c) * 3;
                     canvas[idx + 0] = red;
                     canvas[idx + 1] = green;
                     canvas[idx + 2] = blue;
                 }
                 if (skipped > 0)
                     std::cerr << "[overlap] WARN: " << skipped
-                              << " cells fell outside the "
-                              << grid.width << "x" << grid.height
+                              << " AOI cells fell outside the "
+
+                              << aoiGrid.width << "x" << aoiGrid.height
                               << " AABB and were skipped\n";
+
+                // ── 1. Tint feasible (radar-placeable) cells light blue, blended with ─────
+                //      whatever's already there, so terrain/coverage colour still shows through.
+                int feas_painted = 0, feas_skipped = 0;
+                constexpr uint8_t TR = 135, TG = 206, TB = 250; // light blue tint
+                for (const auto& cell : feasibleGrid.cells) {
+                    int local_r = cell.r - aoiGrid.origin_r;
+                    int local_c = cell.c - aoiGrid.origin_c;
+                    if (local_r < 0 || local_r >= aoiGrid.height ||
+                        local_c < 0 || local_c >= aoiGrid.width) {
+                        ++feas_skipped;
+                        continue;
+                    }
+                    size_t idx = ((size_t)local_r * aoiGrid.width + local_c) * 3;
+                    canvas[idx + 0] = (uint8_t)((canvas[idx + 0] + TR) / 2);
+                    canvas[idx + 1] = (uint8_t)((canvas[idx + 1] + TG) / 2);
+                    canvas[idx + 2] = (uint8_t)((canvas[idx + 2] + TB) / 2);
+                    ++feas_painted;
+                }
+                if (!feasibleGrid.cells.empty())
+                    std::cout << "[overlap] Feasible overlay: " << feas_painted
+                              << " cells tinted, " << feas_skipped << " outside AABB\n";
 
                 // ── 2. Draw radar centre markers (drawn last → always on top) ────────
                 if (!placements.empty()) {
@@ -439,9 +511,9 @@ public:
                     auto px = [&](int lr, int lc,
                                   uint8_t r, uint8_t g, uint8_t b) __attribute__((always_inline))
                     {
-                        if ((unsigned)lr >= (unsigned)grid.height ||
-                            (unsigned)lc >= (unsigned)grid.width) return;
-                        size_t idx = ((size_t)lr * grid.width + lc) * 3;
+                        if ((unsigned)lr >= (unsigned)aoiGrid.height ||
+                            (unsigned)lc >= (unsigned)aoiGrid.width) return;
+                        size_t idx = ((size_t)lr * aoiGrid.width + lc) * 3;
                         canvas[idx + 0] = r;
                         canvas[idx + 1] = g;
                         canvas[idx + 2] = b;
@@ -452,11 +524,11 @@ public:
                     constexpr uint8_t BR = 0,   BG = 0, BB = 0;     // black border / dot
 
                     for (const auto& p : placements) {
-                        const int cr = p.r - grid.origin_r;
-                        const int cc = p.c - grid.origin_c;
+                        const int cr = p.r - aoiGrid.origin_r;
+                        const int cc = p.c - aoiGrid.origin_c;
                         // Skip placements whose centre maps outside the canvas
-                        if (cr < 0 || cr >= grid.height ||
-                            cc < 0 || cc >= grid.width) continue;
+                        if (cr < 0 || cr >= aoiGrid.height ||
+                            cc < 0 || cc >= aoiGrid.width) continue;
 
                         // Pass 1 — black halo (1-px border around every arm pixel)
                         //   Vertical halo: columns cc-1 and cc+1, rows cr±(ARM+1)
@@ -491,8 +563,8 @@ public:
 
                 // ── 3. Write PNG ─────────────────────────────────────────────────────
                 bool ok = writeColorPng(
-                    png_path, grid.width, grid.height,
-                    [&canvas, w = grid.width](int r, uint8_t* rgbRow) {
+                    png_path, aoiGrid.width, aoiGrid.height,
+                    [&canvas, w = aoiGrid.width](int r, uint8_t* rgbRow) {
                         std::memcpy(rgbRow, &canvas[(size_t)r * w * 3], (size_t)w * 3);
                     });
                 if (!ok) return false;

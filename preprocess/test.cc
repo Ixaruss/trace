@@ -34,12 +34,35 @@
 //     b.visualize("./image/combined.png");
 //     return 0;
 // }
+// #include "bin.h"
+
+// using namespace std;
+
+// int main() {
+//     auto k = Bin::getFeasibleGrid(WRITE,FULL_MATRIX);
+//     Bin::verifyMatrixBin<FeasibleCell>("./feasable.bin",1,k.cells.size());
+//     return 0;
+// }
+
+// #include "bin.h"
+
+// using namespace std;
+
+// int main() {
+//     Bin b;
+//     b.init({ALL});
+//     Bin::getonlyFeasibleGrid(b); // output: feasible.bin in root folder based on constraints defined for PSO
+//     Bin::write_heatmap_bin_h5(); // withall option for all cells without feasibility check for heatmap : output aoi_cells.h5 in root folder
+//     return 0;
+// }
+
 #include "bin.h"
 
 using namespace std;
 
 int main() {
-    auto k = Bin::getFeasibleGrid(WRITE,FULL_MATRIX);
-    Bin::verifyMatrixBin<FeasibleCell>("./feasable.bin",1,k.cells.size());
+    Bin b;
+    Bin::build_elevation_matrix();
+    Bin::verifyMatrixBin<int16_t>("./bin/elev.bin", b.conf.grid.rows, b.conf.grid.cols);
     return 0;
 }
