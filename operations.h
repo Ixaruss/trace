@@ -130,7 +130,8 @@ struct RadarCoverageResult
     int srcRow, srcCol;
     int radiusCells;
     int gridCols, gridRows;
-    int sectorAzimuthDeg;     // -1 = full 360
+    double sectorLeftDeg;     // arc start (clockwise from North). < 0 = full 360
+    double sectorRightDeg;    // arc end   (clockwise from North). < 0 = full 360
     int countCovered, countTerrainMasked;
     int countBelowMinElev, countAboveMaxElev;
     int countBeyondHorizon, countOutsideRange;
@@ -253,13 +254,13 @@ public:
     std::vector<Point2D> boundary;   // full 360 boundary
 
     // ------------------------------------------------------------------
-    // Filter boundary cells for a sector
-    // sectorAz: centre azimuth (already snapped to 45° multiple)
+    // Filter boundary cells to those on the [leftDeg, rightDeg] arc,
+    // swept clockwise from leftDeg to rightDeg (North = 0°).
+    // leftDeg < 0 (or rightDeg < 0) → full 360°.
     // ------------------------------------------------------------------
+    std::vector<Point2D> sectorBoundary(double leftDeg, double rightDeg) const;
 
-    std::vector<Point2D> sectorBoundary(int sectorAz) const;
-
-    void prefill(int sectorAz, uint8_t* buf, uint8_t fillInside, uint8_t fillOutside);
+    void prefill(double leftDeg, double rightDeg, uint8_t* buf, uint8_t fillInside, uint8_t fillOutside);
 
     /******************************************************************************
      * AZIMUTH HELPER
@@ -279,29 +280,34 @@ public:
     }
 
     /******************************************************************************
-     * SECTOR HELPER
+     * ARC HELPER
      *
-     * Returns true if azimuth `az` is within `halfWidth` degrees of `centerAz`.
-     * Handles 0/360 wraparound.
+     * Returns true if azimuth `az` lies on the arc swept clockwise from
+     * `leftDeg` to `rightDeg` (both inclusive). North = 0°, clockwise positive.
+     *
+     * Handles the 0°/360° wraparound: if leftDeg > rightDeg the arc is taken
+     * to cross North (e.g. left=350°, right=20° covers 350°..360°,0°..20°).
+     * All inputs are normalised into [0,360) first, so callers may pass any
+     * value (including negative angles or values > 360).
      ******************************************************************************/
 
-    static inline bool inSectorAz(double az, double centerAz, double halfWidth)
+    static inline double normAz(double deg)
     {
-        double diff = std::fabs(az - centerAz);
-        if (diff > 180.0) diff = 360.0 - diff;
-        return diff <= halfWidth;
+        double a = std::fmod(deg, 360.0);
+        if (a < 0.0) a += 360.0;
+        return a;
     }
 
-    /******************************************************************************
-     * SNAP TO NEAREST 45° MULTIPLE
-     ******************************************************************************/
-
-    static int snapTo45(int deg)
+    static inline bool inArc(double az, double leftDeg, double rightDeg)
     {
-        // normalise to [0,360)
-        deg = ((deg % 360) + 360) % 360;
-        int snapped = (int)(std::round(deg / 45.0) * 45) % 360;
-        return snapped;
+        az       = normAz(az);
+        leftDeg  = normAz(leftDeg);
+        rightDeg = normAz(rightDeg);
+
+        if (leftDeg <= rightDeg)
+            return az >= leftDeg && az <= rightDeg;
+        // arc wraps through 0°/360°
+        return az >= leftDeg || az <= rightDeg;
     }
 
 public:
@@ -363,9 +369,11 @@ public:
         std::cout<<"[RADAR]   Horizon     : "<<horizonM/1000.0<<" km\n";
         std::cout<<"[RADAR]   Full rays   : "<<boundary.size()<<"\n";
     }
-    RadarCoverageResult compute(int sectorAzimuthDeg = -1);
+    // leftDeg/rightDeg: arc swept clockwise from leftDeg to rightDeg, North = 0°.
+    // Defaults (-1, -1) mean full 360°. leftDeg > rightDeg wraps through North.
+    RadarCoverageResult compute(double leftDeg = -1.0, double rightDeg = -1.0);
 
-    std::vector<uint8_t> computeFast(int sectorAzimuthDeg = -1);
+    std::vector<uint8_t> computeFast(double leftDeg = -1.0, double rightDeg = -1.0);
 
     void writeToSVG(const RadarCoverageResult& res, const std::string& filename="radar_coverage.svg");
 
