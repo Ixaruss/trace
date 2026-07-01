@@ -295,7 +295,8 @@ class GaEngine {
     static void evaluate_fitness(
         Global& g, const FeasibleGrid& base_grid,
         Chromosome& cn, int index,
-        const Weights& w, const RadarConf& rp, bool writePng, vector<RadarConf> radars = {})
+        const Weights& w, const RadarConf& rp, bool writePng, vector<RadarConf> radars = {},
+        const FeasibleGrid& aoi_grid = {})   // full AOI (allCells=WITHALL); fitness now scored against this
     {
         std::string png_path = writePng
                    ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
@@ -310,14 +311,20 @@ class GaEngine {
                    rp.minAngle,
                    rp.target,
                    rp.minAngle,
-                   rp.range);
+                   rp.range,
+                   {},
+                   aoi_grid);
         }else
         {
             res = calculate_radar_coverage_overlap(
-                g, base_grid, cn.radar, 5.0, png_path,0,0,0,0,0, radars);
+                g, base_grid, cn.radar, 5.0, png_path,0,0,0,0,0, radars, aoi_grid);
         }
 
-               int    total        = (int)base_grid.cells.size();
+               // total denominator matches whatever calculate_radar_coverage_overlap scored
+               // result[] against: full AOI when provided, feasible-only otherwise.
+               int    total        = !aoi_grid.cells.empty()
+                                    ? (int)aoi_grid.cells.size()
+                                    : (int)base_grid.cells.size();
                double unique       = (double)res[1] / total;
                double low_overlap  = (double)res[2] / total;
                double high_overlap = (double)res[3] / total;
@@ -346,7 +353,8 @@ class GaEngine {
     // --- Parallel evaluation (homogenous) ---
     void parallelEvaluatePopulation(
         std::vector<Chromosome>& pop, Global& globalRef,
-        const FeasibleGrid& base_grid, bool writePng = false)
+        const FeasibleGrid& base_grid, bool writePng = false,
+        const FeasibleGrid& aoi_grid = {})
     {
         if(conf.homo.is_case) {
             auto startTime = std::chrono::high_resolution_clock::now();
@@ -358,7 +366,7 @@ class GaEngine {
                    evaluate_fitness,
                    std::ref(globalRef), std::ref(base_grid),
                    std::ref(pop[i]), (int)i,
-                   weights, homoParams, writePng, empty));
+                   weights, homoParams, writePng, empty, std::ref(aoi_grid)));
            for (auto& f : futures) f.wait();
            auto endTime = std::chrono::high_resolution_clock::now();
            std::chrono::duration<double, std::milli> duration = endTime - startTime;
@@ -372,7 +380,7 @@ class GaEngine {
                    evaluate_fitness,
                    std::ref(globalRef), std::ref(base_grid),
                    std::ref(pop[i]), (int)i,
-                   weights, homoParams, writePng, std::ref(conf.hetero.radars)));  // homoParams carries correct rangeM
+                   weights, homoParams, writePng, std::ref(conf.hetero.radars), std::ref(aoi_grid)));  // homoParams carries correct rangeM
            for (auto& f : futures) f.wait();
            auto endTime = std::chrono::high_resolution_clock::now();
            std::chrono::duration<double, std::milli> duration = endTime - startTime;
@@ -1106,6 +1114,7 @@ public:
                   << "  popSize=" << popSize << "\n";
         std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
         auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+        auto aoiGrid = Bin::getFeasibleGrid(g.bin, 0, 0, WITHALL); // unfiltered AOI, same AABB, for PNG background
          auto initStart = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < popSize; i++)
             population.push_back(generate_random_chromosome(f, pathLength));
@@ -1113,7 +1122,7 @@ public:
         std::chrono::duration<double, std::milli> initDuration = initEnd - initStart;
 
         std::cout << "[ga] Dispatching parallel coverage evaluation for Generation 0...\n";
-        parallelEvaluatePopulation(population, g, f, false);
+        parallelEvaluatePopulation(population, g, f, false, aoiGrid);
 
         std::normal_distribution<double> gaussDist(0.0, 10.0);
 
@@ -1156,7 +1165,7 @@ public:
             std::chrono::duration<double, std::milli> stepDuration = stepEnd - stepStart;
             totalEvolutionaryTimeMs += stepDuration.count();
 
-            parallelEvaluatePopulation(nextGen, g, f, false);
+            parallelEvaluatePopulation(nextGen, g, f, false, aoiGrid);
             population = std::move(nextGen);
 
             auto best = std::max_element(population.begin(), population.end(),
@@ -1193,7 +1202,9 @@ public:
             homoParams.minAngle,
             homoParams.target,
             homoParams.maxAngle,
-            homoParams.range);
+            homoParams.range,
+            {},
+            aoiGrid);
         Bin::writeRadarScatterPng(finalBest.radar, scatterOutput);
         return finalBest.fitness;
     }
@@ -1240,12 +1251,13 @@ public:
 
         std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
         auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+        auto aoiGrid = Bin::getFeasibleGrid(g.bin, 0, 0, WITHALL); // unfiltered AOI, same AABB, for PNG background
 
         for (int i = 0; i < popSize; i++)
             population.push_back(generate_random_chromosome(f, pathLength));
 
         std::cout << "[ga] Dispatching parallel coverage evaluation for Generation 0...\n";
-        parallelEvaluatePopulation(population, g, f, false);
+        parallelEvaluatePopulation(population, g, f, false, aoiGrid);
 
         std::normal_distribution<double> gaussDist(0.0, 10.0);
 
@@ -1282,7 +1294,7 @@ public:
                 if ((int)nextGen.size() < popSize) nextGen.push_back(c2);
             }
 
-            parallelEvaluatePopulation(nextGen, g, f, false);
+            parallelEvaluatePopulation(nextGen, g, f, false, aoiGrid);
             population = std::move(nextGen);
 
             auto best = std::max_element(population.begin(), population.end(),
@@ -1299,7 +1311,8 @@ public:
                   << finalBest->fitness << "\n";
 
         calculate_radar_coverage_overlap(g, f, finalBest->radar,
-                                         5.0, coverageOutput,0,0,0,0,0, conf.hetero.radars);
+                                         5.0, coverageOutput,0,0,0,0,0, conf.hetero.radars,
+                                         aoiGrid);
         Bin::writeRadarScatterPng(finalBest->radar, scatterOutput);
 
     }

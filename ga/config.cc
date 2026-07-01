@@ -47,7 +47,7 @@ GaConf from_json(const Json::Value& root) {
 
     // --- Homogenous Settings ---
     Json::Value homoNode = root["homogenous"];
-    config.homo.chromosomeLength = homoNode["chromosome-lentgh"].asInt(); // spelling matches JSON
+    config.homo.chromosomeLength = homoNode["chromosome-length"].asInt(); // spelling matches JSON
     config.homo.is_case = homoNode["case"].asBool();
 
     Json::Value hRadarNode = homoNode["radar"];
@@ -63,7 +63,9 @@ GaConf from_json(const Json::Value& root) {
     config.hetero.is_case = heteroNode["case"].asBool();
     config.hetero.target = heteroNode["target"].asInt();
      parseRadarArray(heteroNode["radars"],config.hetero.radars);
-
+     for (size_t i = 0; i < config.hetero.radars.size(); ++i) {
+         config.hetero.radars[i].target =config.hetero.target;
+     }
     // --- Auto Settings ---
     Json::Value autoNode = root["auto"];
     config.autoG.minRadars = autoNode["min-radar"].asInt();

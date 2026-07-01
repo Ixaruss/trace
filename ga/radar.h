@@ -295,7 +295,7 @@ inline LocalMask computeLocalMask(
  */
 inline std::vector<int> calculate_radar_coverage_overlap(
     Global&                       g,
-    FeasibleGrid                  grid,               // BY VALUE — caller's private copy
+    FeasibleGrid                  grid,               // BY VALUE — feasible cells only; drives result[] stats (GA fitness signal)
     const std::vector<GridPoint>& placements,
     double                        minSpacingCells = 5.0,
     const std::string&            pngPath         = "",
@@ -305,7 +305,8 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     double                        target          = 1000.0,  // metres
     double                        maxAngle        = 30.0,    // degrees
     double                        rangeM          = 25000.0, // metres — was wrongly `int range = 25`
-    const std::vector<RadarConf>& radarRanges = {}
+    const std::vector<RadarConf>& radarRanges = {},
+    FeasibleGrid                  aoiGrid         = {}       // BY VALUE — unfiltered AOI (allCells=WITHALL); overlap computed here too, purely for the PNG
 )
 {
     std::vector<int> result(4, 0);
@@ -316,6 +317,18 @@ inline std::vector<int> calculate_radar_coverage_overlap(
             const double dc = placements[i].c - placements[j].c;
             if (std::sqrt(dr*dr + dc*dc) < minSpacingCells) ++result[0];
         }
+
+    // Small helper: apply one radar's mask to a grid's cells (bump overlap on hit).
+    auto applyMask = [](const rc_detail::LocalMask& m, std::vector<FeasibleCell>& cells) {
+        for (auto& cell : cells) {
+            if (cell.r < m.rowMin || cell.r >= m.rowMax ||
+                cell.c < m.colMin || cell.c >= m.colMax) continue;
+            const size_t local_r = cell.r - m.rowMin;
+            const size_t local_c = cell.c - m.colMin;
+            const size_t flat = local_r * m.localCols + local_c;
+            if (flat < m.buf.size() && m.buf[flat]) ++cell.overlap;
+        }
+    };
 
     if (!radarRanges.empty()) {
         // Build the flattened radar list ONCE.
@@ -341,17 +354,8 @@ inline std::vector<int> calculate_radar_coverage_overlap(
                     r.maxAngle,
                     r.range * 1000);
 
-            for (auto& cell : grid.cells) {
-                if (cell.r < cov.rowMin || cell.r >= cov.rowMax ||
-                    cell.c < cov.colMin || cell.c >= cov.colMax) continue;
-
-                const size_t local_r = cell.r - cov.rowMin;
-                const size_t local_c = cell.c - cov.colMin;
-                const size_t flat = local_r * cov.localCols + local_c;
-
-                if (flat < cov.buf.size() && cov.buf[flat]) // match homogeneous branch's truthy check
-                    ++cell.overlap;
-            }
+            applyMask(cov, grid.cells);
+            applyMask(cov, aoiGrid.cells); // same mask, no extra ray-casting cost
         }
     } else {
         // Homogenous path — all radars share the same physical spec.
@@ -367,24 +371,20 @@ inline std::vector<int> calculate_radar_coverage_overlap(
                     maxAngle,
                     rangeM);   // ← was `range` (int 25 = 25 m), now correct metres
 
-            for (auto& cell : grid.cells) {
-                // Quick bounds check before indexing
-                if (cell.r < mask.rowMin || cell.r >= mask.rowMax ||
-                    cell.c < mask.colMin || cell.c >= mask.colMax) continue;
-
-                const size_t flat =
-                    static_cast<size_t>(cell.r - mask.rowMin) * mask.localCols +
-                    (cell.c - mask.colMin);
-
-                if (mask.buf[flat]) ++cell.overlap;
-            }
+            applyMask(mask, grid.cells);
+            applyMask(mask, aoiGrid.cells); // same mask, no extra ray-casting cost
             // mask goes out of scope here — bounding-box memory released immediately
         }
     }
 
 
     // ── Bucket final per-cell overlap counts ─────────────────────────────
-    for (const auto& cell : grid.cells) {
+    // Prefer the full AOI grid when given, so result[]/fitness reflects coverage
+    // over the whole Area of Operation, not just the road/rail-feasible subset.
+    // (Placement itself is still gated to feasible cells — only the scoring changes.)
+    const std::vector<FeasibleCell>& statsCells =
+        !aoiGrid.cells.empty() ? aoiGrid.cells : grid.cells;
+    for (const auto& cell : statsCells) {
         if      (cell.overlap == 1) ++result[1];
         else if (cell.overlap == 2) ++result[2];
         else if (cell.overlap >= 3) ++result[3];
@@ -392,8 +392,13 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     }
 
     // ── Optional PNG render ───────────────────────────────────────────────
+    // aoiGrid (all AOI cells, with overlap now computed on it) drives the picture;
+    // grid (feasible-only) is passed through purely to show roads/rails/water/etc.
     if (!pngPath.empty())
-        Bin::writeFeasibleGridOverlapPng(grid, pngPath, placements);
+        Bin::writeFeasibleGridOverlapPng(aoiGrid, pngPath, placements, grid,
+            g.bin.flag_road, g.bin.flag_rail,
+            g.bin.flag_water_line, g.bin.flag_water_area,
+            g.bin.flag_ib, g.bin.flag_slope);
 
     return result;
 }
