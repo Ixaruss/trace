@@ -1,5 +1,5 @@
-#ifndef BUILD_H_
-#define BUILD_H_
+#ifndef CONFIG_H_
+#define CONFIG_H_
 
 #include <gdal.h>
 #include <iostream>
@@ -40,7 +40,14 @@ enum Layer_vals {
     SLOPE,
     ALT
 };
-
+struct Case {
+    bool roads;
+    bool rails;
+    bool waterbodies;
+    bool waterlines;
+    bool ib;
+    bool slope;
+};
 struct Grid_Conf {
   int resolution;
   float origin_x;
@@ -63,12 +70,12 @@ class Config {
     public: Input input;
     public: Output output;
     public: Grid_Conf grid;
-    public: std::map<int,Layer_vals> layers;
+    public: Case fcase;
     public: Distance distance;
     public: std::vector<std::pair<double,double>> area_op; // can be a polygon or retangle, if not rectangle find highest breath and hightest height and assign the values to above variable to form a rectangle;
 
     static Config load(std::optional <const std::string> path = std::nullopt);
-    void save(std::string path = "./config.json") const;
+    void save(std::string path = "./config/config.json") const;
     static Config from_json(const Json::Value& j);
     Json::Value to_json() const;
     static bool is_available(std::optional <const std::string> path = std::nullopt);

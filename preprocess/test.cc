@@ -44,25 +44,30 @@
 //     return 0;
 // }
 
+#include "bin.h"
+
+#include "../operations.h"
+using namespace std;
+
+int main() {
+    Global g;
+    g.bin.init();
+    // int x,y;
+    // g.bin.getGridCoords(33.9871, 74.7742,x,y);
+    cout << g.bin.getElevation(12.97, 77.59)<< endl;
+    // RadarEngine::get_coverage_reverse(g, x,y,50,1000,0.5,30,300000, "./output/radar/fdr.png");
+    // Bin::getonlyFeasibleGrid(b); // output: feasible.bin in root folder based on constraints defined for PSO
+    // Bin::write_heatmap_bin_h5(); // withall option for all cells without feasibility check for heatmap : output aoi_cells.h5 in root folder
+    return 0;
+}
+
 // #include "bin.h"
 
 // using namespace std;
 
 // int main() {
 //     Bin b;
-//     b.init({ALL});
-//     Bin::getonlyFeasibleGrid(b); // output: feasible.bin in root folder based on constraints defined for PSO
-//     Bin::write_heatmap_bin_h5(); // withall option for all cells without feasibility check for heatmap : output aoi_cells.h5 in root folder
+//     Bin::build_elevation_matrix();
+//     Bin::verifyMatrixBin<int16_t>("./bin/elev.bin", b.conf.grid.rows, b.conf.grid.cols);
 //     return 0;
 // }
-
-#include "bin.h"
-
-using namespace std;
-
-int main() {
-    Bin b;
-    Bin::build_elevation_matrix();
-    Bin::verifyMatrixBin<int16_t>("./bin/elev.bin", b.conf.grid.rows, b.conf.grid.cols);
-    return 0;
-}

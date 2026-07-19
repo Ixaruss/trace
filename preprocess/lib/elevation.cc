@@ -1,8 +1,19 @@
 #include "../bin.h"
 #include <cstdint>
 #include <gdal_utils.h>
+#include <gdalwarper.h>
 
 using namespace std;
+
+static bool make_dir(const string& path) {
+#ifdef _WIN32
+    int ret = system(("mkdir \"" + path + "\" 2>nul").c_str());
+#else
+    int ret = system(("mkdir -p \"" + path + "\"").c_str());
+#endif
+    (void)ret;
+    return true;
+}
 
 // Horn's formula, nodata-aware.
 // Nodata neighbors are skipped — falls back to one-sided diff.
@@ -51,9 +62,16 @@ static float compute_slope(const int16_t* elev,
 }
 
 int Bin::build_elevation_matrix(bool split) {
-    string opath, ipath;
+    string opath, ipath, spath;
     Config::is_available() ? opath = Config::load().output.elevation_file : opath = DEFAULT_ELEVATION_MATRIX;
     Config::is_available() ? ipath = Config::load().input.elevation        : ipath = DEFAULT_ELEVATION_FILE;
+    Config::is_available() ? spath = Config::load().output.slope_file       : ipath = DEFAULT_SLOPE_MATRIX;
+    auto idx = opath.find_last_of("\\/");
+    string path;
+    if(std::string::npos != idx){
+        path = opath.substr(0,idx+1);
+    }
+    make_dir(path);
     GDALAllRegister();
     // ── 1. open source TIF ─────────────────────────────────────────────────
     cout << "[elevation] Opening: " << ipath << "\n";
@@ -105,7 +123,11 @@ int Bin::build_elevation_matrix(bool split) {
         GDALClose(src_ds);
         return -1;
     }
-    ct->Transform(4, corner_x, corner_y);
+    int success = ct->Transform(4, corner_x, corner_y);
+    if (!success) {
+        cerr << "[elevation] ERROR: coordinate transform failed for one or more corners\n";
+        // bail rather than silently continuing with garbage extent
+    }
     OGRCoordinateTransformation::DestroyCT(ct);
 
     double proj_min_x = *min_element(corner_x, corner_x + 4);
@@ -142,6 +164,7 @@ int Bin::build_elevation_matrix(bool split) {
     char* dst_wkt_str = nullptr;
     dst_srs.exportToWkt(&dst_wkt_str);
     dst_ds->SetProjection(dst_wkt_str);
+    dst_ds->GetRasterBand(1)->SetNoDataValue(-9999);
     CPLFree(dst_wkt_str);
 
     // ── 5. warp with multithreading ────────────────────────────────────────
@@ -160,12 +183,13 @@ int Bin::build_elevation_matrix(bool split) {
     warp_opts->padfDstNoDataReal    = (double*)CPLMalloc(sizeof(double));
     warp_opts->padfSrcNoDataReal[0] = -9999.0;
     warp_opts->padfDstNoDataReal[0] = -9999.0;
+    warp_opts->papszWarpOptions = CSLSetNameValue(warp_opts->papszWarpOptions, "INIT_DEST", "NO_DATA");
+    warp_opts->papszWarpOptions = CSLSetNameValue(warp_opts->papszWarpOptions, "NUM_THREADS", "ALL_CPUS");
+    warp_opts->papszWarpOptions = CSLSetNameValue(
+        warp_opts->papszWarpOptions, "UNIFIED_SRC_NODATA", "YES");
     warp_opts->pTransformerArg      = GDALCreateGenImgProjTransformer(
         src_ds, nullptr, dst_ds, nullptr, FALSE, 0, 1);
     warp_opts->pfnTransformer       = GDALGenImgProjTransform;
-    // use all available CPU cores for warp
-    warp_opts->papszWarpOptions     = CSLSetNameValue(
-        warp_opts->papszWarpOptions, "NUM_THREADS", "ALL_CPUS");
 
     GDALWarpOperation warp_op;
     if (warp_op.Initialize(warp_opts) != CE_None) {
@@ -206,6 +230,17 @@ int Bin::build_elevation_matrix(bool split) {
     GDALClose(src_ds);
     cout << "[elevation] Elevation read complete\n";
 
+    size_t raw_nodata = 0, raw_zero = 0;
+    int16_t raw_min = 32767, raw_max = -32768;
+    for (size_t i = 0; i < total_cells; i++) {
+        if (elev_buf[i] == -9999) raw_nodata++;
+        if (elev_buf[i] == 0) raw_zero++;
+        raw_min = min(raw_min, elev_buf[i]);
+        raw_max = max(raw_max, elev_buf[i]);
+    }
+    cout << "[elevation] RAW elev_buf: nodata=" << raw_nodata
+         << " zero=" << raw_zero
+         << " min=" << raw_min << " max=" << raw_max << "\n";
     // ── 7. allocate output ElevCell array ──────────────────────────────────
     // slope is computed directly into out[i].slope — no intermediate
     // float buffer needed. RAM = elev_buf (int16) + out (ElevCell) only.
@@ -242,6 +277,7 @@ int Bin::build_elevation_matrix(bool split) {
             if (out[idx].slope == -9999.0f) nodata_slope++;
             }else {
                 slope[idx] = compute_slope(elev_buf, r, c, OUT_ROWS, OUT_COLS, RESOLUTION);
+                if (slope[idx] == -9999.0f) nodata_slope++;
             }
         }
     }
@@ -286,7 +322,7 @@ int Bin::build_elevation_matrix(bool split) {
         cout << "[elevation] Writing slope...\n";
 
         {
-            FILE* f = fopen("./bin/slope.bin", "wb");  // ← fixed path in error msg too
+            FILE* f = fopen(spath.c_str(), "wb");  // ← fixed path in error msg too
             if (!f) {
                 cerr << "[elevation] ERROR: could not open ./bin/slope.bin\n";
                 free(slope);

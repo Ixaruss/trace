@@ -6,8 +6,8 @@ using namespace std;
 using namespace lib;
 
 bool Bin::getGridCoords(double lat, double lng, int& out_r, int& out_c) {
-    init({ CONSTRAINTS });
-    if (!vector_loaded || !poCT) return false;
+    init({ ELEVATION });
+    if (!elevation_loaded || !poCT) return false;
 
     double x = lng, y = lat;
     if (!poCT->Transform(1, &x, &y)) return false;
@@ -15,8 +15,8 @@ bool Bin::getGridCoords(double lat, double lng, int& out_r, int& out_c) {
     out_c = (int)std::floor((x - conf.grid.origin_x) / RESOLUTION);
     out_r = (int)std::floor((conf.grid.origin_y - y)  / RESOLUTION);
 
-    return (out_r >= 0 && out_r < VEC_ROWS &&
-            out_c >= 0 && out_c < VEC_COLS);
+    return (out_r >= 0 && out_r < conf.grid.rows &&
+            out_c >= 0 && out_c < conf.grid.cols);
 }
 
 int16_t Bin::getElevation(double lat, double lng) {
@@ -43,6 +43,7 @@ int16_t Bin::getElevation(double lat, double lng) {
 
     int elev_c = (int)std::floor((x - ELEV_OX) / RESOLUTION);
     int elev_r = (int)std::floor((ELEV_OY - y)  / RESOLUTION);
+
 
     if (elev_r >= 0 && elev_r < E_ROWS &&
         elev_c >= 0 && elev_c < E_COLS) {
@@ -241,7 +242,7 @@ FeasibleGrid Bin::getFeasibleGrid(Bin& b, short op, short opt, short allCells) {
         }
     }
     if (op == WRITE)
-        writeBin("./areaofoperation.bin", result.cells);
+        writeBin("./bin/areaofoperation.bin", result.cells);
 
     cout << "[feasible] Outside polygon : " << outside_count  << "\n";
     cout << "[feasible] Water cells     : " << water_count    << "\n";
@@ -262,6 +263,9 @@ int Bin::getTerrianResolution() {
 void Bin::getonlyFeasibleGrid(Bin& b){
     auto x = getFeasibleGrid(b).cells;
     cout <<"bin size: " << x.size() <<endl;
+    for (int i =0; i<x.size();i++) {
+        cout << "cell " << i << ": " << "coordinates: " << x[i].c << x[i].r << endl;
+    }
      writeBin("./pso.bin", x);
 }
 
@@ -269,7 +273,7 @@ void Bin::write_heatmap_bin_h5 (){
     Bin b;
     b.init({CONSTRAINTS});
     auto bin = Bin::getFeasibleGrid(b,0,0,WITHALL);
-    auto h5_path = "aoi_cells.h5";
+    auto h5_path = "output/heatmap/aoi_cells.h5";
     H5E_auto2_t old_func;
     void*       old_data;
     H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);

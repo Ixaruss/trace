@@ -46,6 +46,7 @@ struct FeasibleCell {
 struct GridPoint {
     int r;
     int c;
+    int typeIndex;
 };
 enum LoadOptions {
     ALL,
@@ -572,52 +573,103 @@ public:
                 std::cout << "[overlap] PNG written → " << png_path << "\n";
                 return true;
             }
-            public:
-                        // Plots the raw (r,c) of each point as a red dot — presence only,
-                        // no coverage/overlap rendering. Canvas is sized to fit whatever
-                        // coordinates are passed in (same bounding-box approach as the
-                        // FeasibleCell point-cloud branch in verifyMatrixBin), so it works
-                        // for a single chromosome's radars or the whole population's
-                        // combined radars without you having to specify dimensions.
-                        // PointT just needs public `.r`/`.c` int members — GridPoint,
-                        // FeasibleCell, etc. all qualify.
-                        template <typename PointT>
-                        static bool writeRadarScatterPng(const std::vector<PointT>& points, const std::string& png_path) {
-                            if (points.empty()) {
-                                std::cerr << "[radar-viz] FAIL: no points to plot for " << png_path << "\n";
+
+                        static bool writeReverseBreakPointsPng(
+                            const std::string&            png_path,
+                            int                            originR, int originC,   // top-left of bounding box, grid coords
+                            int                            width,   int height,     // bounding box size (pixels == cells)
+                            int                            srcRow,  int srcCol,     // absolute grid coords of the source
+                            const std::vector<GridPoint>& breakPoints)              // absolute grid coords
+                        {
+                            if (width <= 0 || height <= 0) {
+                                std::cerr << "[reverse-coverage] FAIL: invalid canvas dimensions "
+                                          << width << " x " << height << "\n";
                                 return false;
                             }
 
-                            int min_r = points[0].r, max_r = points[0].r;
-                            int min_c = points[0].c, max_c = points[0].c;
-                            for (const auto& p : points) {
-                                if (p.r < min_r) min_r = p.r;
-                                if (p.r > max_r) max_r = p.r;
-                                if (p.c < min_c) min_c = p.c;
-                                if (p.c > max_c) max_c = p.c;
+                            std::vector<uint8_t> canvas((size_t)height * width * 3, 30); // dark grey background
+
+                            // Safe single-pixel writer — clips to canvas bounds silently
+                            auto px = [&](int lr, int lc, uint8_t r, uint8_t g, uint8_t b) {
+                                if ((unsigned)lr >= (unsigned)height || (unsigned)lc >= (unsigned)width) return;
+                                size_t idx = ((size_t)lr * width + lc) * 3;
+                                canvas[idx + 0] = r;
+                                canvas[idx + 1] = g;
+                                canvas[idx + 2] = b;
+                            };
+
+                            // Bresenham line in local (canvas) coordinates
+                            auto drawLine = [&](int r0, int c0, int r1, int c1, uint8_t r, uint8_t g, uint8_t b) {
+                                const int adr = std::abs(r1 - r0), adc = std::abs(c1 - c0);
+                                const int sr  = (r0 < r1) ? 1 : -1;
+                                const int sc  = (c0 < c1) ? 1 : -1;
+                                int err = adr - adc;
+                                int row = r0, col = c0;
+                                while (true) {
+                                    px(row, col, r, g, b);
+                                    if (row == r1 && col == c1) break;
+                                    const int e2 = 2 * err;
+                                    if (e2 > -adc) { err -= adc; row += sr; }
+                                    if (e2 <  adr) { err += adr; col += sc; }
+                                }
+                            };
+
+                            const int localSrcR = srcRow - originR;
+                            const int localSrcC = srcCol - originC;
+
+                            // ── 1. Covered segments — green line source -> each break point ──────
+                            for (const auto& bp : breakPoints) {
+                                drawLine(localSrcR, localSrcC,
+                                          bp.r - originR, bp.c - originC,
+                                          60, 200, 80);
                             }
 
-                            int img_rows = max_r - min_r + 1;
-                            int img_cols = max_c - min_c + 1;
-
-                            std::vector<uint8_t> canvas((size_t)img_rows * img_cols * 3, 0);  // black background
-                            for (const auto& p : points) {
-                                size_t idx = ((size_t)(p.r - min_r) * img_cols + (p.c - min_c)) * 3;
-                                canvas[idx + 0] = 255;  // red — radar present
-                                canvas[idx + 1] = 0;
-                                canvas[idx + 2] = 0;
+                            // ── 2. Break-point markers — small red dots, drawn on top of lines ────
+                            for (const auto& bp : breakPoints) {
+                                const int lr = bp.r - originR;
+                                const int lc = bp.c - originC;
+                                for (int dr = -1; dr <= 1; ++dr)
+                                    for (int dc = -1; dc <= 1; ++dc)
+                                        px(lr + dr, lc + dc, 220, 30, 30);
                             }
 
-                            bool ok = writeColorPng(png_path, img_cols, img_rows,
-                                                     [&canvas, img_cols](int r, uint8_t* rgbRow) {
-                                                         std::memcpy(rgbRow, &canvas[(size_t)r * img_cols * 3], (size_t)img_cols * 3);
-                                                     });
+                            // ── 3. Source marker — magenta crosshair + black halo (drawn last) ────
+                            constexpr int     ARM = 5;
+                            constexpr uint8_t MR = 255, MG = 0, MB = 255;   // magenta arms
+                            constexpr uint8_t BR = 0,   BG = 0, BB = 0;     // black border / dot
+
+                            for (int d = -(ARM + 1); d <= (ARM + 1); ++d) {
+                                px(localSrcR + d, localSrcC - 1, BR, BG, BB);
+                                px(localSrcR + d, localSrcC + 1, BR, BG, BB);
+                                px(localSrcR - 1, localSrcC + d, BR, BG, BB);
+                                px(localSrcR + 1, localSrcC + d, BR, BG, BB);
+                            }
+                            px(localSrcR - (ARM + 1), localSrcC, BR, BG, BB);
+                            px(localSrcR + (ARM + 1), localSrcC, BR, BG, BB);
+                            px(localSrcR, localSrcC - (ARM + 1), BR, BG, BB);
+                            px(localSrcR, localSrcC + (ARM + 1), BR, BG, BB);
+
+                            for (int d = -ARM; d <= ARM; ++d) {
+                                px(localSrcR + d, localSrcC, MR, MG, MB);
+                                px(localSrcR, localSrcC + d, MR, MG, MB);
+                            }
+
+                            for (int dr = -1; dr <= 1; ++dr)
+                                for (int dc = -1; dc <= 1; ++dc)
+                                    px(localSrcR + dr, localSrcC + dc, BR, BG, BB);
+
+                            // ── 4. Write PNG ───────────────────────────────────────────────────────
+                            bool ok = writeColorPng(
+                                png_path, width, height,
+                                [&canvas, w = width](int r, uint8_t* rgbRow) {
+                                    std::memcpy(rgbRow, &canvas[(size_t)r * w * 3], (size_t)w * 3);
+                                });
                             if (!ok) return false;
 
-                            std::cout << "[radar-viz] PNG written → " << png_path << " (" << points.size()
-                                      << " points, " << img_cols << "x" << img_rows << ")\n";
+                            std::cout << "[reverse-coverage] PNG written -> " << png_path << "\n";
                             return true;
                         }
+
 
 };
 

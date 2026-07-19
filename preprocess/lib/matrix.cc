@@ -23,13 +23,6 @@ int Bin::build_matrix() {
     if (Config::is_available()) {
         Config cfg = Config::load();
 
-        road_bit       = layerName(cfg.layers[BIT_ROAD]);
-        rail_bit       = layerName(cfg.layers[BIT_RAIL]);
-        waterarea_bit  = layerName(cfg.layers[BIT_WATER_AREA]);
-        waterlines_bit = layerName(cfg.layers[BIT_WATER_LINE]);
-        ib_bit         = layerName(cfg.layers[BIT_IB]);
-        slope_bit      = layerName(cfg.layers[BIT_SLOPE]);
-
         road_ipath       = cfg.input.road;
         rail_ipath       = cfg.input.rail;
         waterarea_ipath  = cfg.input.water_area;

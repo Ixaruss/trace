@@ -1,10 +1,12 @@
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <png.h>
 #include "bin.h"
 #include "lib.h"
 #include "../common.h"
 #include <chrono>
+#include <stdio.h>
 using namespace std;
 
 static bool make_dir(const string& path) {
@@ -142,6 +144,7 @@ static uint8_t* rasterize_layer(const string& shp_path,
         OGRGeometry* geom = feat->GetGeometryRef();
         if (geom) {
             if (boundary_only) {
+
                 OGRGeometry* bnd = geom->Boundary();
                 if (bnd) geoms.push_back((OGRGeometryH)bnd);
             } else {
@@ -256,9 +259,11 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
     if (timer){ cout<< ">>> Starting timer count" << endl;
          start = chrono::steady_clock::now();
     }
-    make_dir("bin");
+    string mpath;
+    Config::is_available() ? mpath = Config::load().output.elevation_file : mpath = DEFAULT_ELEVATION_MATRIX;
+
     if (images) make_dir("image");
-    if ( individual == -1 || individual == 6)  Bin::build_elevation_matrix();
+    if(!filesystem::exists(mpath)) if ( individual == -1 || individual == 6)  Bin::build_elevation_matrix();
     string road_shp, rail_shp, warea_shp, wline_shp, ib_shp, elev_bin_path, opath,slope_path;
     int road_bit, rail_bit, waterarea_bit, waterlines_bit, ib_bit, slope_bit;
     int dist_road, dist_rail, dist_water, dist_ib;
@@ -281,12 +286,6 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         dist_rail  = cfg.distance.from_rail  > 0 ? cfg.distance.from_rail  : 1000;
         dist_water = cfg.distance.from_water > 0 ? cfg.distance.from_water : 1000;
         dist_ib    = cfg.distance.from_ib    > 0 ? cfg.distance.from_ib    : 10000;
-
-        road_bit       = lib::layerName(cfg.layers[BIT_ROAD]);
-        rail_bit       = lib::layerName(cfg.layers[BIT_RAIL]);
-        waterarea_bit  = lib::layerName(cfg.layers[BIT_WATER_AREA]);
-        waterlines_bit = lib::layerName(cfg.layers[BIT_WATER_LINE]);
-        ib_bit         = lib::layerName(cfg.layers[BIT_IB]);
 
         // Dynamic assignment or hardcoded to 5 based on request
         slope_bit      = 5;
@@ -320,7 +319,11 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         opath          = DEFAULT_PARAM_MATRIX;
         slope_path     = DEFAULT_SLOPE_MATRIX;
     }
-
+    auto idx = opath.find_last_of("\\/");
+    string path;
+    if(std::string::npos != idx){
+        path = opath.substr(0,idx+1);
+    }
 
 
     int    ROWS = lib::calc_rows(RESOLUTION);
@@ -335,6 +338,7 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
     cout << "[preprocess] dist_water : " << dist_water << "m (" << dist_water / RESOLUTION << " cells)\n";
     cout << "[preprocess] dist_ib    : " << dist_ib    << "m (" << dist_ib    / RESOLUTION << " cells)\n";
     cout << "[preprocess] elev grid  : " << ELEV_C << " x " << ELEV_R << "\n\n";
+
 
     // Fixed typo: mapped road to road_bit (was rail_bit)
     struct LayerJob {
@@ -388,10 +392,10 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         free(slope);
     } else {
         // verify file size first
-        fseek(ef, 0, SEEK_END);
-        size_t file_bytes    = ftell(ef);
+        fseek64(ef, 0, SEEK_END);
+        size_t file_bytes    = ftell64(ef);
         size_t expected_bytes = elev_n * sizeof(int16_t);
-        fseek(ef, 0, SEEK_SET);
+        fseek64(ef, 0, SEEK_SET);
 
         cout << "[preprocess] elev.bin size  : " << file_bytes / 1e6 << " MB\n";
         cout << "[preprocess] expected size  : " << expected_bytes / 1e6 << " MB\n";
@@ -481,7 +485,7 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         cout << "[preprocess] final hits : " << final_hits << " (" << (final_hits * 100.0 / N) << "%)\n";
 
         if (seperate || individual) {
-            write_bin_u8("bin/" + job.name + ".bin", buf, N);
+            write_bin_u8(path + job.name + ".bin", buf, N);
         }
 
         if (images) {
@@ -501,9 +505,9 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
    }
 
     int constraintTime;
-    if(timer){
+    if (timer){
         end = chrono::steady_clock::now();
-         constraintTime = chrono::duration_cast<chrono::seconds>(end - start).count();
+        constraintTime = chrono::duration_cast<chrono::seconds>(end - start).count();
     }
 
     if (images) {
@@ -513,11 +517,11 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
             free(rgb);
         }
     }
-    if(timer) {
-    if (individual == -1) cout << "\n>>> Elevation Build took: " << elevTime << " seconds"<< (images ? " (with png writing)" : "") << endl;
-    cout << "\n>>> Combined bin took: " << constraintTime << " seconds" << (images ? " (with png writing)" : "") << endl;
+    if (timer) {
+        if (individual == -1) cout << "\n>>> Elevation Build took: " << elevTime << " seconds"<< (images ? " (with png writing)" : "") << endl;
+        cout << "\n>>> Combined bin took: " << constraintTime << " seconds" << (images ? " (with png writing)" : "") << endl;
     }
-    cout<< "total cells: " << total <<endl;
-    cout<< "feasible cells: " << feasible << "i.e. " << ((double)feasible / total) * 100 << "%" <<endl;
-    cout << "\n>>> Completed All Tasks Succesfully..\n";
+        cout<< "total cells: " << total <<endl;
+        cout<< "feasible cells: " << feasible << "i.e. " << ((double)feasible / total) * 100 << "%" <<endl;
+        cout << "\n>>> Completed All Tasks Succesfully..\n";
     }

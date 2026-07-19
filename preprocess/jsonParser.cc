@@ -33,7 +33,7 @@ static string layer_to_str(Layer_vals v) {
 
 
 Config Config::load(optional<const string> path) {
-    string p = path.value_or("./config.json");
+    string p = path.value_or("./config/config.json");
 
     ifstream f(p);
     if (!f.is_open())
@@ -60,7 +60,7 @@ void Config::save(string path) const {
 }
 
 bool Config::is_available(optional<const string> path) {
-    return filesystem::exists(path.value_or("./config.json"));
+    return filesystem::exists(path.value_or("./config/config.json"));
 }
 
 
@@ -106,9 +106,12 @@ Config Config::from_json(const Json::Value& j) {
         }
     }
 
-    for (const string& key : j["layers"].getMemberNames())
-        conf.layers[stoi(key)] = str_to_layer(j["layers"][key].asString());
-
+    conf.fcase.roads = j["case"]["roads"].asBool();
+    conf.fcase.rails = j["case"]["rails"].asBool();
+    conf.fcase.waterbodies = j["case"]["waterbodies"].asBool();
+    conf.fcase.waterlines = j["case"]["waterlines"].asBool();
+    conf.fcase.ib = j["case"]["ib"].asBool();
+    conf.fcase.slope = j["case"]["slope"].asBool();
 
         return conf;
 }
@@ -145,8 +148,12 @@ Json::Value Config::to_json() const {
     // Assign the flat array to the key
     j["operation_area"] = array_flat;
     // layers bit → name
-    for (const auto& [bit, layer] : layers)
-        j["layers"][std::to_string(bit)] = layer_to_str(layer);
+    j["case"]["roads"] = fcase.roads;
+    j["case"]["rails"] = fcase.rails;
+    j["case"]["waterbodies"] = fcase.waterbodies;
+    j["case"]["waterlines"] = fcase.waterlines;
+    j["case"]["ib"] = fcase.ib;
+    j["case"]["slope"] = fcase.slope;
 
     // input paths
     j["input"]["road"]       = input.road;

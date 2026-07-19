@@ -5,28 +5,64 @@ using namespace lib;
 
 static void load_vec(Bin* b, const string& param_path) {
     if (b->vector_loaded) return;
-
+    if (Config::is_available()) {
+        auto conf = Config::load();
+        b->flag_road       = conf.fcase.roads;
+        b->flag_rail       = conf.fcase.rails;
+        b->flag_water_area = conf.fcase.waterbodies;
+        b->flag_water_line = conf.fcase.waterlines;
+        b->flag_slope      = conf.fcase.slope;
+        b->flag_ib         = conf.fcase.ib;
+    }
     if (b->VEC_ROWS == 0 || b->VEC_COLS == 0) {
         b->VEC_ROWS = calc_rows(RESOLUTION);
         b->VEC_COLS = calc_cols(RESOLUTION);
     }
 
-    size_t total = (size_t)b->VEC_ROWS * b->VEC_COLS;
+    size_t total = (size_t)b->VEC_ROWS * b->VEC_COLS;   // element count
+
+    using ElementType = decltype(b->vec_matrix)::value_type;
+    size_t expected_bytes = total * sizeof(ElementType);
+
     cout << "[bin] Loading " << param_path
-         << " (" << total / 1e6 << " MB)...\n";
+         << " (" << expected_bytes / 1e6 << " MB)...\n";
 
     ifstream f(param_path, ios::binary);
     if (!f.is_open()) {
         cerr << "[bin] ERROR: cannot open " << param_path << "\n";
         return;
     }
+
+    // verify file size matches before allocating/reading
+    f.seekg(0, ios::end);
+    size_t file_bytes = (size_t)f.tellg();
+    f.seekg(0, ios::beg);
+    if (file_bytes != expected_bytes) {
+        cerr << "[bin] ERROR: size mismatch — expected "
+             << expected_bytes / 1e6 << " MB, got "
+             << file_bytes / 1e6 << " MB for " << param_path << "\n";
+        return;
+    }
+
     b->vec_matrix.resize(total);
-    f.read(reinterpret_cast<char*>(b->vec_matrix.data()), total);
-    if ((size_t)f.gcount() != total) {
-        cerr << "[bin] ERROR: size mismatch reading " << param_path << "\n";
+    char* ptr = reinterpret_cast<char*>(b->vec_matrix.data());
+
+    const size_t CHUNK_SIZE = 1024ULL * 1024ULL * 1024ULL; // 1 GB, in bytes
+    size_t br = 0;
+    while (br < expected_bytes) {
+        size_t toread = min(CHUNK_SIZE, expected_bytes - br);
+        f.read(ptr + br, toread);
+        if (f.gcount() == 0) break;
+        br += f.gcount();
+    }
+
+    if (br != expected_bytes) {
+        cerr << "[bin] ERROR: size mismatch reading " << br
+             << " / " << expected_bytes << " bytes from " << param_path << "\n";
         b->vec_matrix.clear();
         return;
     }
+
     b->vector_loaded = true;
     cout << "[bin] Vec loaded — "
          << b->VEC_ROWS << " x " << b->VEC_COLS << "\n";
@@ -45,8 +81,10 @@ static void load_elev(Bin* b, const string& elev_path) {
         elev_cols  = (size_t)ELEV_COLS;
     }
 
-    size_t total          = elev_rows * elev_cols;
-    size_t expected_bytes = total * sizeof(int16_t);   // 6 bytes/cell
+    size_t total = elev_rows * elev_cols;   // element count
+
+    using ElementType = decltype(b->elev_matrix)::value_type;
+    size_t expected_bytes = total * sizeof(ElementType);
 
     cout << "[bin] Loading " << elev_path
          << " (" << expected_bytes / 1e6 << " MB)...\n";
@@ -54,7 +92,7 @@ static void load_elev(Bin* b, const string& elev_path) {
     ifstream f(elev_path, ios::binary);
     if (!f.is_open()) {
         cerr << "[bin] ERROR: cannot open " << elev_path << "\n";
-        return;
+        exit(EXIT_FAILURE);
     }
 
     f.seekg(0, ios::end);
@@ -64,18 +102,30 @@ static void load_elev(Bin* b, const string& elev_path) {
     if (file_bytes != expected_bytes) {
         cerr << "[bin] ERROR: size mismatch — expected "
              << expected_bytes / 1e6 << " MB, got "
-             << file_bytes     / 1e6 << " MB\n"
-             << "  Hint: rebuild with build_elevation_matrix()\n";
+             << file_bytes / 1e6 << " MB\n"
+             << "Hint: rebuild with build_elevation_matrix()\n";
         return;
     }
 
     b->elev_matrix.resize(total);
-    f.read(reinterpret_cast<char*>(b->elev_matrix.data()), expected_bytes);
-    if ((size_t)f.gcount() != expected_bytes) {
-        cerr << "[bin] ERROR: short read on " << elev_path << "\n";
+    char* ptr = reinterpret_cast<char*>(b->elev_matrix.data());
+
+    const size_t CHUNK_SIZE = 1024ULL * 1024ULL * 1024ULL; // 1 GB, in bytes
+    size_t br = 0;
+    while (br < expected_bytes) {
+        size_t toread = min(CHUNK_SIZE, expected_bytes - br);
+        f.read(ptr + br, toread);
+        if (f.gcount() == 0) break;
+        br += f.gcount();
+    }
+
+    if (br != expected_bytes) {
+        cerr << "[bin] ERROR: size mismatch reading " << br
+             << " / " << expected_bytes << " bytes\n";
         b->elev_matrix.clear();
         return;
     }
+
     b->elevation_loaded = true;
     cout << "[bin] Elev loaded — " << elev_rows << " x " << elev_cols << "\n";
 }
