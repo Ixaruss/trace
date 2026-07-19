@@ -1,0 +1,49 @@
+CXX      := g++
+STD      := -std=c++23
+
+# NOTE: original Makefile used $(gdal-config --cflags --libs) which is not
+# valid Make syntax (missing the `shell` function) and silently expanded to
+# nothing. Fixed below.
+GDAL     := $(shell gdal-config --cflags --libs)
+LIBS     := -ljsoncpp -lgdal -lpng16 -lhdf5
+HDF5     := -lhdf5
+
+BIN      := x
+ADAPT    := adapt
+
+# Shared preprocessing sources used by every target
+COMMON_SRC := preprocess/jsonParser.cc preprocess/reproject.cc preprocess/lib/*.cc
+
+# Aggressive optimization flags, shared by the perf-sensitive targets (tool, ga)
+OPT_FLAGS := -O3 -ffast-math -flto -ffp-contract=fast -march=native \
+             -funroll-loops -fprefetch-loop-arrays -fdata-sections \
+             -ffunction-sections -Wl,--gc-sections -Wl,-O2
+
+.PHONY: all bin test tool deploy ga clean
+
+all: bin
+
+bin:
+	$(CXX) preprocess/preprocess.cc $(COMMON_SRC) -o $(BIN) $(GDAL) $(LIBS) $(STD) && ./$(BIN)
+
+test:
+	$(CXX) preprocess/test.cc $(COMMON_SRC) -o $(BIN) $(GDAL) $(LIBS) $(HDF5) $(STD) && ./$(BIN)
+
+tool:
+	$(CXX) $(OPT_FLAGS) -fopenmp \
+		cli/main.cc common/lineofsight.cc common/image.cc common/coverage.cc \
+		common/angleviewshed.cc common/radarlos.cc common/mult.cc common/operations.cc \
+		preprocess/jsonParser.cc preprocess/reproject.cc preprocess/preprocess.cc \
+		preprocess/lib/*.cc ga/config.cc \
+		-o $(ADAPT) $(LIBS) $(STD)
+
+deploy:
+	$(CXX) deploy.cc $(COMMON_SRC) -o $(BIN) $(GDAL) $(LIBS) $(STD)
+
+ga:
+	$(CXX) $(OPT_FLAGS) -pthread \
+		ga/main.cc ga/config.cc $(COMMON_SRC) \
+		-o $(BIN) $(GDAL) $(LIBS) $(HDF5) $(STD) && ./$(BIN)
+
+clean:
+	rm -f $(BIN) $(ADAPT) *.o
