@@ -149,9 +149,66 @@
 
 
     // ------------------------------------------------------------------
-    void ViewshedEngine::computeViewshed()
+    // SECTOR SUPPORT
+    //
+    // A sector is an arbitrary arc given as two azimuths (degrees,
+    // North = 0°, clockwise positive):
+    //
+    //   leftDeg  = start of the arc (left edge, looking outward from source)
+    //   rightDeg = end of the arc   (right edge)
+    //
+    // The scanned region is everything swept clockwise from leftDeg to
+    // rightDeg. If leftDeg > rightDeg the arc wraps through North
+    // (e.g. leftDeg=340°, rightDeg=20° scans 340->360->0->20, an
+    // 40°-wide arc straddling North).
+    //
+    // leftDeg < 0 || rightDeg < 0 -> full 360°.
+    //
+    // Reuses RadarEngine::cellAzimuth / inArc / normAz rather than
+    // duplicating them, since ViewshedEngine uses the same row/col grid
+    // layout (centerX = row, centerY = col) as RadarEngine.
+    // ------------------------------------------------------------------
+    std::vector<Point2D> ViewshedEngine::sectorPerimeter(double leftDeg, double rightDeg) const
+    {
+        if (leftDeg < 0.0 || rightDeg < 0.0) return circlePerimeter;  // full 360
+
+        std::vector<Point2D> out;
+        double width = rightDeg - leftDeg;
+        if (width < 0.0) width += 360.0;
+        out.reserve(static_cast<size_t>(circlePerimeter.size() * (width / 360.0)) + 8);
+
+        for (const auto& pt : circlePerimeter) {
+            double az = RadarEngine::cellAzimuth(centerX, centerY, pt.x, pt.y);
+            if (RadarEngine::inArc(az, leftDeg, rightDeg))
+                out.push_back(pt);
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // leftDeg/rightDeg: arc swept clockwise from leftDeg to rightDeg,
+    //                    North = 0°. leftDeg < 0 || rightDeg < 0 -> full 360.
+    //                    leftDeg > rightDeg wraps through North.
+    // ------------------------------------------------------------------
+    void ViewshedEngine::computeViewshed(double leftDeg, double rightDeg)
     {
         auto t0 = std::chrono::high_resolution_clock::now();
+
+        bool fullCircle = (leftDeg < 0.0 || rightDeg < 0.0);
+        auto activePerimeter = sectorPerimeter(leftDeg, rightDeg);
+
+        std::cout << "[INFO]   Sector  : ";
+        if (fullCircle) {
+            std::cout << "360° (full)\n";
+        } else {
+            std::cout << RadarEngine::normAz(leftDeg) << "° -> "
+                      << RadarEngine::normAz(rightDeg)
+                      << "° (clockwise)  rays=" << activePerimeter.size() << "\n";
+        }
+
+        // Reset mask so repeated calls (e.g. different sectors on the same
+        // engine) don't leak stale visible cells from a previous call.
+        std::fill(viewshedMask.begin(), viewshedMask.end(), 0);
 
         // centerX = row, centerY = col
         size_t srcIdx =
@@ -169,7 +226,7 @@
         // source cell always visible
         viewshedMask[srcIdx] = 1;
 
-        const size_t N       = circlePerimeter.size();
+        const size_t N       = activePerimeter.size();
         const short* demPtr  = g.bin.elev_matrix.data();
         uint8_t*     maskPtr = viewshedMask.data();
         const int    COLS    = gridCols;
@@ -179,12 +236,12 @@
         // each ray only writes cells it visits (no two rays share a cell
         // on the same Bresenham path), and both write value=1 if they do
         #pragma omp parallel for schedule(dynamic, 64) default(none) \
-            shared(demPtr, maskPtr) \
+            shared(demPtr, maskPtr, activePerimeter) \
             firstprivate(N, COLS, ROWS, srcElev)
         for (size_t i = 0; i < N; ++i)
         {
-            int tx = circlePerimeter[i].x;
-            int ty = circlePerimeter[i].y;
+            int tx = activePerimeter[i].x;
+            int ty = activePerimeter[i].y;
             if (tx >= 0 && tx < COLS && ty >= 0 && ty < ROWS)
                 castRay(tx, ty, srcElev, demPtr, maskPtr);
         }
@@ -223,8 +280,17 @@
 //         true          // earth curvature
 //     );
 
+//     // full 360
 //     engine->computeViewshed();
 //     engine->writeViewshedToSVG("viewshed_timed.svg");
+
+//     // // 60°-wide arc centred on NE (20° -> 80°)
+//     // engine->computeViewshed(20, 80);
+//     // engine->writeViewshedToSVG("viewshed_sector_ne.svg");
+
+//     // // 40°-wide arc straddling North (340° -> 20°)
+//     // engine->computeViewshed(340, 20);
+//     // engine->writeViewshedToSVG("viewshed_sector_north.svg");
 
 //     auto t1 = std::chrono::high_resolution_clock::now();
 //     std::cout << "\n=======================================================\n"

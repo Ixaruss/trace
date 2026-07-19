@@ -73,7 +73,7 @@ static void castRadarRayDiag(
     int maxRadiusCells,
     const short*  __restrict__ dem,
     uint8_t*      __restrict__ stat,
-    int COLS, int ROWS)
+    int COLS, int ROWS, bool use_curvature)
 {
     int adr=std::abs(endRow-srcRow), adc=std::abs(endCol-srcCol);
     int sr=(srcRow<endRow)?1:-1, sc=(srcCol<endCol)?1:-1;
@@ -111,8 +111,9 @@ static void castRadarRayDiag(
         double curvDrop = (dist*dist) * INV_2_KEFFR;
 
         if(dist>maxRangeM){ *statCell=(uint8_t)CoverageStatus::OUTSIDE_RANGE; continue; }
+        if(use_curvature){
         if(dist>horizonM) break;  // pre-filled as BEYOND_HORIZON
-
+        }
         short raw=*demCell;
         if(raw<-9000) break;
 
@@ -143,7 +144,7 @@ static void castRadarRayFast(
     double horizonM, int maxRadiusCells,
     const short* __restrict__ dem,
     uint8_t*     __restrict__ stat,
-    int COLS, int ROWS)
+    int COLS, int ROWS, bool use_curvature)
 {
     int adr=std::abs(endRow-srcRow), adc=std::abs(endCol-srcCol);
     int sr=(srcRow<endRow)?1:-1, sc=(srcCol<endCol)?1:-1;
@@ -178,7 +179,8 @@ static void castRadarRayFast(
         double dist = std::sqrt(drow*drow+dcol*dcol) * RESOLUTION;
         double curvDrop = (dist*dist) * INV_2_KEFFR;
 
-        if(dist>horizonM) break;
+        if(use_curvature)
+            if(dist>horizonM) break;
 
         short raw=*demCell;
         if(raw<-9000) break;
@@ -303,7 +305,7 @@ static void castRadarRayFast(
                 castRadarRayDiag(
                     srcRow,srcCol,er,ec,
                     SE,TH,MNS,MXS,MXR,HOR,MRC,
-                    demPtr,statPtr,COLS,ROWS);
+                    demPtr,statPtr,COLS,ROWS,use_curvature);
         }
 
         auto t1=std::chrono::high_resolution_clock::now();
@@ -352,7 +354,7 @@ static void castRadarRayFast(
         std::cout<<"  BEYOND_HORIZON : "<<res.countBeyondHorizon<<"\n";
         std::cout<<"  OUTSIDE_SECTOR : "<<res.countOutsideSector<<"\n";
         if(total>0) std::cout<<"  Coverage %     : "
-                             <<(100.0*res.countCovered/total)<<"%\n";
+                             <<(100.0*((double)res.countCovered/total))<<"%\n";
         return res;
     }
 
@@ -391,7 +393,7 @@ static void castRadarRayFast(
                 castRadarRayFast(
                     srcRow,srcCol,er,ec,
                     SE,TH,MNS,MXS,HOR,MRC,
-                    demPtr,statPtr,COLS,ROWS);
+                    demPtr,statPtr,COLS,ROWS,use_curvature);
         }
 
         auto t1=std::chrono::high_resolution_clock::now();

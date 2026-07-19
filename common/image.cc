@@ -1,5 +1,176 @@
 #include "../operations.h"
 
+#include <png.h>
+#include <cstdio>
+#include <stdexcept>
+#include <vector>
+
+
+static void write_rgba_to_png(const std::string& filename, int width, int height, const std::vector<uint8_t>& rgba)
+{
+    FILE *fp = fopen(filename.c_str(), "wb");
+    if (!fp) {
+        throw std::runtime_error("write_rgba_to_png: Could not open file " + filename + " for writing");
+    }
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) {
+        fclose(fp);
+        throw std::runtime_error("write_rgba_to_png: png_create_write_struct failed");
+    }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_write_struct(&png, NULL);
+        fclose(fp);
+        throw std::runtime_error("write_rgba_to_png: png_create_info_struct failed");
+    }
+
+    // libpng uses setjmp for error handling
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        throw std::runtime_error("write_rgba_to_png: Error during PNG creation");
+    }
+
+    png_init_io(png, fp);
+
+    // Setup PNG header for 8-bit RGBA
+    png_set_IHDR(
+        png, info, width, height,
+        8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
+        PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT
+    );
+    png_write_info(png, info);
+
+    // libpng expects an array of pointers to the start of each row
+    std::vector<png_bytep> row_pointers(height);
+    for (int y = 0; y < height; y++) {
+        row_pointers[y] = (png_bytep)&rgba[y * width * 4];
+    }
+
+    // Write image data and end
+    png_write_image(png, row_pointers.data());
+    png_write_end(png, NULL);
+
+    // Cleanup
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
+}
+
+void ViewshedEngine::writeViewshedToPNG(const std::string& filename)
+{
+    auto tAll = std::chrono::high_resolution_clock::now();
+
+    int rowMin = std::max(0,        centerX - maxRadiusCells - 2);
+    int rowMax = std::min(gridRows, centerX + maxRadiusCells + 2);
+    int colMin = std::max(0,        centerY - maxRadiusCells - 2);
+    int colMax = std::min(gridCols, centerY + maxRadiusCells + 2);
+
+    int W = colMax - colMin;
+    int H = rowMax - rowMin;
+
+    size_t total = (size_t)W * H;
+    std::vector<uint8_t> rgba(total * 4, 0);
+
+    long long rSq =
+        static_cast<long long>(maxRadiusCells) * maxRadiusCells;
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    #pragma omp parallel for schedule(static, 4096)
+    for (size_t i = 0; i < total; ++i)
+    {
+        int px  = (int)(i % W);
+        int py  = (int)(i / W);
+        int col = colMin + px;
+        int row = rowMin + py;
+
+        int dcol = col - centerY;
+        int drow = row - centerX;
+
+        if ((long long)dcol*dcol + (long long)drow*drow > rSq)
+            continue;
+
+        size_t gridIdx = (size_t)row * gridCols + col;
+        size_t pix     = i * 4;
+
+        if (viewshedMask[gridIdx]) {
+            rgba[pix+0] = 46;  rgba[pix+1] = 204;
+            rgba[pix+2] = 113; rgba[pix+3] = 255;
+        } else {
+            rgba[pix+0] = 231; rgba[pix+1] = 76;
+            rgba[pix+2] = 60;  rgba[pix+3] = 255;
+        }
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::cout << "[METRIC] RGBA map generation          : "
+              << std::chrono::duration<double,std::milli>(t1-t0).count()
+              << " ms\n";
+
+    t0 = std::chrono::high_resolution_clock::now();
+
+    // Call the libpng helper
+    write_rgba_to_png(filename, W, H, rgba);
+
+    t1 = std::chrono::high_resolution_clock::now();
+    std::cout << "[METRIC] libpng write/compress        : "
+              << std::chrono::duration<double,std::milli>(t1-t0).count()
+              << " ms\n";
+
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    std::cout << "[METRIC] Total PNG generation         : "
+              << std::chrono::duration<double,std::milli>(tEnd-tAll).count()
+              << " ms\n";
+}
+
+
+void RadarEngine::writeToPNG(
+    const RadarCoverageResult& res,
+    const std::string& filename)
+{
+    auto tAll=std::chrono::high_resolution_clock::now();
+
+    int W=colMax-colMin, H=rowMax-rowMin;
+    size_t total=(size_t)W*H;
+    std::vector<uint8_t> rgba(total*4,0);
+    long long rSq=(long long)maxRadiusCells*maxRadiusCells;
+
+    #pragma omp parallel for schedule(static,4096)
+    for(size_t i=0;i<total;++i){
+        int px=(int)(i%W), py=(int)(i/W);
+        int col=colMin+px, row=rowMin+py;
+        int dc=col-srcCol, dr=row-srcRow;
+        if((long long)dc*dc+(long long)dr*dr>rSq) continue;
+        size_t gi=(size_t)row*gridCols+col;
+        size_t pix=i*4;
+        switch((CoverageStatus)res.status[gi]){
+            case CoverageStatus::COVERED:
+                rgba[pix+0]=46; rgba[pix+1]=204;rgba[pix+2]=113;rgba[pix+3]=255; break;
+            case CoverageStatus::TERRAIN_MASKED:
+                rgba[pix+0]=231;rgba[pix+1]=76; rgba[pix+2]=60; rgba[pix+3]=255; break;
+            case CoverageStatus::BELOW_MIN_ELEV:
+                rgba[pix+0]=52; rgba[pix+1]=152;rgba[pix+2]=219;rgba[pix+3]=255; break;
+            case CoverageStatus::ABOVE_MAX_ELEV:
+                rgba[pix+0]=230;rgba[pix+1]=126;rgba[pix+2]=34; rgba[pix+3]=255; break;
+            case CoverageStatus::BEYOND_HORIZON:
+                rgba[pix+0]=155;rgba[pix+1]=89; rgba[pix+2]=182;rgba[pix+3]=255; break;
+            case CoverageStatus::OUTSIDE_SECTOR:
+                rgba[pix+0]=40; rgba[pix+1]=40; rgba[pix+2]=40; rgba[pix+3]=255; break;
+            default: break;
+        }
+    }
+
+    // Call the libpng helper
+    write_rgba_to_png(filename, W, H, rgba);
+
+    std::cout<<"[RADAR] PNG: "<<filename<<"  "
+             <<std::chrono::duration<double,std::milli>(
+                 std::chrono::high_resolution_clock::now()-tAll).count()
+             <<" ms\n";
+}
+
 void ViewshedEngine::writeViewshedToSVG(const std::string& filename)
 {
     auto tAll = std::chrono::high_resolution_clock::now();
