@@ -7,6 +7,23 @@
 #include "preprocess/lib.h"
 #include <sys/stat.h>
 
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    // Windows (MSVC or MinGW)
+    #define fseek64 _fseeki64
+    #define ftell64 _ftelli64
+    public: static std::vector<std::vector<LOSResult>> lineOfVisibilityBatch(const std::vector<LOSQuery>& queries, int numThreads = 0);  // 0 = auto detect
+
+    typedef __int64 off64_t;
+#elif defined(__unix__) || defined(__APPLE__) || defined(__linux__)
+    // POSIX systems
+    #define fseek64 fseeko
+    #define ftell64 ftello
+#else
+    // Fallback for older compilers (may fallback to 32-bit)
+    #define fseek64 fseek
+    #define ftell64 ftell
+#endif
+
 struct LOSResult
 {
     int    x;
@@ -40,11 +57,11 @@ public:
     }
     public: static void preprocess(bool images = 0, bool timer = false, bool seperate = false, int individual = -1);
 
-    public: std::vector<LOSResult>  lineOfVisibilityopt(double lat0, double lon0, int h0, double lat1, double lon1, int h1);
+    public: std::vector<LOSResult> lineOfVisibilityopt(double lat0, double lon0, int h0, double lat1, double lon1, int h1);
 
     public: std::vector<LOSResult> lineOfVisibilityOptimized(double lat0, double lon0, int h0, double lat1, double lon1, int h1);
 
-    public:  bool lineOfSight(double lat0, double long0,int h0, double lat1, double long1,int h1);
+    public: bool lineOfSight(double lat0, double long0,int h0, double lat1, double long1,int h1);
 
     public: static std::vector<std::pair<int,int>> bresenham(int x0, int y0, int x1, int y1);
 

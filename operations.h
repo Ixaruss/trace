@@ -181,6 +181,13 @@ private:
 
     void precomputeCirclePerimeter();
 
+    // Filter circlePerimeter down to the rays whose azimuth (from source)
+    // falls on the [leftDeg, rightDeg] arc, swept clockwise, North = 0°.
+    // leftDeg < 0 || rightDeg < 0 -> full 360 (returns circlePerimeter).
+    // Reuses RadarEngine's azimuth helpers since both engines share the
+    // same row/col grid convention.
+    std::vector<Point2D> sectorPerimeter(double leftDeg, double rightDeg) const;
+
 public:
     ViewshedEngine(
         Global& globalInstance,
@@ -230,10 +237,16 @@ public:
         std::cout << "[INFO]   Curv    " << (useEarthCurvature ? "ON" : "OFF") << "\n";
     }
 
-    public: void computeViewshed();
+    // leftDeg/rightDeg: arc swept clockwise from leftDeg to rightDeg,
+    //                    North = 0°. leftDeg < 0 || rightDeg < 0 -> full 360.
+    //                    leftDeg > rightDeg wraps through North.
+    public: void computeViewshed(double leftDeg = -1.0, double rightDeg = -1.0);
     public: inline const std::vector<uint8_t>& getMask() const { return viewshedMask; }
     public: void writeViewshedToSVG(const std::string& filename);
+    public: void writeViewshedToPNG(const std::string& filename);
     public: static std::string base64Encode(const uint8_t* data, size_t length);
+    public: void writeViewshedToGeoTIFF(const std::string& filename);
+
 };
 
 class RadarEngine
@@ -248,7 +261,7 @@ public:
     double  antennaHeight, targetHeight;
     double  minSlopeRatio, maxSlopeRatio;
     double  maxRangeM, horizonM, srcElev;
-
+    bool use_curvature;
     std::vector<uint8_t> statusBuf;
     std::vector<uint8_t> fastBuf;
     std::vector<Point2D> boundary;   // full 360 boundary
@@ -259,7 +272,6 @@ public:
     // leftDeg < 0 (or rightDeg < 0) → full 360°.
     // ------------------------------------------------------------------
     std::vector<Point2D> sectorBoundary(double leftDeg, double rightDeg) const;
-
     void prefill(double leftDeg, double rightDeg, uint8_t* buf, uint8_t fillInside, uint8_t fillOutside);
 
     /******************************************************************************
@@ -317,11 +329,12 @@ public:
         double antennaHeightM,
         double targetHeightM,
         double minElevDeg, double maxElevDeg,
-        double maxRangeKM)
+        double maxRangeKM, bool curv)
         : g(globalInstance)
         , antennaHeight(antennaHeightM)
         , targetHeight(targetHeightM)
-        , maxRangeM(maxRangeKM * 1000.0)
+        , maxRangeM(maxRangeKM * 1000.0), use_curvature(curv)
+
     {
         auto t0=std::chrono::high_resolution_clock::now();
 
@@ -350,9 +363,11 @@ public:
         statusBuf.assign((size_t)gridRows*gridCols, 0);
         fastBuf.assign(  (size_t)gridRows*gridCols, 0);
 
-        horizonM = std::sqrt(2.0*K_EFF_R*antennaHeight)
-                 + std::sqrt(2.0*K_EFF_R*targetHeight);
-        if(horizonM>maxRangeM) horizonM=maxRangeM;
+
+            horizonM = std::sqrt(2.0*K_EFF_R*antennaHeight)
+                     + std::sqrt(2.0*K_EFF_R*targetHeight);
+            if(horizonM>maxRangeM) horizonM=maxRangeM;
+
 
         minSlopeRatio=std::tan(minElevDeg*DEG2RAD);
         maxSlopeRatio=std::tan(maxElevDeg*DEG2RAD);
@@ -379,6 +394,7 @@ public:
 
     static std::vector<Point2D> circleBoundary(int cr, int cc, int radius);
 
+    void writeToPNG( const RadarCoverageResult& res, const std::string& filename= "radar_coverage.png");
     public: static RadarLOSResult radarLOS(
         Global&  g,
         double   srcLat,  double srcLon,  double antennaHeightM,
@@ -392,6 +408,10 @@ public:
         double   tgtLat,  double tgtLon,  double targetHeightM,
         double   minElevDeg, double maxElevDeg,
         double   maxRangeKM);
+
+    void writeFastToGeoTIFF(const std::vector<uint8_t>& fastMask, const std::string& filename);
+
+    void writeCoverageToGeoTIFF(const RadarCoverageResult& res, const std::string& filename);
 
     inline static void printLOSResult(const RadarLOSResult& r,
                                double srcLat, double srcLon,
@@ -416,6 +436,22 @@ public:
         std::cout << "  Compute     : " << r.computeUs << " µs\n";
         std::cout << "======================================\n";
     }
+    static std::vector<GridPoint> get_coverage_reverse(
+       Global&              g,
+       int                  srcRow,
+       int                  srcCol,
+       double               antennaHeight = 50.0,
+       double               targetH       = 1000.0,
+       double               minAngle      = 0.5,
+       double               maxAngle      = 30.0,
+       double               maxRangeM     = 25000.0,
+       const std::string&   pngPath       = "");
 };
+
+bool writeOverlapGeoTIFF(
+    Global&                        g,
+    const FeasibleGrid&            aoiGrid,
+    const std::string&             filename,
+    const std::vector<GridPoint>&  placements = {});
 
 #endif
