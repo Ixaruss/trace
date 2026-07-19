@@ -10,3 +10,6 @@ preprocess/maps/new/
 adapt
 z
 __MACOSX/
+*.xml
+*.tif
+*.h5

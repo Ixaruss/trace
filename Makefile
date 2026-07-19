@@ -5,14 +5,14 @@ STD      := -std=c++23
 # valid Make syntax (missing the `shell` function) and silently expanded to
 # nothing. Fixed below.
 GDAL     := $(shell gdal-config --cflags --libs)
-LIBS     := -ljsoncpp -lgdal -lpng16
+LIBS     := -ljsoncpp -lgdal -lpng16 -lhdf5
 HDF5     := -lhdf5
 
 BIN      := x
 ADAPT    := adapt
 
 # Shared preprocessing sources used by every target
-COMMON_SRC := preprocess/jsonParser.cc preprocess/reproject.cc preprocess/lib/*.cc
+COMMON_SRC := preprocess/jsonParser.cc preprocess/reproject.cc preprocess/lib/*.cc common/radarfdr.cc  common/coverage.cc
 
 # Aggressive optimization flags, shared by the perf-sensitive targets (tool, ga)
 OPT_FLAGS := -O3 -ffast-math -flto -ffp-contract=fast -march=native \
@@ -31,10 +31,10 @@ test:
 
 tool:
 	$(CXX) $(OPT_FLAGS) -fopenmp \
-		cli/main.cc common/lineofsight.cc common/image.cc common/coverage.cc \
+		cli/main.cc common/lineofsight.cc common/image.cc common/coverage.cc render.cc \
 		common/angleviewshed.cc common/radarlos.cc common/mult.cc common/operations.cc \
 		preprocess/jsonParser.cc preprocess/reproject.cc preprocess/preprocess.cc \
-		preprocess/lib/*.cc \
+		preprocess/lib/*.cc ga/config.cc \
 		-o $(ADAPT) $(LIBS) $(STD)
 
 deploy:
