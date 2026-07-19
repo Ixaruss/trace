@@ -1,7 +1,8 @@
 #include "cli.h"
 #include "../common.h"
 #include "../operations.h"
-
+#include "../ga/config.h"
+#include "../ga/ga.h"
 int main(int argc, char** argv) {
 
     CLI::App app{"Geospatial Analysis and Radar CLI Tool"};
@@ -32,16 +33,21 @@ int main(int argc, char** argv) {
     float vs_range = 300.0f;
     float vs_ant_height = 30.0f;
     bool vs_curvature = true;
-    std::string vs_output = "viewshed_timed.svg";
+    double loa = 0;
+    double roa = 90;
+    bool has_sector = false;
+    std::string vs_output = "output/viewshed/viewshed.svg";
 
     viewshed_sub->add_option("--lat", vs_lat, "Latitude of the origin")->required();
     viewshed_sub->add_option("--lon", vs_lon, "Longitude of the origin")->required();
     viewshed_sub->add_option("-r,--range", vs_range, "Range limit in kilometers");
     viewshed_sub->add_option("-a,--antenna", vs_ant_height, "Antenna height in meters");
     viewshed_sub->add_option("-o,--output", vs_output, "Output SVG filename");
-
+    viewshed_sub->add_flag("-s", has_sector, "Use sector");
+    viewshed_sub->add_option("--loa", loa, "Left of arc (degrees)");
+    viewshed_sub->add_option("--roa", roa, "Right of arc (degrees)");
     bool no_curvature = false;
-    viewshed_sub->add_flag("--no-curvature", no_curvature, "Disable earth curvature corrections");
+    viewshed_sub->add_flag("--use-curvature", no_curvature, "use earth curvature corrections");
 
     auto radar_sub = app.add_subcommand("radar", "Calculate radar profile coverage.");
 
@@ -52,10 +58,8 @@ int main(int argc, char** argv) {
     double r_min_elev = 10.0;
     double r_max_elev = 30.0;
     double r_max_range = 300.0;
+
     std::string r_output = "radar_output.svg";
-
-
-    double r_sector = -1.0; // Left at -1 to detect if user passes a specific sector angle
     bool r_fast = false;
 
 
@@ -67,10 +71,11 @@ int main(int argc, char** argv) {
     radar_sub->add_option("--max-elev", r_max_elev, "Maximum elevation angle (degrees)");
     radar_sub->add_option("-r,--range", r_max_range, "Maximum radar range (kilometers)");
     radar_sub->add_option("-o,--output", r_output, "Output SVG filename");
-
-    radar_sub->add_option("-s,--sector", r_sector, "Specific sector slice in degrees (e.g. 45, 90)");
+    radar_sub->add_flag("-s", has_sector, "Use sector");
+    radar_sub->add_option("--loa", loa, "Left of arc (degrees)");
+    radar_sub->add_option("--roa", roa, "Right of arc (degrees)");
     radar_sub->add_flag("-f,--fast", r_fast, "Execute calculation in fast mode (without image)");
-
+    radar_sub->add_flag("--use-curvature", no_curvature, "use earth curvature corrections");
     auto rlos_sub = app.add_subcommand("rlos", "Calculate radar Line of Sight (LOS) between a source and a target.");
 
     double srcLat = 34.017346;
@@ -105,6 +110,11 @@ int main(int argc, char** argv) {
     los_sub->add_option("-t,--target", los_tgt_height, "Target aircraft height AGL (meters)");
     los_sub->add_flag("-d,--detailed", detailed, "Execute detailed profile and print cell telemetry");
 
+    auto run  = app.add_subcommand("run", "run ga cases via config");
+    int gen = 0;
+    bool run_benchmark = false;
+     run->add_option("-g,--gen-simdata",gen, "write simulation for top k solutions for ga");
+     run->add_flag("-b, --run-benchmark", run_benchmark, "create benchamrk table for all selection, mutation and crossover methods");
     try {
         app.parse(argc, argv);
     } catch (const CLI::ParseError &e) {
@@ -113,45 +123,57 @@ int main(int argc, char** argv) {
 
 
     if (*viewshed_sub) {
+        cout << s << "loa: " << loa << "roa: " << roa;
         Global g;
         vs_curvature = !no_curvature; // Flip state if flag passed
-
         auto engine = std::make_unique<ViewshedEngine>(
             g, vs_lat, vs_lon, vs_range, vs_ant_height, vs_curvature
         );
+        if (viewshed_sub->count("--output") == 0 && has_sector) {
+            vs_output = "output/viewshed/viewshed_sector.tif";
+        } else if (viewshed_sub->count("--output") == 0) {
+            vs_output = "output/viewshed/viewshed_360.tif";
+        }
+         if (has_sector) {
+             engine->computeViewshed(loa,roa);
+             engine->writeViewshedToGeoTIFF(vs_output);
+         } else {
+             engine->computeViewshed();
+             engine->writeViewshedToGeoTIFF(vs_output);
+         }
 
-        engine->computeViewshed();
-        engine->writeViewshedToSVG(vs_output);
+
     }
 
     // Route 2: Execution for Radar
     else if (*radar_sub) {
-        Global g;
-        RadarEngine engine(
-            g, r_lat, r_lon, r_ant_agl, r_tgt_agl, r_min_elev, r_max_elev, r_max_range
-        );
 
-        bool has_sector = radar_sub->count("--sector") > 0;
+        Global g;
+        g.bin.init({ ELEVATION });
+        RadarEngine engine(
+            g, r_lat, r_lon, r_ant_agl, r_tgt_agl, r_min_elev, r_max_elev, r_max_range, no_curvature
+        );
 
         if (r_fast) {
             if (has_sector) {
-                engine.computeFast(r_sector);
+
+                engine.computeFast(loa,roa);
             } else {
                 engine.computeFast();
             }
         } else {
             if (radar_sub->count("--output") == 0 && has_sector) {
-                r_output = "radar_sector_" + std::to_string(static_cast<int>(r_sector)) + ".svg";
+                r_output = "output/radar/radar_sector.tif";
             } else if (radar_sub->count("--output") == 0) {
-                r_output = "radar_360.svg";
+                r_output = "output/radar/radar_360.tif";
             }
 
             if (has_sector) {
-                auto res = engine.compute(r_sector);
-                engine.writeToSVG(res, r_output);
+                auto res = engine.compute(loa,roa);
+                engine.writeCoverageToGeoTIFF(res, r_output);
             } else {
                 auto res = engine.compute();
-                engine.writeToSVG(res, r_output);
+                engine.writeCoverageToGeoTIFF(res, r_output);
             }
         }
     }
@@ -261,6 +283,38 @@ int main(int argc, char** argv) {
                std::cout << "Total Distance: " << std::fixed << std::setprecision(2) << target.dist << " meters\n";
                std::cout << "Total cells : " << res.size() << "\n";
            }
+    }else if (*run) {
+        ThreadPool pool;
+        GaEngine ga(pool);
+        if (GaConf::is_available()) {
+            GaConf cfg = GaConf::load();
+            if(run_benchmark) {
+                ga.run_benchmark();
+            }else if (gen != 0) {
+                 ga.run_native_random_simulation(gen);
+            } else if (cfg.homo.is_case) {
+                // Parameters (pop, rates, weights, output) already applied in
+                // GaEngine constructor via applyConfig(); just call the runner.
+                ga.run_homogenous();
+            }
+            else if (cfg.hetero.is_case) {
+                // Fleet built inside run_heterogenous() from cfg.hetero.radars
+                ga.run_heterogenous();
+            }
+            else if (cfg.autoG.is_case) {
+                ga.setAutoOperators(SelectionMethod::TOURNAMENT,
+                                    AutoCrossoverMethod::RANDOM_SUBSET,
+                                    /*mRate=*/0.10, /*cRate=*/0.85);
+                // Fleet built inside run_auto() from cfg.autoG.radars
+                ga.run_auto();
+            }
+            else {
+                std::cerr << "[ga] Config found but no is_case flag is set — "
+                             "falling back to default homogenous run.\n";
+                ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
+                                  /*opt=*/false, /*num_top_k=*/15);
+            }
+        }
     }
     return 0;
 }
