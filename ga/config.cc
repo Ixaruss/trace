@@ -5,7 +5,7 @@
 using namespace std;
 
 bool GaConf::is_available(optional<const string> path) {
-    return filesystem::exists(path.value_or("./gaconf.json"));
+    return filesystem::exists(path.value_or("./config/gaconf.json"));
 }
 
 void parseHeteroRadarDetails(const Json::Value& node, RadarConf& r) {
@@ -14,6 +14,11 @@ void parseHeteroRadarDetails(const Json::Value& node, RadarConf& r) {
     r.minAngle = node["min-angle"].asDouble();
     r.maxAngle = node["max-angle"].asDouble();
     r.quantity = node["quantity"].asInt();
+    // "auto" radar objects carry their own "target" key (unlike "hetero",
+    // where target lives one level up and is patched in after this call).
+    // .get(..., 0) keeps this a no-op for hetero radars, which get
+    // overwritten by the hetero.target patch loop right below anyway.
+    r.target = node.get("target", 0).asInt();
 }
 
 void parseRadarArray(const Json::Value& arrayNode, std::vector<RadarConf>& list) {
@@ -33,9 +38,11 @@ GaConf from_json(const Json::Value& root) {
     config.parameters.numPopulation = root["num-population"].asInt();
     config.parameters.displaySolutions = root["display_solutions"].asInt();
     config.parameters.saveSolutions = root["save_solutions"].asInt();
+    config.parameters.overlapFactor = root["overlap-factor"].asDouble();
+    config.parameters.varianceThreshold = root["variance-threshold"].asDouble();
+    config.parameters.forgiveFactor = root["variance-threshold-forgive-factor"].asInt();
     config.parameters.save = root["save"].asBool();
     config.parameters.output = root["output"].asString();
-    config.parameters.scatterOutput = root["scatter-output"].asString();
 
     // --- Weights Sub-Object ---
     Json::Value wNode = root["weights"];
@@ -78,7 +85,7 @@ GaConf from_json(const Json::Value& root) {
 }
 
 GaConf GaConf::load(optional<const string> path) {
-    string p = path.value_or("./gaconf.json");
+    string p = path.value_or("./config/gaconf.json");
 
     ifstream f(p);
     if (!f.is_open())

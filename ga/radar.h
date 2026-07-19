@@ -27,18 +27,13 @@
 #endif
 
 #include "../common.h"   // Global, FeasibleGrid, GridPoint, RESOLUTION,
-                      // Bin::writeFeasibleGridOverlapPng
-
+#include "../operations.h"                      // Bin::writeFeasibleGridOverlapPng
 // ═══════════════════════════════════════════════════════════════════════════
 // Implementation detail — keep out of global namespace
 // ═══════════════════════════════════════════════════════════════════════════
 namespace rc_detail {
 
 // ── Physical constants ────────────────────────────────────────────────────
-constexpr double EARTH_R     = 6'371'000.0;
-constexpr double K_EFF_R     = (4.0 / 3.0) * EARTH_R;   // 4/3 earth radius
-constexpr double INV_2_KEFFR = 1.0 / (2.0 * K_EFF_R);
-constexpr double DEG2RAD     = 3.14159265358979323846 / 180.0;
 
 // ── Minimal 2-D point ────────────────────────────────────────────────────
 struct Pt { int x, y; };
@@ -195,6 +190,7 @@ inline void castRayFast(
     }
 }
 
+
 // ── Build a local mask for one radar placement ────────────────────────────
 // Peak allocation: (2R+3)² bytes — nothing grid-sized.
 inline LocalMask computeLocalMask(
@@ -271,6 +267,8 @@ inline LocalMask computeLocalMask(
     return m;  // moves the buf vector — no copy
 }
 
+
+
 }  // namespace rc_detail
 
 
@@ -300,10 +298,10 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     double                        minSpacingCells = 5.0,
     const std::string&            pngPath         = "",
 
-    double                        antennaHeight   = 50.0,    // metres AGL
-    double                        minAngle        = 0.5,     // degrees
+    double                        antennaHeight   = 10.0,    // metres AGL
+    double                        minAngle        = -5,     // degrees
     double                        target          = 1000.0,  // metres
-    double                        maxAngle        = 30.0,    // degrees
+    double                        maxAngle        = 90.0,    // degrees
     double                        rangeM          = 25000.0, // metres — was wrongly `int range = 25`
     const std::vector<RadarConf>& radarRanges = {},
     FeasibleGrid                  aoiGrid         = {}       // BY VALUE — unfiltered AOI (allCells=WITHALL); overlap computed here too, purely for the PNG
@@ -395,10 +393,11 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     // aoiGrid (all AOI cells, with overlap now computed on it) drives the picture;
     // grid (feasible-only) is passed through purely to show roads/rails/water/etc.
     if (!pngPath.empty())
-        Bin::writeFeasibleGridOverlapPng(aoiGrid, pngPath, placements, grid,
-            g.bin.flag_road, g.bin.flag_rail,
-            g.bin.flag_water_line, g.bin.flag_water_area,
-            g.bin.flag_ib, g.bin.flag_slope);
+         writeOverlapGeoTIFF(g, aoiGrid, "output/ga/overlap.tif", placements);
+    // Bin::writeFeasibleGridOverlapPng(aoiGrid, pngPath, placements, grid,
+        //     g.bin.flag_road, g.bin.flag_rail,
+        //     g.bin.flag_water_line, g.bin.flag_water_area,
+        //     g.bin.flag_ib, g.bin.flag_slope);
 
     return result;
 }

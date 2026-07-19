@@ -18,11 +18,13 @@ struct Parameters {
     int numGenerations;
     int numPopulation;
     Weights weights;
+    double overlapFactor;
     bool save;
     int displaySolutions;
+    double varianceThreshold;
+    int forgiveFactor;
     int saveSolutions;
     std::string output;
-    std::string scatterOutput;
 };
 
 struct RadarConf {
