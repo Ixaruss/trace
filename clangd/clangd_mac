@@ -1,0 +1,14 @@
+CompileFlags:
+  Add:
+    - -std=c++23
+    - -I.
+    - -I./lib
+    - -I/opt/homebrew/include
+    - -I/opt/homebrew/include/jsoncpp
+    - -I/opt/homebrew/Cellar/gdal/3.13.0/include
+
+Diagnostics:
+  UnusedIncludes: Strict
+
+Index:
+  Background: Build
