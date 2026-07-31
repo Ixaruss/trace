@@ -1,5 +1,5 @@
 {
-    "case" : 
+    "case" :
     {
         "ib" : true,
         "rails" : true,
@@ -8,14 +8,14 @@
         "waterbodies" : true,
         "waterlines" : true
     },
-    "distance" : 
+    "distance" :
     {
         "from_ib" : 1000,
         "from_rail" : 0,
         "from_road" : 0,
         "from_water" : 0
     },
-    "grid" : 
+    "grid" :
     {
         "cols" : 33242,
         "max_x" : 5977534.0136858551,
@@ -27,7 +27,7 @@
         "resolution" : 100,
         "rows" : 32166
     },
-    "input" : 
+    "input" :
     {
         "elevation" : "./preprocess/maps/alt/alt.tif",
         "ib" : "./preprocess/maps/ib/ib.shp",
@@ -36,16 +36,16 @@
         "water_area" : "./preprocess/maps/water-areas/water_areas.shp",
         "water_lines" : "./preprocess/maps/water-lines/water_lines.shp"
     },
-    "operation_area" : 
+    "operation_area" :
     [
-        28.302369630000001,
-        77.345159030000005,
+        28.557712479999999,
+        74.366416689999994,
         30.585609760000001,
         76.039734100000004,
-        28.557712479999999,
-        74.366416689999994
+        28.302369630000001,
+        77.345159030000005
     ],
-    "output" : 
+    "output" :
     {
         "elevation_file" : "./bin/elev.bin",
         "feasible" : "./bin/feasible.bin",
