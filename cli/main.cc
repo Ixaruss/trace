@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
     double loa = 0;
     double roa = 90;
     bool has_sector = false;
+    bool png = false, svg = false, tiff = false;
     std::string vs_output = "output/viewshed/viewshed.svg";
 
     viewshed_sub->add_option("--lat", vs_lat, "Latitude of the origin")->required();
@@ -46,9 +47,15 @@ int main(int argc, char** argv) {
     viewshed_sub->add_flag("-s", has_sector, "Use sector");
     viewshed_sub->add_option("--loa", loa, "Left of arc (degrees)");
     viewshed_sub->add_option("--roa", roa, "Right of arc (degrees)");
+
     bool no_curvature = false;
     viewshed_sub->add_flag("--use-curvature", no_curvature, "use earth curvature corrections");
 
+    auto vg = viewshed_sub->add_option_group("output formats available");
+    vg->add_flag("--tif", tiff,"geotagged tiff");
+    vg->add_flag("--svg",svg, "svg vector");
+    vg->add_flag("--png", png, "png image (default)");
+    vg->require_option(1);
     auto radar_sub = app.add_subcommand("radar", "Calculate radar profile coverage.");
 
     double r_lat = 33.9871;
@@ -77,6 +84,11 @@ int main(int argc, char** argv) {
     radar_sub->add_flag("-f,--fast", r_fast, "Execute calculation in fast mode (without image)");
     radar_sub->add_flag("--use-curvature", no_curvature, "use earth curvature corrections");
     auto rlos_sub = app.add_subcommand("rlos", "Calculate radar Line of Sight (LOS) between a source and a target.");
+    auto rg = radar_sub->add_option_group("output formats available");
+    rg->add_flag("--tif", tiff,"geotagged tiff");
+    rg->add_flag("--svg",svg, "svg vector");
+    rg->add_flag("--png", png, "png image (default)");
+    rg->require_option(1);
 
     double srcLat = 34.017346;
     double srcLon = 74.50587999;
@@ -113,7 +125,10 @@ int main(int argc, char** argv) {
     auto run  = app.add_subcommand("run", "run ga cases via config");
     int gen = 0;
     bool run_benchmark = false;
+    int reduction_factor = 50;
      run->add_option("-g,--gen-simdata",gen, "write simulation for top k solutions for ga");
+     run->add_option("--reduce",reduction_factor, "reduction percentage for output resolution quality");
+     run-> add_flag("--png", png,"write output as png as well");
      run->add_flag("-b, --run-benchmark", run_benchmark, "create benchamrk table for all selection, mutation and crossover methods");
     try {
         app.parse(argc, argv);
@@ -129,20 +144,39 @@ int main(int argc, char** argv) {
         auto engine = std::make_unique<ViewshedEngine>(
             g, vs_lat, vs_lon, vs_range, vs_ant_height, vs_curvature
         );
+        string output_ext;
+        if(tiff){
+            output_ext = ".tiff";
+        }else if(svg) {
+            output_ext = ".svg";
+        } else {
+            output_ext = ".png";
+        }
         if (viewshed_sub->count("--output") == 0 && has_sector) {
-            vs_output = "output/viewshed/viewshed_sector.tif";
+            vs_output = "output/viewshed/viewshed_sector" + output_ext;
         } else if (viewshed_sub->count("--output") == 0) {
-            vs_output = "output/viewshed/viewshed_360.tif";
+            vs_output = "output/viewshed/viewshed_360" + output_ext;
         }
          if (has_sector) {
              engine->computeViewshed(loa,roa);
-             engine->writeViewshedToGeoTIFF(vs_output);
+             if(tiff){
+                  engine->writeViewshedToGeoTIFF(vs_output,50);
+             }else if(svg) {
+                  engine->writeViewshedToSVG(vs_output);
+             } else {
+                 engine->writeViewshedToPNG(vs_output);
+             }
          } else {
              engine->computeViewshed();
-             engine->writeViewshedToGeoTIFF(vs_output);
+             cout << "writing: " << vs_output <<endl;
+             if(tiff){
+                  engine->writeViewshedToGeoTIFF(vs_output,50);
+             }else if(svg) {
+                  engine->writeViewshedToSVG(vs_output);
+             } else {
+                 engine->writeViewshedToPNG(vs_output);
+             }
          }
-
-
     }
 
     // Route 2: Execution for Radar
@@ -153,7 +187,14 @@ int main(int argc, char** argv) {
         RadarEngine engine(
             g, r_lat, r_lon, r_ant_agl, r_tgt_agl, r_min_elev, r_max_elev, r_max_range, no_curvature
         );
-
+        string output_ext;
+        if(tiff){
+            output_ext = ".tiff";
+        }else if(svg) {
+            output_ext = ".svg";
+        } else {
+            output_ext = ".png";
+        }
         if (r_fast) {
             if (has_sector) {
 
@@ -163,17 +204,30 @@ int main(int argc, char** argv) {
             }
         } else {
             if (radar_sub->count("--output") == 0 && has_sector) {
-                r_output = "output/radar/radar_sector.tif";
+                r_output = "output/radar/radar_sector" +  output_ext;
             } else if (radar_sub->count("--output") == 0) {
-                r_output = "output/radar/radar_360.tif";
+                r_output = "output/radar/radar_360" + output_ext;
             }
 
             if (has_sector) {
                 auto res = engine.compute(loa,roa);
-                engine.writeCoverageToGeoTIFF(res, r_output);
+                if(tiff){
+                     engine.writeCoverageToGeoTIFF(res,r_output,50);
+                }else if(svg) {
+                     engine.writeToSVG(res,r_output);
+                } else {
+                    engine.writeToPNG(res,r_output);
+                }
             } else {
                 auto res = engine.compute();
-                engine.writeCoverageToGeoTIFF(res, r_output);
+                cout << "writing: " << r_output <<endl;
+                if(tiff){
+                     engine.writeCoverageToGeoTIFF(res,r_output,50);
+                }else if(svg) {
+                     engine.writeToSVG(res,r_output);
+                } else {
+                    engine.writeToPNG(res,r_output);
+                }
             }
         }
     }
@@ -295,18 +349,18 @@ int main(int argc, char** argv) {
             } else if (cfg.homo.is_case) {
                 // Parameters (pop, rates, weights, output) already applied in
                 // GaEngine constructor via applyConfig(); just call the runner.
-                ga.run_homogenous();
+                ga.run_homogenous(reduction_factor, png);
             }
             else if (cfg.hetero.is_case) {
                 // Fleet built inside run_heterogenous() from cfg.hetero.radars
-                ga.run_heterogenous();
+                ga.run_heterogenous(reduction_factor, png);
             }
             else if (cfg.autoG.is_case) {
                 ga.setAutoOperators(SelectionMethod::TOURNAMENT,
                                     AutoCrossoverMethod::RANDOM_SUBSET,
                                     /*mRate=*/0.10, /*cRate=*/0.85);
                 // Fleet built inside run_auto() from cfg.autoG.radars
-                ga.run_auto();
+                ga.run_auto(reduction_factor, png);
             }
             else {
                 std::cerr << "[ga] Config found but no is_case flag is set — "
