@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstdio>
+#include <experimental/filesystem>
 #include <filesystem>
 #include <png.h>
 #include "bin.h"
@@ -524,4 +525,16 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         cout<< "total cells: " << total <<endl;
         cout<< "feasible cells: " << feasible << "i.e. " << ((double)feasible / total) * 100 << "%" <<endl;
         cout << "\n>>> Completed All Tasks Succesfully..\n";
+    }
+
+    void init_prequisites (){
+        filesystem::create_directories("./output/ga");
+        filesystem::create_directories("./output/heatmap");
+        filesystem::create_directories("./output/radar");
+        filesystem::create_directories("./output/viewshed");
+        filesystem::create_directories("./output/path");
+        filesystem::create_directories("./output/pso");
+        filesystem::create_directories("./output/radarfdr");
+        filesystem::create_directories("./output/simdata");
+        filesystem::create_directories("./output/gbadws");
     }

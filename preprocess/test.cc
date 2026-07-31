@@ -54,8 +54,7 @@ int main() {
     g.bin.init();
     // int x,y;
     // g.bin.getGridCoords(33.9871, 74.7742,x,y);
-    cout << g.bin.getElevation(12.97, 77.59)<< endl;
-    // RadarEngine::get_coverage_reverse(g, x,y,50,1000,0.5,30,300000, "./output/radar/fdr.png");
+    RadarEngine::get_coverage_reverse(g, 33.9871, 74.7742,50,1000,0.5,30,300000,"./output/radar/new-fdr.tif", "./output/radar/new-fdr.png");
     // Bin::getonlyFeasibleGrid(b); // output: feasible.bin in root folder based on constraints defined for PSO
     // Bin::write_heatmap_bin_h5(); // withall option for all cells without feasibility check for heatmap : output aoi_cells.h5 in root folder
     return 0;
