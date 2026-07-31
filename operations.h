@@ -245,7 +245,7 @@ public:
     public: void writeViewshedToSVG(const std::string& filename);
     public: void writeViewshedToPNG(const std::string& filename);
     public: static std::string base64Encode(const uint8_t* data, size_t length);
-    public: void writeViewshedToGeoTIFF(const std::string& filename);
+    public: void writeViewshedToGeoTIFF(const std::string& filename,int reductionPercent);
 
 };
 
@@ -409,9 +409,9 @@ public:
         double   minElevDeg, double maxElevDeg,
         double   maxRangeKM);
 
-    void writeFastToGeoTIFF(const std::vector<uint8_t>& fastMask, const std::string& filename);
+    void writeFastToGeoTIFF(const std::vector<uint8_t>& fastMask, const std::string& filename,int reductionPercent);
 
-    void writeCoverageToGeoTIFF(const RadarCoverageResult& res, const std::string& filename);
+    void writeCoverageToGeoTIFF(const RadarCoverageResult& res, const std::string& filename,int reductionPercent);
 
     inline static void printLOSResult(const RadarLOSResult& r,
                                double srcLat, double srcLon,
@@ -437,21 +437,25 @@ public:
         std::cout << "======================================\n";
     }
     static std::vector<GridPoint> get_coverage_reverse(
-       Global&              g,
-       int                  srcRow,
-       int                  srcCol,
-       double               antennaHeight = 50.0,
-       double               targetH       = 1000.0,
-       double               minAngle      = 0.5,
-       double               maxAngle      = 30.0,
-       double               maxRangeM     = 25000.0,
-       const std::string&   pngPath       = "");
+        Global&              g,
+        double                  srcLat,
+        double                  srcLon,
+        double               antennaHeight,
+        double               targetH,
+        double               minAngle,
+        double               maxAngle,
+        double               maxRangeM,
+        const std::string&   tifPath = "",
+        const std::string&   pngPath = "",
+        int reduction = 50);
 };
 
 bool writeOverlapGeoTIFF(
     Global&                        g,
     const FeasibleGrid&            aoiGrid,
     const std::string&             filename,
-    const std::vector<GridPoint>&  placements = {});
+    const std::vector<GridPoint>&  placements,
+    int                            reductionPercent);
+
 
 #endif

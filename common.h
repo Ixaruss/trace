@@ -11,8 +11,6 @@
     // Windows (MSVC or MinGW)
     #define fseek64 _fseeki64
     #define ftell64 _ftelli64
-    public: static std::vector<std::vector<LOSResult>> lineOfVisibilityBatch(const std::vector<LOSQuery>& queries, int numThreads = 0);  // 0 = auto detect
-
     typedef __int64 off64_t;
 #elif defined(__unix__) || defined(__APPLE__) || defined(__linux__)
     // POSIX systems

@@ -27,13 +27,32 @@
  * Rows are streamed one at a time rather than building full-grid RGBA
  * buffers up front — this grid is ~1.07 billion cells, so 4 full-size
  * planes would mean ~4 GB of extra pixel-data memory alone.
+ *
+ * DOWNSAMPLING (reductionPercent): every writer takes an optional
+ * `reductionPercent` in [0, 100]. 0 (the default) writes at native
+ * resolution; 50 halves the pixel count along EACH axis (so ~1/4 the
+ * total pixels); 90 leaves a tenth of the cells per side. The
+ * geographic extent is always preserved exactly — the output has
+ * fewer, proportionally larger pixels covering the same ground, and
+ * the geotransform's pixel size is scaled to match. Nothing shifts,
+ * so a reduced raster still lines up with a full-resolution one.
+ *
+ * WINDOWED RASTERS: writeOverlapGeoTIFF and the two reverse-raycast
+ * writers emit only their own sub-window of the DEM grid (the AOI's
+ * AABB, or the mask's rowMin/colMin box) rather than the full grid.
+ * The geotransform origin is shifted by that window's row/col offset,
+ * so these still overlay the full-grid products correctly.
  */
 
 #include "operations.h"
+#include "common/radarfdr.h"
 
 #include <gdal_priv.h>
 #include <ogr_spatialref.h>
 #include <cpl_string.h>
+
+#include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -64,22 +83,42 @@ constexpr const char* EPSG_7755_WKT_FALLBACK =
     "AXIS[\"Northing\",NORTH],"
     "AUTHORITY[\"EPSG\",\"7755\"]]";
 
-std::string epsg7755Wkt()
+// Builds EPSG:7755 into `srs`. Returns false if neither PROJ nor the
+// bundled WKT yields a usable CRS -- the caller must not then pretend
+// the raster got georeferenced.
+bool epsg7755Srs(OGRSpatialReference& srs)
 {
-    OGRSpatialReference srs;
     srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
 
-    if (srs.importFromEPSG(7755) == OGRERR_NONE) {
-        char* wkt = nullptr;
-        srs.exportToWkt(&wkt);
-        std::string result(wkt ? wkt : "");
-        CPLFree(wkt);
-        if (!result.empty()) return result;
-    }
+    if (srs.importFromEPSG(7755) == OGRERR_NONE) return true;
 
-    std::cerr << "[WARN] PROJ database missing EPSG:7755, "
-                 "using bundled WKT fallback\n";
-    return EPSG_7755_WKT_FALLBACK;
+    std::cerr << "[WARN] PROJ could not resolve EPSG:7755 (proj.db missing, "
+                 "unset PROJ_LIB/PROJ_DATA, or too old a PROJ) -- "
+                 "trying bundled WKT\n";
+
+    srs.Clear();
+    srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    if (srs.importFromWkt(EPSG_7755_WKT_FALLBACK) == OGRERR_NONE) return true;
+
+    std::cerr << "[ERROR] Bundled EPSG:7755 WKT also failed to parse -- "
+                 "raster will be written WITHOUT a CRS\n";
+    return false;
+}
+
+// Applies geotransform + CRS, reporting each failure rather than
+// letting an untagged raster out the door silently.
+void applyGeoreferencing(GDALDataset* ds, const double gt[6],
+                         const std::string& filename)
+{
+    if (ds->SetGeoTransform(const_cast<double*>(gt)) != CE_None)
+        std::cerr << "[ERROR] SetGeoTransform failed for " << filename << "\n";
+
+    OGRSpatialReference srs;
+    if (epsg7755Srs(srs)) {
+        if (ds->SetSpatialRef(&srs) != CE_None)
+            std::cerr << "[ERROR] SetSpatialRef failed for " << filename
+                      << " -- output will not be georeferenced\n";
+    }
 }
 
 struct RGBA { uint8_t r, g, b, a; };
@@ -95,14 +134,78 @@ RGBA overlapColorAlpha(int overlap, uint8_t alpha)
         default: return {139, 0,   0,   alpha};  // dark red, 5+
     }
 }
+
+// ======================================================================
+// Downsampling helpers
+// ======================================================================
+
+// Validate + clamp the caller's percentage. Out-of-range is a caller
+// bug, so it's loud, but we don't fail the export over it.
+int clampReduction(int reductionPercent, const char* who)
+{
+    if (reductionPercent < 0 || reductionPercent > 100) {
+        std::cerr << "[WARN] " << who << ": reductionPercent "
+                  << reductionPercent
+                  << " outside [0,100], clamping\n";
+        reductionPercent = std::min(100, std::max(0, reductionPercent));
+    }
+    return reductionPercent;
+}
+
+// Output pixel count along one axis. 0% -> unchanged, 50% -> half,
+// 100% -> would be zero, so we floor at 1 px (a 100% reduction is
+// degenerate but shouldn't produce an invalid dataset).
+int reducedDim(int n, int reductionPercent)
+{
+    if (reductionPercent <= 0) return n;
+    const double scale = (100.0 - reductionPercent) / 100.0;
+    int out = static_cast<int>(std::lround(n * scale));
+    return std::min(n, std::max(1, out));
+}
+
+// Half-open source index range [lo, hi) that output index `outIdx`
+// aggregates over. The blocks exactly tile the source extent with no
+// gaps or overlap even when outN doesn't divide srcN evenly, so no
+// source cell is silently dropped and none is counted twice.
+inline void srcSpan(int outIdx, int outN, int srcN, int& lo, int& hi)
+{
+    lo = static_cast<int>((static_cast<long long>(outIdx)     * srcN) / outN);
+    hi = static_cast<int>((static_cast<long long>(outIdx) + 1) * srcN / outN);
+    if (hi <= lo) hi = lo + 1;
+    if (hi > srcN) hi = srcN;
+}
+
+// Map a source row/col onto the reduced grid (used to keep placement
+// markers on the right cell after downsampling).
+inline int scaleIndex(int idx, int srcN, int outN)
+{
+    if (idx < 0) return -1;
+    int out = static_cast<int>((static_cast<long long>(idx) * outN) / srcN);
+    return std::min(outN - 1, std::max(0, out));
+}
+
 // ----------------------------------------------------------------------
 // Core writer: 4-band (R,G,B,A) Byte GeoTIFF, LZW-compressed.
 //
 // `src` is a single-band classification buffer (cols*rows bytes,
-// row-major, row 0 = north/top). Each cell's color is chosen by
-// `coveredColor` if src[i] == coveredValue, else `otherColor` — this
-// keeps the caller's "just show me the covered footprint" semantics
-// with no per-status enumeration needed.
+// row-major, row 0 = north/top). Two coloring modes:
+//
+//   palette == nullptr  -- each cell is `coveredColor` if it equals
+//       coveredValue, else `otherColor`. Downsampling rule: a block is
+//       covered if ANY source cell in it is. Used by the status/mask
+//       writers, where the non-covered values are unordered enum tags
+//       and taking a max over them would be meaningless.
+//
+//   palette != nullptr  -- 256-entry lookup, cell value indexes it
+//       directly. Downsampling rule: MAX value in the block wins, so
+//       higher palette indices are drawn on top when cells collide.
+//       coveredValue/coveredColor/otherColor are ignored in this mode.
+//
+// `reductionPercent` (0-100, 0 = native) shrinks the raster by that
+// percentage along each axis. Neither rule is nearest-neighbour or
+// majority, both of which erase single-cell slivers and thin ridgeline
+// coverage -- exactly the detail worth keeping when you're zoomed out
+// far enough to need a reduced raster in the first place.
 // ----------------------------------------------------------------------
 bool writeRGBAGeoTIFF(
     const std::string& filename,
@@ -115,13 +218,25 @@ bool writeRGBAGeoTIFF(
     double                 originX,
     double                 originY,
     double                 resolution,
-    int                    markerRow = -1,       // -1 = no marker
+    int                    reductionPercent = 0,  // 0-100, 0 = full res
+    int                    markerRow = -1,        // -1 = no marker
     int                    markerCol = -1,
     int                    markerRadiusCells = 8,
     RGBA                   markerColor = {255, 0, 0, 255},
     RGBA                   markerRingColor = {255, 255, 255, 255},
-    int                    markerRingThicknessCells = 2)
+    int                    markerRingThicknessCells = 2,
+    const RGBA*            palette = nullptr)     // 256 entries, or null
 {
+    if (cols <= 0 || rows <= 0) {
+        std::cerr << "[ERROR] Invalid raster dimensions "
+                  << cols << " x " << rows << " for " << filename << "\n";
+        return false;
+    }
+
+    reductionPercent = clampReduction(reductionPercent, "writeRGBAGeoTIFF");
+    const int outCols = reducedDim(cols, reductionPercent);
+    const int outRows = reducedDim(rows, reductionPercent);
+
     GDALAllRegister();
 
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("GTiff");
@@ -138,7 +253,7 @@ bool writeRGBAGeoTIFF(
     opts = CSLSetNameValue(opts, "PHOTOMETRIC","RGB");
 
     GDALDataset* ds = driver->Create(
-        filename.c_str(), cols, rows, /*bands=*/4, GDT_Byte, opts);
+        filename.c_str(), outCols, outRows, /*bands=*/4, GDT_Byte, opts);
     CSLDestroy(opts);
 
     if (!ds) {
@@ -146,12 +261,17 @@ bool writeRGBAGeoTIFF(
         return false;
     }
 
-    double gt[6] = {
-        originX, resolution, 0.0,
-        originY, 0.0,        -resolution
+    // Same top-left corner, same total ground extent — only the pixel
+    // size grows. Derived from the ACTUAL dimension ratio rather than
+    // the requested percentage, since reducedDim() rounds.
+    const double pixelW = resolution * static_cast<double>(cols) / outCols;
+    const double pixelH = resolution * static_cast<double>(rows) / outRows;
+
+    const double gt[6] = {
+        originX, pixelW, 0.0,
+        originY, 0.0,    -pixelH
     };
-    ds->SetGeoTransform(gt);
-    ds->SetProjection(epsg7755Wkt().c_str());
+    applyGeoreferencing(ds, gt, filename);
 
     GDALRasterBand* rBand = ds->GetRasterBand(1);
     GDALRasterBand* gBand = ds->GetRasterBand(2);
@@ -162,30 +282,67 @@ bool writeRGBAGeoTIFF(
     bBand->SetColorInterpretation(GCI_BlueBand);
     aBand->SetColorInterpretation(GCI_AlphaBand);
 
-    const bool hasMarker = (markerRow >= 0 && markerCol >= 0);
+    // Marker geometry lives in OUTPUT pixel space: only the center is
+    // rescaled, the radius stays put, so the marker keeps the same
+    // on-screen size instead of shrinking away with the raster.
+    const bool hasMarker = (markerRow >= 0 && markerCol >= 0 &&
+                            markerRow < rows && markerCol < cols);
+    const int outMarkerRow = hasMarker ? scaleIndex(markerRow, rows, outRows) : -1;
+    const int outMarkerCol = hasMarker ? scaleIndex(markerCol, cols, outCols) : -1;
+
     const long long outerRSq = (long long)markerRadiusCells * markerRadiusCells;
     const long long innerRSq = (long long)(markerRadiusCells - markerRingThicknessCells)
                               * (markerRadiusCells - markerRingThicknessCells);
 
-    // Bounded to O(cols) per iteration -- one scanline of each band at a
-    // time, not the full W*H*4 image at once.
-    std::vector<uint8_t> rowR(cols), rowG(cols), rowB(cols), rowA(cols);
+    // Column blocks are identical for every row, so resolve them once
+    // instead of redoing the integer math per pixel.
+    std::vector<int> colLo(outCols), colHi(outCols);
+    for (int x = 0; x < outCols; ++x)
+        srcSpan(x, outCols, cols, colLo[x], colHi[x]);
+
+    // Bounded to O(outCols) per iteration -- one scanline of each band
+    // at a time, not the full W*H*4 image at once.
+    std::vector<uint8_t> rowR(outCols), rowG(outCols), rowB(outCols), rowA(outCols);
 
     bool ok = true;
-    for (int y = 0; y < rows && ok; ++y) {
-        const uint8_t* srcRow = src + static_cast<size_t>(y) * cols;
+    for (int y = 0; y < outRows && ok; ++y) {
+        int sy0, sy1;
+        srcSpan(y, outRows, rows, sy0, sy1);
 
         // Skip the marker distance-check entirely for rows far from it --
         // this loop still runs once per row regardless, so keep the
         // common (non-marker) case cheap.
         const bool rowNearMarker = hasMarker &&
-            std::abs(y - markerRow) <= markerRadiusCells;
+            std::abs(y - outMarkerRow) <= markerRadiusCells;
 
-        for (int x = 0; x < cols; ++x) {
-            RGBA c = (srcRow[x] == coveredValue) ? coveredColor : otherColor;
+        for (int x = 0; x < outCols; ++x) {
+            RGBA c;
+
+            if (palette) {
+                // Highest value in the block wins, so break-point dots
+                // survive on top of the segments they sit on.
+                uint8_t best = 0;
+                for (int sy = sy0; sy < sy1; ++sy) {
+                    const uint8_t* srcRow = src + static_cast<size_t>(sy) * cols;
+                    for (int sx = colLo[x]; sx < colHi[x]; ++sx)
+                        if (srcRow[sx] > best) best = srcRow[sx];
+                }
+                c = palette[best];
+            } else {
+                // "Any covered cell in the block wins." Degenerates to a
+                // plain lookup when the block is 1x1 (reduction = 0).
+                bool covered = false;
+                for (int sy = sy0; sy < sy1 && !covered; ++sy) {
+                    const uint8_t* srcRow = src + static_cast<size_t>(sy) * cols;
+                    for (int sx = colLo[x]; sx < colHi[x]; ++sx) {
+                        if (srcRow[sx] == coveredValue) { covered = true; break; }
+                    }
+                }
+                c = covered ? coveredColor : otherColor;
+            }
 
             if (rowNearMarker) {
-                long long dx = x - markerCol, dy = y - markerRow;
+                long long dx = x - outMarkerCol, dy = y - outMarkerRow;
                 long long distSq = dx * dx + dy * dy;
                 if (distSq <= outerRSq)
                     c = (distSq >= innerRSq) ? markerRingColor : markerColor;
@@ -193,10 +350,10 @@ bool writeRGBAGeoTIFF(
 
             rowR[x] = c.r; rowG[x] = c.g; rowB[x] = c.b; rowA[x] = c.a;
         }
-        ok = ok && rBand->RasterIO(GF_Write, 0, y, cols, 1, rowR.data(), cols, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && gBand->RasterIO(GF_Write, 0, y, cols, 1, rowG.data(), cols, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && bBand->RasterIO(GF_Write, 0, y, cols, 1, rowB.data(), cols, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && aBand->RasterIO(GF_Write, 0, y, cols, 1, rowA.data(), cols, 1, GDT_Byte, 0, 0) == CE_None;
+        ok = ok && rBand->RasterIO(GF_Write, 0, y, outCols, 1, rowR.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+        ok = ok && gBand->RasterIO(GF_Write, 0, y, outCols, 1, rowG.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+        ok = ok && bBand->RasterIO(GF_Write, 0, y, outCols, 1, rowB.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+        ok = ok && aBand->RasterIO(GF_Write, 0, y, outCols, 1, rowA.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
     }
 
     GDALClose(ds);
@@ -207,7 +364,12 @@ bool writeRGBAGeoTIFF(
     }
 
     std::cout << "[INFO]   Wrote GeoTIFF: " << filename
-              << " (" << cols << " x " << rows << ", RGBA)\n";
+              << " (" << outCols << " x " << outRows << ", RGBA";
+    if (reductionPercent > 0)
+        std::cout << ", reduced " << reductionPercent << "% from "
+                  << cols << " x " << rows
+                  << ", pixel " << pixelW << "m";
+    std::cout << ")\n";
     return true;
 }
 
@@ -217,12 +379,21 @@ bool writeRGBAGeoTIFF(
 constexpr RGBA GREEN       { 0, 200, 0, 160 };
 constexpr RGBA TRANSPARENT { 0,   0, 0,   0 };
 
+// Reverse-raycast palette, mirroring writeReverseBreakPointsPng's
+// colors: green covered segments, red break-point dots on top. Higher
+// index wins under downsampling, so the dots never get averaged away.
+constexpr uint8_t V_EMPTY      = 0;
+constexpr uint8_t V_SEGMENT    = 1;
+constexpr uint8_t V_BREAKPOINT = 2;
+constexpr RGBA    BREAK_DOT { 220, 30, 30, 255 };
+
 } // namespace
 
 // ----------------------------------------------------------------------
 // ViewshedEngine — binary mask (0 = not visible, 1 = visible)
 // ----------------------------------------------------------------------
-void ViewshedEngine::writeViewshedToGeoTIFF(const std::string& filename)
+void ViewshedEngine::writeViewshedToGeoTIFF(
+    const std::string& filename, int reductionPercent)
 {
     writeRGBAGeoTIFF(
         filename,
@@ -232,6 +403,7 @@ void ViewshedEngine::writeViewshedToGeoTIFF(const std::string& filename)
         static_cast<double>(g.conf.grid.origin_x),
         static_cast<double>(g.conf.grid.origin_y),
         static_cast<double>(RESOLUTION),
+        reductionPercent,
         /*markerRow=*/centerX, /*markerCol=*/centerY);
 }
 
@@ -243,7 +415,8 @@ void ViewshedEngine::writeViewshedToGeoTIFF(const std::string& filename)
 // are shown; every other status (masked, out of range/sector, beyond
 // horizon, etc.) is fully transparent.
 void RadarEngine::writeCoverageToGeoTIFF(
-    const RadarCoverageResult& res, const std::string& filename)
+    const RadarCoverageResult& res, const std::string& filename,
+    int reductionPercent)
 {
     static_assert(sizeof(CoverageStatus) == sizeof(uint8_t),
         "CoverageStatus must be byte-sized for the reinterpret_cast below "
@@ -258,12 +431,14 @@ void RadarEngine::writeCoverageToGeoTIFF(
         static_cast<double>(g.conf.grid.origin_x),
         static_cast<double>(g.conf.grid.origin_y),
         static_cast<double>(RESOLUTION),
+        reductionPercent,
         /*markerRow=*/res.srcRow, /*markerCol=*/res.srcCol);
 }
 
 // Binary fast-mode result (0/1 covered mask) from computeFast().
 void RadarEngine::writeFastToGeoTIFF(
-    const std::vector<uint8_t>& fastMask, const std::string& filename)
+    const std::vector<uint8_t>& fastMask, const std::string& filename,
+    int reductionPercent)
 {
     writeRGBAGeoTIFF(
         filename,
@@ -273,14 +448,253 @@ void RadarEngine::writeFastToGeoTIFF(
         static_cast<double>(g.conf.grid.origin_x),
         static_cast<double>(g.conf.grid.origin_y),
         static_cast<double>(RESOLUTION),
+        reductionPercent,
         /*markerRow=*/srcRow, /*markerCol=*/srcCol);
 }
+
+// ======================================================================
+// Reverse ray cast (castRayReverse / get_coverage_reverse) exports
+// ======================================================================
+//
+// Both of these emit a WINDOWED raster: only the [rowMin,rowMax) x
+// [colMin,colMax) box the rays were cast across, not the full DEM grid.
+// The geotransform origin is offset by that box's row/col so the result
+// still registers against the full-grid products -- same convention as
+// writeOverlapGeoTIFF.
+// ----------------------------------------------------------------------
+
+// LocalMask straight out of computeLocalMaskReverse: 0/1 covered, laid
+// out over the mask's own window, row 0 = mask.rowMin = north.
+// srcRow/srcCol are FULL-GRID coords (the radar site); pass -1 for both
+// to omit the site marker.
+bool writeReverseMaskGeoTIFF(
+    Global&                     g,
+    const rc_detail::LocalMask& mask,
+    int                         srcRow,
+    int                         srcCol,
+    const std::string&          filename,
+    int                         reductionPercent)
+{
+    const int cols = mask.localCols;
+    const int rows = mask.rowMax - mask.rowMin;
+
+    if (cols <= 0 || rows <= 0) {
+        std::cerr << "[reverse-tif] FAIL: invalid mask window "
+                  << cols << " x " << rows << "\n";
+        return false;
+    }
+    if (mask.buf.size() != static_cast<size_t>(rows) * cols) {
+        std::cerr << "[reverse-tif] FAIL: mask buffer is "
+                  << mask.buf.size() << " bytes but the window implies "
+                  << static_cast<size_t>(rows) * cols
+                  << " -- rowMin/rowMax/localCols disagree with buf\n";
+        return false;
+    }
+
+    // Window origin = full-grid origin shifted by the mask's own offset.
+    const double originX = static_cast<double>(g.conf.grid.origin_x)
+                          + static_cast<double>(mask.colMin) * RESOLUTION;
+    const double originY = static_cast<double>(g.conf.grid.origin_y)
+                          - static_cast<double>(mask.rowMin) * RESOLUTION;
+
+    // Site marker in window-local pixels. Guarded rather than assumed:
+    // a clamped R can pull the window in, and a marker outside it would
+    // otherwise get snapped onto an edge pixel and quietly lie.
+    int markerRow = -1, markerCol = -1;
+    if (srcRow >= 0 && srcCol >= 0) {
+        const int lr = srcRow - mask.rowMin;
+        const int lc = srcCol - mask.colMin;
+        if (lr >= 0 && lr < rows && lc >= 0 && lc < cols) {
+            markerRow = lr;
+            markerCol = lc;
+        } else {
+            std::cerr << "[reverse-tif] WARN: source (" << srcRow << ","
+                      << srcCol << ") is outside the mask window -- "
+                         "marker omitted\n";
+        }
+    }
+
+    return writeRGBAGeoTIFF(
+        filename,
+        mask.buf.data(),
+        /*coveredValue=*/1, GREEN, TRANSPARENT,
+        cols, rows,
+        originX, originY,
+        static_cast<double>(RESOLUTION),
+        reductionPercent,
+        markerRow, markerCol);
+}
+
+// Break points from get_coverage_reverse, rendered the same way
+// Bin::writeReverseBreakPointsPng renders them: a green SEGMENT from
+// the source out to each break point, with a red dot at the break
+// point itself.
+//
+// The segments are what make the footprint solid. A break point is one
+// cell out of ~28 million, so stamping only the points gives you a
+// visually empty raster -- the filled blob you see in the PNG comes
+// entirely from the source->breakpoint lines.
+//
+// The Bresenham stepping rule here is character-for-character the one
+// in castRayReverse's path walk and in the PNG renderer, so the three
+// agree on which cells a given ray touches.
+//
+// NOTE ON SEMANTICS: this fills every cell from the source up to and
+// including the break point, matching what castRayReverse itself writes
+// into its mask. Cells that are shadowed but nearer than the farthest
+// visible cell are therefore drawn as covered. That's the existing
+// definition of this product, not a rendering artifact -- if you want
+// strictly-visible cells only, that's computeLocalMaskReverse's mask
+// via writeReverseMaskGeoTIFF, which is a different (and slower) thing.
+//
+// Window args mirror writeReverseBreakPointsPng's, so the call site can
+// hand both the same numbers:
+//   (winRowMin, winColMin, winCols, winRows, srcRow, srcCol, breakPoints)
+bool writeReverseBreakPointsGeoTIFF(
+    Global&                       g,
+    const std::string&            filename,
+    int                           winRowMin,
+    int                           winColMin,
+    int                           winCols,
+    int                           winRows,
+    int                           srcRow,
+    int                           srcCol,
+    const std::vector<GridPoint>& breakPoints,
+    int                           reductionPercent,
+    int                           dotRadiusCells,
+    bool                          fillToBreakPoints)
+{
+    if (winCols <= 0 || winRows <= 0) {
+        std::cerr << "[breakpoint-tif] FAIL: invalid window "
+                  << winCols << " x " << winRows << "\n";
+        return false;
+    }
+    if (dotRadiusCells < 0) dotRadiusCells = 0;
+
+    if (breakPoints.empty())
+        std::cerr << "[breakpoint-tif] WARN: no break points -- writing an "
+                     "empty raster with just the source marker\n";
+
+    // Single-band stamp buffer over the window (1 byte/cell -- the same
+    // footprint LocalMask would take for the same R).
+    std::vector<uint8_t> buf(static_cast<size_t>(winRows) * winCols, V_EMPTY);
+
+    const int localSrcR = srcRow - winRowMin;
+    const int localSrcC = srcCol - winColMin;
+    const bool srcInWindow =
+        (localSrcR >= 0 && localSrcR < winRows &&
+         localSrcC >= 0 && localSrcC < winCols);
+
+    if (!srcInWindow)
+        std::cerr << "[breakpoint-tif] WARN: source (" << srcRow << ","
+                  << srcCol << ") is outside the window -- segments and "
+                     "marker omitted\n";
+
+    // Highest value wins on collision, so a break-point dot is never
+    // overwritten by a segment from a neighbouring ray.
+    auto stamp = [&](int lr, int lc, uint8_t v) {
+        if ((unsigned)lr >= (unsigned)winRows ||
+            (unsigned)lc >= (unsigned)winCols) return;
+        uint8_t& dst = buf[static_cast<size_t>(lr) * winCols + lc];
+        if (v > dst) dst = v;
+    };
+
+    // Same stepping rule as castRayReverse's path walk.
+    auto drawSegment = [&](int r0, int c0, int r1, int c1) {
+        const int adr = std::abs(r1 - r0), adc = std::abs(c1 - c0);
+        const int sr  = (r0 < r1) ? 1 : -1;
+        const int sc  = (c0 < c1) ? 1 : -1;
+        int err = adr - adc;
+        int row = r0, col = c0;
+        while (true) {
+            stamp(row, col, V_SEGMENT);
+            if (row == r1 && col == c1) break;
+            const int e2 = 2 * err;
+            if (e2 > -adc) { err -= adc; row += sr; }
+            if (e2 <  adr) { err += adr; col += sc; }
+        }
+    };
+
+    const long long dotRSq =
+        static_cast<long long>(dotRadiusCells) * dotRadiusCells;
+
+    int skipped = 0;
+    for (const auto& p : breakPoints) {
+        const int lr = p.r - winRowMin;
+        const int lc = p.c - winColMin;
+        if (lr < 0 || lr >= winRows || lc < 0 || lc >= winCols) { ++skipped; continue; }
+
+        // 1. Covered segment, source -> break point. This is the fill.
+        if (fillToBreakPoints && srcInWindow)
+            drawSegment(localSrcR, localSrcC, lr, lc);
+
+        // 2. Break-point dot on top.
+        const int yLo = std::max(0,           lr - dotRadiusCells);
+        const int yHi = std::min(winRows - 1, lr + dotRadiusCells);
+        const int xLo = std::max(0,           lc - dotRadiusCells);
+        const int xHi = std::min(winCols - 1, lc + dotRadiusCells);
+
+        for (int y = yLo; y <= yHi; ++y) {
+            const long long dy  = y - lr;
+            const long long dy2 = dy * dy;
+            for (int x = xLo; x <= xHi; ++x) {
+                const long long dx = x - lc;
+                if (dx * dx + dy2 <= dotRSq) stamp(y, x, V_BREAKPOINT);
+            }
+        }
+    }
+    if (skipped > 0)
+        std::cerr << "[breakpoint-tif] WARN: " << skipped << " of "
+                  << breakPoints.size() << " break points fell outside the "
+                  << winCols << "x" << winRows << " window and were skipped\n";
+
+    const double originX = static_cast<double>(g.conf.grid.origin_x)
+                          + static_cast<double>(winColMin) * RESOLUTION;
+    const double originY = static_cast<double>(g.conf.grid.origin_y)
+                          - static_cast<double>(winRowMin) * RESOLUTION;
+
+    RGBA palette[256];
+    for (auto& e : palette) e = TRANSPARENT;
+    palette[V_SEGMENT]    = GREEN;
+    palette[V_BREAKPOINT] = BREAK_DOT;
+
+    const bool ok = writeRGBAGeoTIFF(
+        filename,
+        buf.data(),
+        // coveredValue / coveredColor / otherColor are unused in
+        // palette mode -- the palette below drives the coloring.
+        /*coveredValue=*/0, TRANSPARENT, TRANSPARENT,
+        winCols, winRows,
+        originX, originY,
+        static_cast<double>(RESOLUTION),
+        reductionPercent,
+        srcInWindow ? localSrcR : -1,
+        srcInWindow ? localSrcC : -1,
+        /*markerRadiusCells=*/8,
+        /*markerColor=*/RGBA{255, 0, 255, 255},   // magenta, as in the PNG
+        /*markerRingColor=*/RGBA{0, 0, 0, 255},   // black halo
+        /*markerRingThicknessCells=*/2,
+        palette);
+
+    if (ok)
+        std::cout << "[breakpoint-tif] "
+                  << (static_cast<int>(breakPoints.size()) - skipped)
+                  << " break point(s), segments "
+                  << (fillToBreakPoints ? "filled" : "omitted")
+                  << ", dot radius " << dotRadiusCells << " cell(s)\n";
+    return ok;
+}
+
+// ======================================================================
+// AOI overlap counts
+// ======================================================================
 
 bool writeOverlapGeoTIFF(
     Global&                        g,
     const FeasibleGrid&            aoiGrid,
     const std::string&             filename,
-    const std::vector<GridPoint>&  placements)
+    const std::vector<GridPoint>&  placements,
+    int                            reductionPercent)
 {
     if (aoiGrid.height <= 0 || aoiGrid.width <= 0) {
         std::cerr << "[overlap-tif] FAIL: invalid grid dimensions "
@@ -291,9 +705,15 @@ bool writeOverlapGeoTIFF(
     const int width  = aoiGrid.width;
     const int height = aoiGrid.height;
 
+    reductionPercent = clampReduction(reductionPercent, "writeOverlapGeoTIFF");
+    const int outWidth  = reducedDim(width,  reductionPercent);
+    const int outHeight = reducedDim(height, reductionPercent);
+
     // Dense local overlap buffer, scoped to the AOI's own bounding box
     // only -- not the full DEM grid (same allocation philosophy as
     // rc_detail::LocalMask). Default 0 == "no coverage" == transparent.
+    // Still built at native resolution; the reduction happens at write
+    // time so the source counts stay exact.
     std::vector<uint8_t> overlapBuf(static_cast<size_t>(height) * width, 0);
 
     int skipped = 0;
@@ -311,11 +731,15 @@ bool writeOverlapGeoTIFF(
 
     // Local geotransform origin = full-grid origin, offset by this AABB's
     // own row/col offset -- same convention as the rest of this file
-    // (row 0 = north/top, col grows east).
+    // (row 0 = north/top, col grows east). Unaffected by downsampling:
+    // the top-left corner doesn't move, only the pixel size grows.
     const double originX = static_cast<double>(g.conf.grid.origin_x)
                           + static_cast<double>(aoiGrid.origin_c) * RESOLUTION;
     const double originY = static_cast<double>(g.conf.grid.origin_y)
                           - static_cast<double>(aoiGrid.origin_r) * RESOLUTION;
+
+    const double pixelW = static_cast<double>(RESOLUTION) * width  / outWidth;
+    const double pixelH = static_cast<double>(RESOLUTION) * height / outHeight;
 
     GDALAllRegister();
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("GTiff");
@@ -331,7 +755,7 @@ bool writeOverlapGeoTIFF(
     opts = CSLSetNameValue(opts, "PHOTOMETRIC","RGB");
 
     GDALDataset* ds = driver->Create(
-        filename.c_str(), width, height, /*bands=*/4, GDT_Byte, opts);
+        filename.c_str(), outWidth, outHeight, /*bands=*/4, GDT_Byte, opts);
     CSLDestroy(opts);
 
     if (!ds) {
@@ -339,12 +763,11 @@ bool writeOverlapGeoTIFF(
         return false;
     }
 
-    double gt[6] = {
-        originX, static_cast<double>(RESOLUTION), 0.0,
-        originY, 0.0,                             -static_cast<double>(RESOLUTION)
+    const double gt[6] = {
+        originX, pixelW, 0.0,
+        originY, 0.0,    -pixelH
     };
-    ds->SetGeoTransform(gt);
-    ds->SetProjection(epsg7755Wkt().c_str());
+    applyGeoreferencing(ds, gt, filename);
 
     GDALRasterBand* rBand = ds->GetRasterBand(1);
     GDALRasterBand* gBand = ds->GetRasterBand(2);
@@ -355,12 +778,19 @@ bool writeOverlapGeoTIFF(
     bBand->SetColorInterpretation(GCI_BlueBand);
     aBand->SetColorInterpretation(GCI_AlphaBand);
 
-    // Marker centers in this AOI's local pixel space.
+    // Marker centers in this AOI's local pixel space, then rescaled into
+    // the reduced raster's pixel space.
     struct LocalMarker { int lr, lc; };
     std::vector<LocalMarker> markers;
     markers.reserve(placements.size());
-    for (const auto& p : placements)
-        markers.push_back({p.r - aoiGrid.origin_r, p.c - aoiGrid.origin_c});
+    for (const auto& p : placements) {
+        const int lr = p.r - aoiGrid.origin_r;
+        const int lc = p.c - aoiGrid.origin_c;
+        markers.push_back({
+            scaleIndex(lr, height, outHeight),
+            scaleIndex(lc, width,  outWidth)
+        });
+    }
 
     constexpr RGBA MARKER_FILL{ 255, 0, 255, 255 };  // magenta, opaque
     constexpr RGBA MARKER_RING{ 0,   0, 0,   255 };  // black outline
@@ -370,26 +800,43 @@ bool writeOverlapGeoTIFF(
     constexpr long long INNER_R_SQ =
         (long long)(MARKER_RADIUS - MARKER_RING_THICK) * (MARKER_RADIUS - MARKER_RING_THICK);
 
-    std::vector<uint8_t> rowR(width), rowG(width), rowB(width), rowA(width);
+    std::vector<int> colLo(outWidth), colHi(outWidth);
+    for (int x = 0; x < outWidth; ++x)
+        srcSpan(x, outWidth, width, colLo[x], colHi[x]);
+
+    std::vector<uint8_t> rowR(outWidth), rowG(outWidth), rowB(outWidth), rowA(outWidth);
 
     bool ok = true;
-    for (int y = 0; y < height && ok; ++y) {
-        const uint8_t* srcRow = overlapBuf.data() + static_cast<size_t>(y) * width;
+    for (int y = 0; y < outHeight && ok; ++y) {
+        int sy0, sy1;
+        srcSpan(y, outHeight, height, sy0, sy1);
 
-        for (int x = 0; x < width; ++x) {
-            RGBA c = overlapColorAlpha(srcRow[x], /*alpha=*/160);
+        for (int x = 0; x < outWidth; ++x) {
+            // MAX over the block, not mean: averaging would wash a
+            // 5-radar hotspot down into the 1-2 range and lose the very
+            // thing the color ramp exists to show. Worst case per block
+            // is the honest summary here.
+            uint8_t best = 0;
+            for (int sy = sy0; sy < sy1; ++sy) {
+                const uint8_t* srcRow = overlapBuf.data() + static_cast<size_t>(sy) * width;
+                for (int sx = colLo[x]; sx < colHi[x]; ++sx)
+                    if (srcRow[sx] > best) best = srcRow[sx];
+            }
+            RGBA c = overlapColorAlpha(best, /*alpha=*/160);
             rowR[x] = c.r; rowG[x] = c.g; rowB[x] = c.b; rowA[x] = c.a;
         }
 
         // Stamp markers whose vertical extent touches this row -- bounded
         // to O(placements_near_row * MARKER_RADIUS), never a full-row scan.
+        // Radius is in OUTPUT pixels, so markers stay the same visual size
+        // no matter how far the raster was reduced.
         for (const auto& mk : markers) {
             const int dy = y - mk.lr;
             if (std::abs(dy) > MARKER_RADIUS) continue;
             const long long dy2 = static_cast<long long>(dy) * dy;
 
             const int xLo = std::max(0, mk.lc - MARKER_RADIUS);
-            const int xHi = std::min(width - 1, mk.lc + MARKER_RADIUS);
+            const int xHi = std::min(outWidth - 1, mk.lc + MARKER_RADIUS);
             for (int x = xLo; x <= xHi; ++x) {
                 const long long dx = x - mk.lc;
                 const long long d2 = dx * dx + dy2;
@@ -399,10 +846,10 @@ bool writeOverlapGeoTIFF(
             }
         }
 
-        ok = ok && rBand->RasterIO(GF_Write, 0, y, width, 1, rowR.data(), width, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && gBand->RasterIO(GF_Write, 0, y, width, 1, rowG.data(), width, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && bBand->RasterIO(GF_Write, 0, y, width, 1, rowB.data(), width, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && aBand->RasterIO(GF_Write, 0, y, width, 1, rowA.data(), width, 1, GDT_Byte, 0, 0) == CE_None;
+        ok = ok && rBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowR.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+        ok = ok && gBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowG.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+        ok = ok && bBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowB.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+        ok = ok && aBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowA.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
     }
 
     GDALClose(ds);
@@ -413,7 +860,12 @@ bool writeOverlapGeoTIFF(
     }
 
     std::cout << "[overlap-tif] Wrote GeoTIFF: " << filename
-              << " (" << width << " x " << height << ", RGBA, "
-              << placements.size() << " marker(s))\n";
+              << " (" << outWidth << " x " << outHeight << ", RGBA, "
+              << placements.size() << " marker(s)";
+    if (reductionPercent > 0)
+        std::cout << ", reduced " << reductionPercent << "% from "
+                  << width << " x " << height
+                  << ", pixel " << pixelW << "m";
+    std::cout << ")\n";
     return true;
 }
