@@ -123,7 +123,13 @@ private:
 public:
     ThreadPool() : stop(false) {
         size_t threads = std::thread::hardware_concurrency();
+        std::cout<<"total number of threads : " <<threads;
+
         if (threads == 0) threads = 4;
+        else{
+            threads=abs(threads*0.75);
+            std::cout<<"number of threads used : " <<threads;
+        }
 
         for (size_t i = 0; i < threads; ++i) {
             workers.emplace_back([this]() {
@@ -185,13 +191,7 @@ class GaEngine {
     double totalFitnessEvalTimeMs = 0.0;
     double totalEvolutionaryTimeMs = 0.0;
 
-    void reloadConfig() {
-        if (GaConf::is_available()) {
-            conf = GaConf::load();
-            confLoaded = true;
-            applyConfig();
-        }
-    }
+
     // --- Hyperparameters (set from config or defaults) ---
     int    popSize       = NUM_CHROMOSOMES;
     double mutationRate  = 0.08;
@@ -201,8 +201,8 @@ class GaEngine {
 
     // Output paths (overridden by config when present)
     std::string coverageOutput = "final_optimized_coverage.png";
-    map<int,Chromosome> cache;
-    int bubble = 0;
+    std::unordered_map<uint64_t, double> cache;   // key: content hash, value: fitness
+    std::mutex cacheMutex;
     // Physical spec for the homogenous evaluator (all radar share these values)
     RadarConf homoParams;
 
@@ -246,7 +246,6 @@ class GaEngine {
             homoParams.minAngle = r.minAngle;  // float, always valid
             homoParams.maxAngle = r.maxAngle;
         }
-
         std::cout << "[ga] Config loaded — "
                   << "pop=" << popSize
                   << "  mutRate=" << mutationRate
@@ -255,6 +254,21 @@ class GaEngine {
                   << "  output=\"" << coverageOutput << "\"\n";
     }
 
+    static uint64_t hashChromosome(const Chromosome& cn) {
+        std::vector<uint64_t> geneHashes;
+        geneHashes.reserve(cn.radar.size());
+        for (const auto& g : cn.radar) {
+            uint64_t h = std::hash<int>()(g.r);
+            h ^= std::hash<int>()(g.c)         + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(g.typeIndex) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            geneHashes.push_back(h);
+        }
+        std::sort(geneHashes.begin(), geneHashes.end()); // order-independent
+        uint64_t result = geneHashes.size();
+        for (auto h : geneHashes)
+            result ^= h + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+        return result;
+    }
     // =========================================================
     // SECTION 1 — FIXED-LENGTH GA (run_homogenous / run_heterogenous)
     // =========================================================
@@ -288,8 +302,6 @@ class GaEngine {
             do { x = gen(rng); } while (!used.insert(x).second);
             cn.radar[i] = {f.cells[x].r, f.cells[x].c};
         }
-        cn.id = bubble+1;
-        bubble++;
         return cn;
     }
 
@@ -357,37 +369,63 @@ class GaEngine {
         const FeasibleGrid& base_grid, bool writePng = false,
         const FeasibleGrid& aoi_grid = {})
     {
-        if(conf.homo.is_case) {
-            auto startTime = std::chrono::high_resolution_clock::now();
-           std::vector<std::future<void>> futures;
-           std::vector<RadarConf> empty(0);
-           futures.reserve(pop.size());
-           for (size_t i = 0; i < pop.size(); i++)
-               futures.push_back(pool.enqueue(
-                   evaluate_fitness,
-                   std::ref(globalRef), std::ref(base_grid),
-                   std::ref(pop[i]), (int)i,
-                   weights, homoParams, writePng, empty, std::ref(aoi_grid), wf, overlapping_factor));
-           for (auto& f : futures) f.wait();
-           auto endTime = std::chrono::high_resolution_clock::now();
-           std::chrono::duration<double, std::milli> duration = endTime - startTime;
-           totalFitnessEvalTimeMs += duration.count();
-        }else {
-            auto startTime = std::chrono::high_resolution_clock::now();
-           std::vector<std::future<void>> futures;
-           futures.reserve(pop.size());
-           for (size_t i = 0; i < pop.size(); i++)
-               futures.push_back(pool.enqueue(
-                   evaluate_fitness,
-                   std::ref(globalRef), std::ref(base_grid),
-                   std::ref(pop[i]), (int)i,
-                   weights, homoParams, writePng, std::ref(conf.hetero.radars), std::ref(aoi_grid), wf, overlapping_factor));  // homoParams carries correct rangeM
-           for (auto& f : futures) f.wait();
-           auto endTime = std::chrono::high_resolution_clock::now();
-           std::chrono::duration<double, std::milli> duration = endTime - startTime;
-           totalFitnessEvalTimeMs += duration.count();
+        auto startTime = std::chrono::high_resolution_clock::now();
+
+        std::vector<std::future<void>> futures;
+        std::vector<size_t>   pendingIdx;
+        std::vector<uint64_t> pendingKeys;
+        futures.reserve(pop.size());
+        pendingIdx.reserve(pop.size());
+        pendingKeys.reserve(pop.size());
+
+        std::vector<RadarConf> empty(0);
+
+        for (size_t i = 0; i < pop.size(); i++) {
+            uint64_t key = hashChromosome(pop[i]);
+
+            bool hit = false;
+            double cachedFitness = 0.0;
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                auto it = cache.find(key);
+                if (it != cache.end()) { hit = true; cachedFitness = it->second; }
+            }
+
+            if (hit) {
+                pop[i].fitness = cachedFitness;
+                continue; // skip enqueueing — no coverage recompute needed
+            }
+
+            pendingIdx.push_back(i);
+            pendingKeys.push_back(key);
+
+            if (conf.homo.is_case) {
+                futures.push_back(pool.enqueue(
+                    evaluate_fitness,
+                    std::ref(globalRef), std::ref(base_grid),
+                    std::ref(pop[i]), (int)i,
+                    weights, homoParams, writePng, empty, std::ref(aoi_grid), wf, overlapping_factor));
+            } else {
+                futures.push_back(pool.enqueue(
+                    evaluate_fitness,
+                    std::ref(globalRef), std::ref(base_grid),
+                    std::ref(pop[i]), (int)i,
+                    weights, homoParams, writePng, std::ref(conf.hetero.radars), std::ref(aoi_grid), wf, overlapping_factor));
+            }
         }
 
+        for (auto& f : futures) f.wait();
+
+        // Populate cache with freshly-computed results
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            for (size_t k = 0; k < pendingIdx.size(); k++)
+                cache[pendingKeys[k]] = pop[pendingIdx[k]].fitness;
+        }
+
+        auto endTime = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> duration = endTime - startTime;
+        totalFitnessEvalTimeMs += duration.count();
     }
 
     // --- Parallel evaluation (heterogenous) ---
@@ -524,7 +562,6 @@ class GaEngine {
                 }
             }
         }
-        c1.id = ++bubble; c2.id = ++bubble;
         return {c1, c2};
     }
 
@@ -553,7 +590,6 @@ class GaEngine {
                 }
             }
         }
-        ind.id = ++bubble;
     }
 
     // =========================================================
@@ -607,7 +643,6 @@ class GaEngine {
                    }
                }
            }
-           cn.id = ++bubble;
            return cn;
        }
 
@@ -692,17 +727,47 @@ class GaEngine {
         const FeasibleGrid& aoi_grid = {})
     {
         std::vector<std::future<void>> futures;
+        std::vector<size_t>   pendingIdx;
+        std::vector<uint64_t> pendingKeys;
         futures.reserve(pop.size());
-        for (size_t i = 0; i < pop.size(); i++)
+        pendingIdx.reserve(pop.size());
+        pendingKeys.reserve(pop.size());
+
+        for (size_t i = 0; i < pop.size(); i++) {
+            uint64_t key = hashChromosome(pop[i]);
+
+            bool hit = false;
+            double cachedFitness = 0.0;
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                auto it = cache.find(key);
+                if (it != cache.end()) { hit = true; cachedFitness = it->second; }
+            }
+
+            if (hit) {
+                pop[i].fitness = cachedFitness;
+                continue;
+            }
+
+            pendingIdx.push_back(i);
+            pendingKeys.push_back(key);
+
             futures.push_back(pool.enqueue(
                 evaluate_auto_fitness,
                 std::ref(globalRef), std::ref(base_grid),
                 std::ref(pop[i]), (int)i,
                 std::ref(configs), std::ref(typeSpecs), weights, writePng,
-                std::ref(aoi_grid),wf));
-        for (auto& f : futures) f.wait();
-    }
+                std::ref(aoi_grid), wf));
+        }
 
+        for (auto& f : futures) f.wait();
+
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            for (size_t k = 0; k < pendingIdx.size(); k++)
+                cache[pendingKeys[k]] = pop[pendingIdx[k]].fitness;
+        }
+    }
     // --- REPAIR ---
     void repairChromosome(
         Chromosome& ind, const FeasibleGrid& f,
@@ -767,7 +832,6 @@ class GaEngine {
                 }
             }
         }
-        ind.id = ++bubble;
     }
 
     // --- MUTATION (variable-length) ---
@@ -795,7 +859,6 @@ class GaEngine {
                 return;
             }
         }
-        ind.id = ++bubble;
     }
 
     void mutate_remove(Chromosome& ind,
@@ -812,7 +875,6 @@ class GaEngine {
         int idx = removable[
             std::uniform_int_distribution<int>(0, (int)removable.size()-1)(rng)];
         ind.radar.erase(ind.radar.begin() + idx);
-        ind.id = ++bubble;
     }
 
     void mutate_move(Chromosome& ind, const FeasibleGrid& f) {
@@ -827,7 +889,6 @@ class GaEngine {
             gene.r + distNudge(rng), gene.c + distNudge(rng), f);
         gene.r = snapped.r;
         gene.c = snapped.c;
-        ind.id = ++bubble;
     }
 
     void executeMutationAuto(Chromosome& ind, const FeasibleGrid& f,
@@ -869,7 +930,6 @@ class GaEngine {
         c1.radar.insert(c1.radar.end(), b_chosen.begin(), b_chosen.end());
         c2.radar.insert(c2.radar.end(), a_rest.begin(),   a_rest.end());
         c2.radar.insert(c2.radar.end(), b_rest.begin(),   b_rest.end());
-        c1.id = ++bubble; c2.id = ++bubble;
         return {c1, c2};
     }
 
@@ -886,7 +946,6 @@ class GaEngine {
             std::shuffle(pool.begin(), pool.end(), rng);
             Chromosome child;
             child.radar.assign(pool.begin(), pool.begin() + take);
-            child.id = ++bubble;
             return child;
         };
         return {buildChild(), buildChild()};
@@ -916,7 +975,6 @@ class GaEngine {
         };
         stripNull(c1.radar);
         stripNull(c2.radar);
-        c1.id = ++bubble; c2.id = ++bubble;
         return {c1, c2};
     }
 
@@ -1016,6 +1074,16 @@ public:
     bool wf = 0;
     double overlapping_factor = conf.parameters.overlapFactor;
     Global g;
+    void reloadConfig() {
+        if (GaConf::is_available()) {
+            conf = GaConf::load();
+            confLoaded = true;
+            applyConfig();
+            if(Config::is_available()){
+                g.bin.conf.area_op = Config::load().area_op;
+            }
+        }
+    }
     explicit GaEngine(ThreadPool& p) : pool(p) {
         rng.seed((unsigned int)
             std::chrono::system_clock::now().time_since_epoch().count());
@@ -1154,7 +1222,7 @@ public:
     // All radar share a single fixed range (set in radar.h defaults).
     // chromosomeLength and generations sourced from config when available.
     // ------------------------------------------------------------------
-    double run_homogenous(int pathLength   = 2,
+    double run_homogenous(int reduction = 50, bool write_png = false, int pathLength   = 2,
                         int generations  = 50,
                         bool opt         = false,
                         int  num_top_k   = 15)
@@ -1241,12 +1309,23 @@ public:
             std::cout << "  -> Gen " << gen
                       << " Best Fitness: " << best->fitness << "\n";
             std::cout << "  -> Variance: " << currVariance << "\n";
-
+            if (opt) {
+                vector<GridPoint> top_k;
+                for (int i = 0; i < population.size() /** conf.parameters.saveSolutions */ && i < (int)population.size(); i++)
+                    for (const auto& pt : population[i].radar)
+                        top_k.push_back(pt);
+                write_h5_indiviual(g, f, "output/heatmap/data.h5", top_k,homoParams.antennaHeight,
+                homoParams.target,
+                homoParams.minAngle,
+                homoParams.maxAngle,
+                homoParams.range);
+            }
             if(currVariance < conf.parameters.varianceThreshold) {
-                cout<< "comp: " << count << " " << conf.parameters.forgiveFactor <<endl;
-                if(count < conf.parameters.forgiveFactor) {
-                    count+=1;
-                } else break;
+                // cout<< "comp: " << count << " " << conf.parameters.forgiveFactor <<endl;
+                // if(count < conf.parameters.forgiveFactor) {
+                //     count+=1;
+                // } else
+                break;
             }
             else if(gen >= generations) break;
             ++gen;
@@ -1256,17 +1335,7 @@ public:
             [](const Chromosome& a, const Chromosome& b) {
                 return a.fitness > b.fitness; });
 
-        if (opt) {
-            vector<GridPoint> top_k;
-            for (int i = 0; i < conf.parameters.saveSolutions && i < (int)population.size(); i++)
-                for (const auto& pt : population[i].radar)
-                    top_k.push_back(pt);
-            write_h5_indiviual(g, f, "output/heatmap/data.h5", top_k,homoParams.antennaHeight,
-            homoParams.target,
-            homoParams.minAngle,
-            homoParams.maxAngle,
-            homoParams.range);
-        }
+
 
         auto& finalBest = population[0];
         std::cout << "\n[ga] Evolution Complete. Best Lifetime Score: "
@@ -1281,7 +1350,7 @@ public:
             homoParams.maxAngle,
             homoParams.range,
             {},
-            aoiGrid);
+            aoiGrid, write_png, reduction);
         return finalBest.fitness;
     }
 
@@ -1290,7 +1359,7 @@ public:
     // Fixed fleet; each chromosome locus maps to a specific radar range.
     // Fleet sourced from config (hetero.radar) when available.
     // ------------------------------------------------------------------
-    void run_heterogenous(std::vector<RadarConfig> fleetConfig = {},
+    void run_heterogenous(int reduction = 50, bool write_png = false, std::vector<RadarConfig> fleetConfig = {},
                           int generations = 50)
     {
         if (confLoaded && conf.hetero.is_case) {
@@ -1398,7 +1467,7 @@ public:
 
         calculate_radar_coverage_overlap(g, f, finalBest->radar,
                                          5.0, coverageOutput,0,0,0,0,0, conf.hetero.radars,
-                                         aoiGrid);
+                                         aoiGrid,write_png,reduction);
 
     }
 
@@ -1407,7 +1476,7 @@ public:
     // Variable-length, variable-count, heterogeneous fleet.
     // Fleet sourced from config (autoG.radar) when available.
     // ------------------------------------------------------------------
-    void run_auto(std::vector<FlexRadarConfig> configs = {},
+    void run_auto(int reduction = 50, bool write_png = false, std::vector<FlexRadarConfig> configs = {},
                       int generations = 50)
         {
             if (confLoaded && conf.autoG.is_case) {
@@ -1554,7 +1623,7 @@ public:
             calculate_radar_coverage_overlap(g, f, positions,
                                              5.0, coverageOutput,
                                              0, 0, 0, 0, 0, radarConfigs,
-                                             aoiGrid);
+                                             aoiGrid,write_png,reduction);
         }
     int run_benchmark() {
         BoundingBox areaOfOps = { 34.0522, 34.1022, -118.2437, -118.1937 };

@@ -296,7 +296,7 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     FeasibleGrid                  grid,               // BY VALUE — feasible cells only; drives result[] stats (GA fitness signal)
     const std::vector<GridPoint>& placements,
     double                        minSpacingCells = 5.0,
-    const std::string&            pngPath         = "",
+    const std::string&            tifPath         = "",
 
     double                        antennaHeight   = 10.0,    // metres AGL
     double                        minAngle        = -5,     // degrees
@@ -304,7 +304,9 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     double                        maxAngle        = 90.0,    // degrees
     double                        rangeM          = 25000.0, // metres — was wrongly `int range = 25`
     const std::vector<RadarConf>& radarRanges = {},
-    FeasibleGrid                  aoiGrid         = {}       // BY VALUE — unfiltered AOI (allCells=WITHALL); overlap computed here too, purely for the PNG
+    FeasibleGrid                  aoiGrid         = {} ,
+    bool write_png = false,
+    int reduction = 50// BY VALUE — unfiltered AOI (allCells=WITHALL); overlap computed here too, purely for the PNG
 )
 {
     std::vector<int> result(4, 0);
@@ -392,12 +394,20 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     // ── Optional PNG render ───────────────────────────────────────────────
     // aoiGrid (all AOI cells, with overlap now computed on it) drives the picture;
     // grid (feasible-only) is passed through purely to show roads/rails/water/etc.
-    if (!pngPath.empty())
-         writeOverlapGeoTIFF(g, aoiGrid, "output/ga/overlap.tif", placements);
-    // Bin::writeFeasibleGridOverlapPng(aoiGrid, pngPath, placements, grid,
-        //     g.bin.flag_road, g.bin.flag_rail,
-        //     g.bin.flag_water_line, g.bin.flag_water_area,
-        //     g.bin.flag_ib, g.bin.flag_slope);
+    if (!tifPath.empty()){
+        auto idx = tifPath.find_last_of("\\/");
+        std::string p;
+        if(std::string::npos != idx){
+            p = tifPath.substr(0,idx+1);
+        }
+        writeOverlapGeoTIFF(g, aoiGrid, tifPath, placements, reduction);
+        if(write_png){
+            Bin::writeFeasibleGridOverlapPng(aoiGrid, p+"result.png", placements, grid,
+                    g.bin.flag_road, g.bin.flag_rail,
+                    g.bin.flag_water_line, g.bin.flag_water_area,
+                    g.bin.flag_ib, g.bin.flag_slope);
+        }
+    }
 
     return result;
 }
