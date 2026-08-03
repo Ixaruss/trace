@@ -65,7 +65,9 @@ int Bin::build_elevation_matrix(bool split) {
     string opath, ipath, spath;
     Config::is_available() ? opath = Config::load().output.elevation_file : opath = DEFAULT_ELEVATION_MATRIX;
     Config::is_available() ? ipath = Config::load().input.elevation        : ipath = DEFAULT_ELEVATION_FILE;
-    Config::is_available() ? spath = Config::load().output.slope_file       : ipath = DEFAULT_SLOPE_MATRIX;
+    // FIX: previously this assigned to `ipath` in the no-config branch (typo),
+    // leaving `spath` empty and breaking the split/slope output path.
+    Config::is_available() ? spath = Config::load().output.slope_file      : spath = DEFAULT_SLOPE_MATRIX;
     auto idx = opath.find_last_of("\\/");
     string path;
     if(std::string::npos != idx){
@@ -124,11 +126,14 @@ int Bin::build_elevation_matrix(bool split) {
         return -1;
     }
     int success = ct->Transform(4, corner_x, corner_y);
-    if (!success) {
-        cerr << "[elevation] ERROR: coordinate transform failed for one or more corners\n";
-        // bail rather than silently continuing with garbage extent
-    }
     OGRCoordinateTransformation::DestroyCT(ct);
+    if (!success) {
+        // FIX: previously logged a "bail" comment but fell through anyway,
+        // continuing with a possibly-garbage extent. Now actually bails.
+        cerr << "[elevation] ERROR: coordinate transform failed for one or more corners — aborting\n";
+        GDALClose(src_ds);
+        return -1;
+    }
 
     double proj_min_x = *min_element(corner_x, corner_x + 4);
     double proj_max_x = *max_element(corner_x, corner_x + 4);
@@ -194,12 +199,17 @@ int Bin::build_elevation_matrix(bool split) {
     GDALWarpOperation warp_op;
     if (warp_op.Initialize(warp_opts) != CE_None) {
         cerr << "[elevation] ERROR: warp init failed\n";
+        // FIX: GDALDestroyWarpOptions does NOT free pTransformerArg — it's
+        // caller-owned. Previously leaked on this failure path.
+        GDALDestroyGenImgProjTransformer(warp_opts->pTransformerArg);
         GDALDestroyWarpOptions(warp_opts);
         GDALClose(dst_ds); GDALClose(src_ds);
         return -1;
     }
     if ((CPLErr)warp_op.ChunkAndWarpImage(0, 0, OUT_COLS, OUT_ROWS) != CE_None) {
         cerr << "[elevation] ERROR: warp failed\n";
+        // FIX: same leak as above, on the warp-execution failure path.
+        GDALDestroyGenImgProjTransformer(warp_opts->pTransformerArg);
         GDALDestroyWarpOptions(warp_opts);
         GDALClose(dst_ds); GDALClose(src_ds);
         return -1;
@@ -255,6 +265,14 @@ int Bin::build_elevation_matrix(bool split) {
         }
     }else {
         slope = (float*)malloc(total_cells * sizeof(float));
+        // FIX: this allocation was previously unchecked. On failure it would
+        // fall straight into a null-pointer write in the loop below, and
+        // elev_buf would be leaked on the way down.
+        if (!slope) {
+            cerr << "[elevation] ERROR: failed to allocate slope buffer\n";
+            free(elev_buf);
+            return -1;
+        }
     }
 
 
@@ -324,7 +342,7 @@ int Bin::build_elevation_matrix(bool split) {
         {
             FILE* f = fopen(spath.c_str(), "wb");  // ← fixed path in error msg too
             if (!f) {
-                cerr << "[elevation] ERROR: could not open ./bin/slope.bin\n";
+                cerr << "[elevation] ERROR: could not open " << spath << "\n";
                 free(slope);
                 return -1;
             }

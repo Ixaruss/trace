@@ -263,7 +263,7 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
     string mpath;
     Config::is_available() ? mpath = Config::load().output.elevation_file : mpath = DEFAULT_ELEVATION_MATRIX;
 
-    if (images) make_dir("image");
+    if (images) make_dir("./output/preprocess");
     if(!filesystem::exists(mpath)) if ( individual == -1 || individual == 6)  Bin::build_elevation_matrix();
     string road_shp, rail_shp, warea_shp, wline_shp, ib_shp, elev_bin_path, opath,slope_path;
     int road_bit, rail_bit, waterarea_bit, waterlines_bit, ib_bit, slope_bit;
@@ -311,15 +311,17 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         oy = VEC_ORIGIN_Y;
         ELEV_R = ELEV_ROWS;
         ELEV_C = ELEV_COLS;
-        road_bit       = BIT_ROAD;
-        rail_bit       = BIT_RAIL;
-        waterarea_bit  = BIT_WATER_AREA;
-        waterlines_bit = BIT_WATER_LINE;
-        ib_bit         = BIT_IB;
-        slope_bit      = 5; // Hardcoded requirement for index 5
         opath          = DEFAULT_PARAM_MATRIX;
         slope_path     = DEFAULT_SLOPE_MATRIX;
     }
+
+    road_bit       = BIT_ROAD;
+    rail_bit       = BIT_RAIL;
+    waterarea_bit  = BIT_WATER_AREA;
+    waterlines_bit = BIT_WATER_LINE;
+    ib_bit         = BIT_IB;
+    slope_bit      = 5;
+
     auto idx = opath.find_last_of("\\/");
     string path;
     if(std::string::npos != idx){
@@ -379,8 +381,11 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
     int16_t* elev = (int16_t*)malloc(elev_n * sizeof(int16_t));
     float* slope  = (float*)malloc(elev_n * sizeof(float));
 
-    if (!elev) { cerr << "[preprocess] ERROR: cannot allocate elevation buffer\n"; return; }
-    if (!slope) { cerr << "[preprocess] ERROR: cannot allocate slope buffer\n"; return; }
+    if (!elev || !slope) {
+        cerr << "[preprocess] ERROR: cannot allocate elevation/slope buffer\n";
+        free(matrix); free(elev); free(slope);
+        return;
+    }
 
     FILE* ef = fopen(elev_bin_path.c_str(), "rb");
     FILE* sf = fopen(slope_path.c_str(), "rb");
@@ -407,6 +412,7 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
             fclose(sf);
             free(elev);
             free(slope);
+            free(matrix);
             return ;
         }
 
@@ -417,16 +423,16 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         fclose(sf);
 
         print_elev_stats(elev, slope, read);
-        if (images || individual){
+        if (images || individual == 6){
             uint8_t* rgb_e = elev_to_rgb(elev, read);
             if (rgb_e) {
-                write_png("image/elev.png", ELEV_R, ELEV_C, rgb_e);
+                write_png("./output/preprocess/elev.png", ELEV_R, ELEV_C, rgb_e);
                 free(rgb_e);
             }
 
             uint8_t* rgb_s = slope_to_rgb(slope, read1);
             if (rgb_s) {
-                write_png("image/slope.png", ELEV_R, ELEV_C, rgb_s);
+                write_png("./output/preprocess/slope.png", ELEV_R, ELEV_C, rgb_s);
                 free(rgb_s);
             }
         }
@@ -444,9 +450,8 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         cout << "[preprocess] writen slope bit";
         free(elev);
         free(slope); // Freed safely after matrix calculations
+
     }
-
-
 
     if(timer){
         end = chrono::steady_clock::now();
@@ -460,6 +465,7 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
             cout << "[preprocess] reprojecting " << job.shp << "...\n";
             if (lib::reproject(job.shp) != 0) {
                 cerr << "[preprocess] ERROR: reprojection failed\n";
+                free(matrix);
                 return;
             }
         }
@@ -492,7 +498,7 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         if (images) {
             uint8_t* rgb = mask_to_rgb(buf, N);
             if (rgb) {
-                write_png("image/" + job.name + ".png", ROWS, COLS, rgb);
+                write_png("./output/preprocess/" + job.name + ".png", ROWS, COLS, rgb);
                 free(rgb);
             }
         }
@@ -501,23 +507,28 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
 
    if(individual == -1) {
        auto f = fopen(opath.c_str(), "wb");
-       fwrite(matrix, 1, N, f);
-       fclose(f);
+       if (!f) {
+           cerr << "[preprocess] ERROR: cannot open " << opath << " for write\n";
+       } else {
+           fwrite(matrix, 1, N, f);
+           fclose(f);
+       }
+       if (images) {
+           uint8_t* rgb = mask_to_rgb(matrix, N);
+           if (rgb) {
+               if(individual == -1) write_png("./output/preprocess/combined.png", ROWS, COLS, rgb);
+               free(rgb);
+           }
+       }
    }
-
+   free(matrix);
     int constraintTime;
     if (timer){
         end = chrono::steady_clock::now();
         constraintTime = chrono::duration_cast<chrono::seconds>(end - start).count();
     }
 
-    if (images) {
-        uint8_t* rgb = mask_to_rgb(matrix, N);
-        if (rgb) {
-            if(individual == -1) write_png("image/combined.png", ROWS, COLS, rgb);
-            free(rgb);
-        }
-    }
+
     if (timer) {
         if (individual == -1) cout << "\n>>> Elevation Build took: " << elevTime << " seconds"<< (images ? " (with png writing)" : "") << endl;
         cout << "\n>>> Combined bin took: " << constraintTime << " seconds" << (images ? " (with png writing)" : "") << endl;
@@ -537,4 +548,5 @@ void Global::preprocess(bool images, bool timer, bool seperate, int individual) 
         filesystem::create_directories("./output/radarfdr");
         filesystem::create_directories("./output/simdata");
         filesystem::create_directories("./output/gbadws");
+        filesystem::create_directories("./output/preprocess");
     }
