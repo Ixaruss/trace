@@ -123,12 +123,10 @@ private:
 public:
     ThreadPool() : stop(false) {
         size_t threads = std::thread::hardware_concurrency();
-        std::cout<<"total number of threads : " <<threads;
 
         if (threads == 0) threads = 4;
         else{
             threads=abs(threads*0.75);
-            std::cout<<"number of threads used : " <<threads;
         }
 
         for (size_t i = 0; i < threads; ++i) {
@@ -216,7 +214,8 @@ class GaEngine {
     AutoCrossoverMethod autoCrossover    = AutoCrossoverMethod::RANDOM_SUBSET;
     double autoMutationRate  = 0.10;
     double autoCrossoverRate = 0.85;
-
+    int cachehits = 0;
+    int totalcount = 0;
     std::mt19937 rng;
 
     // =========================================================
@@ -382,7 +381,7 @@ class GaEngine {
 
         for (size_t i = 0; i < pop.size(); i++) {
             uint64_t key = hashChromosome(pop[i]);
-
+            totalcount++;
             bool hit = false;
             double cachedFitness = 0.0;
             {
@@ -393,6 +392,7 @@ class GaEngine {
 
             if (hit) {
                 pop[i].fitness = cachedFitness;
+                cachehits++;
                 continue; // skip enqueueing — no coverage recompute needed
             }
 
@@ -735,7 +735,7 @@ class GaEngine {
 
         for (size_t i = 0; i < pop.size(); i++) {
             uint64_t key = hashChromosome(pop[i]);
-
+            totalcount++;
             bool hit = false;
             double cachedFitness = 0.0;
             {
@@ -746,6 +746,7 @@ class GaEngine {
 
             if (hit) {
                 pop[i].fitness = cachedFitness;
+                cachehits++;
                 continue;
             }
 
@@ -1260,6 +1261,7 @@ public:
 
         std::normal_distribution<double> gaussDist(0.0, 10.0);
         int gen = 1;
+        int count = 0;
         while (true) {
 
             auto stepStart = std::chrono::high_resolution_clock::now();
@@ -1302,7 +1304,6 @@ public:
             parallelEvaluatePopulation(nextGen, g, f, false, aoiGrid);
             population = std::move(nextGen);
             double currVariance = calculateVariance(population);
-            int count = 0;
             auto best = std::max_element(population.begin(), population.end(),
                 [](const Chromosome& a, const Chromosome& b) {
                     return a.fitness < b.fitness; });
@@ -1320,14 +1321,12 @@ public:
                 homoParams.maxAngle,
                 homoParams.range);
             }
-            if(currVariance < conf.parameters.varianceThreshold) {
-                // cout<< "comp: " << count << " " << conf.parameters.forgiveFactor <<endl;
-                // if(count < conf.parameters.forgiveFactor) {
-                //     count+=1;
-                // } else
-                break;
+            if (currVariance < conf.parameters.varianceThreshold) {
+                if (++count >= conf.parameters.forgiveFactor) break;
+            } else {
+                count = 0;
             }
-            else if(gen >= generations) break;
+            if(gen >= generations) break;
             ++gen;
         }
 
@@ -1341,6 +1340,9 @@ public:
         std::cout << "\n[ga] Evolution Complete. Best Lifetime Score: "
                   << finalBest.fitness << "\n";
 
+        std::cout << "[ga] Cache hits: " << cachehits << " / " << totalcount << "\n";
+        cachehits = 0;
+        totalcount = 0;
         calculate_radar_coverage_overlap(
             g, f, finalBest.radar,
             5.0, coverageOutput,
@@ -1407,6 +1409,7 @@ public:
         std::normal_distribution<double> gaussDist(0.0, 10.0);
 
         int gen = 1;
+        int count = 0;
         while (true) {
             std::sort(population.begin(), population.end(),
                 [](const Chromosome& a, const Chromosome& b) {
@@ -1443,19 +1446,18 @@ public:
             parallelEvaluatePopulation(nextGen, g, f, false, aoiGrid);
             population = std::move(nextGen);
             double currVariance = calculateVariance(population);
-            int count = 0;
             auto best = std::max_element(population.begin(), population.end(),
                 [](const Chromosome& a, const Chromosome& b) {
                     return a.fitness < b.fitness; });
             std::cout << "  -> Gen " << gen
                       << " Best Fitness: " << best->fitness << "\n";
                       std::cout << "  -> Variance: " << currVariance << "\n";
-
-            if(currVariance < conf.parameters.varianceThreshold) {
-                if(count < conf.parameters.forgiveFactor)count++;
-                else break;
+            if (currVariance < conf.parameters.varianceThreshold) {
+                if (++count >= conf.parameters.forgiveFactor) break;
+            } else {
+                count = 0;
             }
-            else if(gen >= generations) break;
+            if(gen >= generations) break;
             ++gen;
         }
 
@@ -1464,7 +1466,9 @@ public:
                 return a.fitness < b.fitness; });
         std::cout << "\n[ga] Evolution Complete. Best Lifetime Score: "
                   << finalBest->fitness << "\n";
-
+        std::cout << "[ga] Cache hits: " << cachehits << " / " << totalcount << "\n";
+        cachehits = 0;
+        totalcount = 0;
         calculate_radar_coverage_overlap(g, f, finalBest->radar,
                                          5.0, coverageOutput,0,0,0,0,0, conf.hetero.radars,
                                          aoiGrid,write_png,reduction);
@@ -1539,6 +1543,7 @@ public:
             std::cout << "[ga] Evaluating Generation 0...\n";
             parallelEvaluateAutoPopulation(autoPop, g, f, configs, typeSpecs, false, aoiGrid);
             int gen = 1;
+            int count = 0;
             while(true) {
                 std::sort(autoPop.begin(), autoPop.end(),
                     [](const Chromosome& a, const Chromosome& b) {
@@ -1582,8 +1587,8 @@ public:
                 parallelEvaluateAutoPopulation(nextGen, g, f, configs, typeSpecs, false, aoiGrid);
                 autoPop = std::move(nextGen);
 
-                double currVariance = calculateVariance(population);
-                int count = 0;
+                double currVariance = calculateVariance(autoPop);
+
                 auto best = std::max_element(autoPop.begin(), autoPop.end(),
                     [](const Chromosome& a, const Chromosome& b) {
                         return a.fitness < b.fitness; });
@@ -1599,11 +1604,12 @@ public:
                           << breakdown << "\n";
                           std::cout << "  -> Variance: " << currVariance << "\n";
 
-                if(currVariance < conf.parameters.varianceThreshold) {
-                    if(count < conf.parameters.forgiveFactor)count++;
-                    else break;
+                if (currVariance < conf.parameters.varianceThreshold) {
+                    if (++count >= conf.parameters.forgiveFactor) break;
+                } else {
+                    count = 0;
                 }
-                else if(gen >= generations) break;
+                if(gen >= generations) break;
                 ++gen;
             }
 
@@ -1617,7 +1623,9 @@ public:
             for (int t = 0; t < (int)configs.size(); t++)
                 std::cout << "  Type " << t << " (" << configs[t].rangeKm << " km) : "
                           << finalBest->countType(t) << " units\n";
-
+            std::cout << "  Cache hits: " << cachehits << " / " << totalcount << "\n";
+            cachehits = 0;
+            totalcount = 0;
             auto positions    = extractPositions(finalBest->radar);
             auto radarConfigs = extractRadarConfigs(finalBest->radar, typeSpecs);
             calculate_radar_coverage_overlap(g, f, positions,
