@@ -12,4 +12,5 @@ z
 __MACOSX/
 *.xml
 *.tif
+*.tiff
 *.h5

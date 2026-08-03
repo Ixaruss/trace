@@ -40,8 +40,8 @@ ga:
 		ga/main.cc ga/config.cc $(COMMON_SRC) \
 		-o $(BIN) $(GDAL) $(LIBS) $(HDF5) $(STD) && ./$(BIN)
 
-create:
-	mkdir -p .\output\radar\ .\output\viewshed\ .\output\pso\ .\output\ga\ .\output\radarfd\   .\output\path\  .\output\simdata\   .\output\gbadws\  .\output\heatmap\
+init:
+	mkdir  .\output\radar\ .\output\viewshed\ .\output\pso\ .\output\ga\ .\output\radarfd\   .\output\path\  .\output\simdata\   .\output\gbadws\  .\output\heatmap\
 
 clean:
 	rm -f $(BIN) $(ADAPT) *.o

@@ -6,7 +6,10 @@ CompileFlags:
     - -I/opt/homebrew/include
     - -I/opt/homebrew/include/jsoncpp
     - -I/opt/homebrew/Cellar/gdal/3.13.0/include
-
+    - --sysroot=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+    - -F/opt/homebrew/opt/qt/lib
+    - -isystem
+    - /opt/homebrew/opt/qt/include
 Diagnostics:
   UnusedIncludes: Strict
 

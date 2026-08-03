@@ -12,6 +12,13 @@ HOMEBREW_LIBS     := -L/opt/homebrew/lib -ljsoncpp -lgdal -lpng16
 OMP_FLAGS := -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include
 OMP_LIBS  := -L/opt/homebrew/opt/libomp/lib -lomp
 
+# HDF5 - needed anywhere GaEngine's HDF5-writing code (H5Dclose/H5Fopen/etc.)
+# gets linked in, i.e. wherever GaEngine itself is compiled in - currently
+# just the "ga" target, but if GaEngine ends up part of "tool" too (it
+# looked like it might be, based on the last linker error), this needs to
+# be added there as well.
+HDF5_LIBS := -L/opt/homebrew/opt/hdf5/lib -lhdf5
+
 # macOS Linker Dead-Code Stripping (Replaces Linux --gc-sections)
 MAC_LDFLAGS := -Wl,-dead_strip
 
@@ -33,35 +40,14 @@ PREPROCESS_SRC := preprocess/jsonParser.cc preprocess/reproject.cc preprocess/li
 all: tool
 
 # =====================================================
-# Preprocess & Run
-# =====================================================
-bin:
-	$(CXX) $(CXXFLAGS) preprocess/preprocess.cc \
-	preprocess/main.cc \
-	$(PREPROCESS_SRC) \
-	$(HOMEBREW_INCLUDES) \
-	$(GDAL_CFLAGS) \
-	-o preproc \
-	$(HOMEBREW_LIBS) && ./preproc
-
-# =====================================================
-# Preprocess Test Run
-# =====================================================
-test:
-	$(CXX) $(CXXFLAGS) preprocess/test.cc \
-	$(PREPROCESS_SRC) \
-	$(HOMEBREW_INCLUDES) \
-	$(GDAL_CFLAGS) \
-	-o x_test \
-	$(HOMEBREW_LIBS) && ./x_test
-
-# =====================================================
 # Main Adapt CLI (with Optimized OpenMP parallel processing)
 # =====================================================
 tool:
 	$(CXX) $(CXXFLAGS) -flto $(OMP_FLAGS) \
+	$(HOMEBREW_INCLUDES) \
 	$(JSON_CFLAGS) $(PNG_CFLAGS) $(GDAL_CFLAGS) \
 	cli/main.cc \
+	ga/config.cc \
 	common/lineofsight.cc \
 	common/image.cc \
 	common/coverage.cc \
@@ -70,23 +56,13 @@ tool:
 	common/mult.cc \
 	common/operations.cc \
 	preprocess/preprocess.cc \
+	render.cc \
 	$(PREPROCESS_SRC) \
 	-o adapt \
 	$(JSON_LIBS) $(PNG_LIBS) $(GDAL_LIBS) \
-	$(OMP_LIBS) \
+	$(OMP_LIBS) $(HDF5_LIBS) \
 	-fdata-sections -ffunction-sections \
 	$(MAC_LDFLAGS)
-
-# =====================================================
-# Deploy Target
-# =====================================================
-deploy:
-	$(CXX) $(CXXFLAGS) deploy.cc \
-	$(PREPROCESS_SRC) \
-	$(HOMEBREW_INCLUDES) \
-	$(GDAL_CFLAGS) \
-	-o x_deploy \
-	$(HOMEBREW_LIBS)
 
 # =====================================================
 # Genetic Algorithm (GA) Build with HDF5
@@ -99,7 +75,7 @@ ga:
 	$(HOMEBREW_INCLUDES) \
 	$(GDAL_CFLAGS) \
 	-o x_ga \
-	$(HOMEBREW_LIBS) -lhdf5 $(OMP_LIBS)
+	$(HOMEBREW_LIBS) $(HDF5_LIBS) $(OMP_LIBS)
 
 # =====================================================
 # Path Finder (A*)
@@ -113,6 +89,19 @@ astar:
 	-ljsoncpp $(GDAL_LIBS)
 
 # =====================================================
+# Create the output/ folder tree the tool expects to write into
+# =====================================================
+init:
+	mkdir -p output/viewshed \
+	output/radar \
+	output/gbadws \
+	output/radarfd \
+	output/heatmap \
+	output/ga \
+	output/pso \
+	output/astar \
+
+# =====================================================
 # Particle Swarm Optimization (PSO) Single Radar
 # =====================================================
 pso:
@@ -123,19 +112,11 @@ pso:
 	-o pso_run \
 	$(HOMEBREW_LIBS) && ./pso_run
 
-# =====================================================
-# Generate Binary Maps / Data
-# =====================================================
-gen_bin:
-	$(CXX) $(CXXFLAGS) pso/generate_bin.cc \
-	$(HOMEBREW_INCLUDES) \
-	$(GDAL_CFLAGS) \
-	-o gen_bin \
-	-L/opt/homebrew/lib \
-	-ljsoncpp $(GDAL_LIBS) && ./gen_bin
+init:
+	mkdir -p ./output/radar ./output/viewshed ./output/pso ./output/ga ./output/radarfd ./output/path ./output/simdata ./output/gbadws ./output/heatmap ./output/preprocess
 
 # =====================================================
 # Cleanup
 # =====================================================
 clean:
-	rm -f preproc x_test adapt x_deploy x_ga astar_run pso_run gen_bin
+	rm -f preproc x_test adapt x_deploy x_ga astar_run pso_run gen_bin ga-gbadws/tactical_planner_ga-gbadws

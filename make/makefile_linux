@@ -45,5 +45,8 @@ ga:
 		ga/main.cc ga/config.cc $(COMMON_SRC) \
 		-o $(BIN) $(GDAL) $(LIBS) $(HDF5) $(STD) && ./$(BIN)
 
+init:
+	mkdir -p ./output/radar ./output/viewshed ./output/pso ./output/ga ./output/radarfd ./output/path ./output/simdata ./output/gbadws ./output/heatmap ./output/preprocess
+
 clean:
 	rm -f $(BIN) $(ADAPT) *.o
