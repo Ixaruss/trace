@@ -1,6 +1,5 @@
 #include <cstdint>
 #include <cstdio>
-#include <experimental/filesystem>
 #include <filesystem>
 #include <png.h>
 #include "bin.h"
