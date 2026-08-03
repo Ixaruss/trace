@@ -1248,7 +1248,7 @@ public:
                   << "  generations=" << generations
                   << "  popSize=" << popSize << "\n";
         std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
-        auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+        auto f = Bin::getFeasibleGrid(g.bin, 0);
         auto aoiGrid = Bin::getFeasibleGrid(g.bin, 0, 0, WITHALL); // unfiltered AOI, same AABB, for PNG background
          auto initStart = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < popSize; i++)
@@ -1397,7 +1397,7 @@ public:
         population.reserve(popSize);
 
         std::cout << "[ga] Extracting baseline Area of Operation boundaries...\n";
-        auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+        auto f = Bin::getFeasibleGrid(g.bin, 0);
         auto aoiGrid = Bin::getFeasibleGrid(g.bin, 0, 0, WITHALL); // unfiltered AOI, same AABB, for PNG background
 
         for (int i = 0; i < popSize; i++)
@@ -1531,7 +1531,7 @@ public:
                       << "  popSize=" << popSize << "\n\n";
 
             std::cout << "[ga] Extracting feasible grid...\n";
-            auto f = Bin::getFeasibleGrid(g.bin, WRITE);
+            auto f = Bin::getFeasibleGrid(g.bin, 0);
             auto aoiGrid = Bin::getFeasibleGrid(g.bin, 0, 0, WITHALL); // unfiltered AOI, same AABB, for coverage + PNG background
 
             // Seed population
