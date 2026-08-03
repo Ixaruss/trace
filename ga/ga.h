@@ -313,7 +313,7 @@ class GaEngine {
         const FeasibleGrid& aoi_grid = {}, bool wf = 0, double overlapping_factor = 0.25)   // full AOI (allCells=WITHALL); fitness now scored against this
     {
         std::string png_path = writePng
-                   ? "output/ga/chromosome_" + std::to_string(index) + "_coverage.png" : "";
+                   ? "./output/ga/chromosome_" + std::to_string(index) + "_coverage.png" : "";
 
          std::vector<int> res;
         if(radar.empty()) {
@@ -1315,7 +1315,7 @@ public:
                 for (int i = 0; i < population.size() /** conf.parameters.saveSolutions */ && i < (int)population.size(); i++)
                     for (const auto& pt : population[i].radar)
                         top_k.push_back(pt);
-                write_h5_indiviual(g, f, "output/heatmap/data.h5", top_k,homoParams.antennaHeight,
+                write_h5_indiviual(g, f, "./output/heatmap/data.h5", top_k,homoParams.antennaHeight,
                 homoParams.target,
                 homoParams.minAngle,
                 homoParams.maxAngle,
