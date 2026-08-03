@@ -22,11 +22,6 @@ int main(int argc, char** argv) {
     op_group->add_flag("--slope",slope,"create slope bin");
     op_group->require_option(0,1);
 
-    auto f_sub = app.add_subcommand("feasible", "Build feasible bin for a AOP if no point is provided then . bins & config REQUIRED");
-    f_sub->add_flag("-v,--with-images",images,"Generates images for bin visualization");
-    f_sub->add_flag("-c,--count-time",timer,"Counts the time taken for feasible bin generation");
-    f_sub->add_flag("-a,--full",s,"make feasible bin for full map");
-
     auto viewshed_sub = app.add_subcommand("viewshed", "Calculate viewshed for a given location");
     double vs_lat = 33.9871;
     double vs_lon = 74.7742;
@@ -138,7 +133,6 @@ int main(int argc, char** argv) {
 
 
     if (*viewshed_sub) {
-        cout << s << "loa: " << loa << "roa: " << roa;
         Global g;
         vs_curvature = !no_curvature; // Flip state if flag passed
         auto engine = std::make_unique<ViewshedEngine>(
@@ -146,7 +140,7 @@ int main(int argc, char** argv) {
         );
         string output_ext;
         if(tiff){
-            output_ext = ".tiff";
+            output_ext = ".tif";
         }else if(svg) {
             output_ext = ".svg";
         } else {
@@ -189,7 +183,7 @@ int main(int argc, char** argv) {
         );
         string output_ext;
         if(tiff){
-            output_ext = ".tiff";
+            output_ext = ".tif";
         }else if(svg) {
             output_ext = ".svg";
         } else {

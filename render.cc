@@ -175,6 +175,37 @@ inline void srcSpan(int outIdx, int outN, int srcN, int& lo, int& hi)
     if (hi > srcN) hi = srcN;
 }
 
+// Scans a covered/mask buffer for the tightest [rowMin,rowMax] x
+// [colMin,colMax] box containing every cell == coveredValue. Returns
+// false if nothing is covered at all -- callers should skip the write
+// (or fall back to a placeholder) rather than ask for a degenerate
+// window.
+bool computeCoverageBBox(
+    const uint8_t* src, int cols, int rows, uint8_t coveredValue,
+    int& rowMin, int& rowMax, int& colMin, int& colMax)
+{
+    rowMin = rows; rowMax = -1;
+    colMin = cols; colMax = -1;
+
+    for (int y = 0; y < rows; ++y) {
+        const uint8_t* row = src + static_cast<size_t>(y) * cols;
+        int lo = -1, hi = -1;
+        for (int x = 0; x < cols; ++x) {
+            if (row[x] == coveredValue) {
+                if (lo < 0) lo = x;
+                hi = x;
+            }
+        }
+        if (lo >= 0) {
+            rowMin = std::min(rowMin, y);
+            rowMax = std::max(rowMax, y);
+            colMin = std::min(colMin, lo);
+            colMax = std::max(colMax, hi);
+        }
+    }
+    return rowMax >= rowMin;
+}
+
 // Map a source row/col onto the reduced grid (used to keep placement
 // markers on the right cell after downsampling).
 inline int scaleIndex(int idx, int srcN, int outN)
@@ -225,13 +256,16 @@ bool writeRGBAGeoTIFF(
     RGBA                   markerColor = {255, 0, 0, 255},
     RGBA                   markerRingColor = {255, 255, 255, 255},
     int                    markerRingThicknessCells = 2,
-    const RGBA*            palette = nullptr)     // 256 entries, or null
+    const RGBA*            palette = nullptr,
+    int                    srcStride = -1)     // 256 entries, or null
 {
     if (cols <= 0 || rows <= 0) {
         std::cerr << "[ERROR] Invalid raster dimensions "
                   << cols << " x " << rows << " for " << filename << "\n";
         return false;
     }
+
+    const int stride = (srcStride > 0) ? srcStride : cols;
 
     reductionPercent = clampReduction(reductionPercent, "writeRGBAGeoTIFF");
     const int outCols = reducedDim(cols, reductionPercent);
@@ -323,7 +357,7 @@ bool writeRGBAGeoTIFF(
                 // survive on top of the segments they sit on.
                 uint8_t best = 0;
                 for (int sy = sy0; sy < sy1; ++sy) {
-                    const uint8_t* srcRow = src + static_cast<size_t>(sy) * cols;
+                    const uint8_t* srcRow = src + static_cast<size_t>(sy) * stride;
                     for (int sx = colLo[x]; sx < colHi[x]; ++sx)
                         if (srcRow[sx] > best) best = srcRow[sx];
                 }
@@ -333,7 +367,7 @@ bool writeRGBAGeoTIFF(
                 // plain lookup when the block is 1x1 (reduction = 0).
                 bool covered = false;
                 for (int sy = sy0; sy < sy1 && !covered; ++sy) {
-                    const uint8_t* srcRow = src + static_cast<size_t>(sy) * cols;
+                    const uint8_t* srcRow = src + static_cast<size_t>(sy) * stride;
                     for (int sx = colLo[x]; sx < colHi[x]; ++sx) {
                         if (srcRow[sx] == coveredValue) { covered = true; break; }
                     }
@@ -395,25 +429,58 @@ constexpr RGBA    BREAK_DOT { 220, 30, 30, 255 };
 void ViewshedEngine::writeViewshedToGeoTIFF(
     const std::string& filename, int reductionPercent)
 {
+    int rowMin, rowMax, colMin, colMax;
+    if (!computeCoverageBBox(viewshedMask.data(), gridCols, gridRows,
+                             /*coveredValue=*/1, rowMin, rowMax, colMin, colMax)) {
+        std::cerr << "[viewshed-tif] WARN: nothing visible -- skipping "
+                  << filename << "\n";
+        return;
+    }
+
+    // Keep the observer marker inside the window even if the origin
+    // cell itself isn't flagged visible (self-occlusion edge case).
+    rowMin = std::min(rowMin, centerX);
+    rowMax = std::max(rowMax, centerX);
+    colMin = std::min(colMin, centerY);
+    colMax = std::max(colMax, centerY);
+
+    // Pad so the marker ring isn't clipped at the window edge, then
+    // clamp back into the full grid.
+    constexpr int kPad = 10;
+    rowMin = std::max(0,            rowMin - kPad);
+    colMin = std::max(0,            colMin - kPad);
+    rowMax = std::min(gridRows - 1, rowMax + kPad);
+    colMax = std::min(gridCols - 1, colMax + kPad);
+
+    const int winCols = colMax - colMin + 1;
+    const int winRows = rowMax - rowMin + 1;
+
+    const double originX = static_cast<double>(g.conf.grid.origin_x)
+                          + static_cast<double>(colMin) * RESOLUTION;
+    const double originY = static_cast<double>(g.conf.grid.origin_y)
+                          - static_cast<double>(rowMin) * RESOLUTION;
+
     writeRGBAGeoTIFF(
         filename,
-        viewshedMask.data(),
+        viewshedMask.data() + static_cast<size_t>(rowMin) * gridCols + colMin,
         /*coveredValue=*/1, GREEN, TRANSPARENT,
-        gridCols, gridRows,
-        static_cast<double>(g.conf.grid.origin_x),
-        static_cast<double>(g.conf.grid.origin_y),
+        winCols, winRows,
+        originX, originY,
         static_cast<double>(RESOLUTION),
         reductionPercent,
-        /*markerRow=*/centerX, /*markerCol=*/centerY);
+        /*markerRow=*/centerX - rowMin, /*markerCol=*/centerY - colMin,
+        /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
+        /*palette=*/nullptr,
+        /*srcStride=*/gridCols);
 }
 
 // ----------------------------------------------------------------------
 // RadarEngine
 // ----------------------------------------------------------------------
 
-// Full diagnostic result (per-cell CoverageStatus) — only COVERED cells
-// are shown; every other status (masked, out of range/sector, beyond
-// horizon, etc.) is fully transparent.
+// ----------------------------------------------------------------------
+// RadarEngine — full diagnostic (per-cell CoverageStatus)
+// ----------------------------------------------------------------------
 void RadarEngine::writeCoverageToGeoTIFF(
     const RadarCoverageResult& res, const std::string& filename,
     int reductionPercent)
@@ -422,34 +489,98 @@ void RadarEngine::writeCoverageToGeoTIFF(
         "CoverageStatus must be byte-sized for the reinterpret_cast below "
         "to be safe -- check the enum's underlying type in operations.h");
 
+    const uint8_t* statusBuf = reinterpret_cast<const uint8_t*>(res.status.data());
+    const uint8_t coveredValue = static_cast<uint8_t>(CoverageStatus::COVERED);
+
+    int rowMin, rowMax, colMin, colMax;
+    if (!computeCoverageBBox(statusBuf, res.gridCols, res.gridRows,
+                             coveredValue, rowMin, rowMax, colMin, colMax)) {
+        std::cerr << "[radar-tif] WARN: nothing covered -- skipping "
+                  << filename << "\n";
+        return;
+    }
+
+    // Keep the site marker inside the window even if the site cell
+    // itself isn't flagged COVERED (e.g. masked at its own location).
+    rowMin = std::min(rowMin, res.srcRow);
+    rowMax = std::max(rowMax, res.srcRow);
+    colMin = std::min(colMin, res.srcCol);
+    colMax = std::max(colMax, res.srcCol);
+
+    constexpr int kPad = 10;  // >= markerRadiusCells so the ring isn't clipped
+    rowMin = std::max(0,               rowMin - kPad);
+    colMin = std::max(0,               colMin - kPad);
+    rowMax = std::min(res.gridRows - 1, rowMax + kPad);
+    colMax = std::min(res.gridCols - 1, colMax + kPad);
+
+    const int winCols = colMax - colMin + 1;
+    const int winRows = rowMax - rowMin + 1;
+
+    const double originX = static_cast<double>(g.conf.grid.origin_x)
+                          + static_cast<double>(colMin) * RESOLUTION;
+    const double originY = static_cast<double>(g.conf.grid.origin_y)
+                          - static_cast<double>(rowMin) * RESOLUTION;
+
     writeRGBAGeoTIFF(
         filename,
-        reinterpret_cast<const uint8_t*>(res.status.data()),
-        /*coveredValue=*/static_cast<uint8_t>(CoverageStatus::COVERED),
-        GREEN, TRANSPARENT,
-        res.gridCols, res.gridRows,
-        static_cast<double>(g.conf.grid.origin_x),
-        static_cast<double>(g.conf.grid.origin_y),
+        statusBuf + static_cast<size_t>(rowMin) * res.gridCols + colMin,
+        coveredValue, GREEN, TRANSPARENT,
+        winCols, winRows,
+        originX, originY,
         static_cast<double>(RESOLUTION),
         reductionPercent,
-        /*markerRow=*/res.srcRow, /*markerCol=*/res.srcCol);
+        /*markerRow=*/res.srcRow - rowMin, /*markerCol=*/res.srcCol - colMin,
+        /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
+        /*palette=*/nullptr,
+        /*srcStride=*/res.gridCols);
 }
 
-// Binary fast-mode result (0/1 covered mask) from computeFast().
+// ----------------------------------------------------------------------
+// RadarEngine — binary fast-mode mask (0/1) from computeFast()
+// ----------------------------------------------------------------------
 void RadarEngine::writeFastToGeoTIFF(
     const std::vector<uint8_t>& fastMask, const std::string& filename,
     int reductionPercent)
 {
+    int rowMin, rowMax, colMin, colMax;
+    if (!computeCoverageBBox(fastMask.data(), gridCols, gridRows,
+                             /*coveredValue=*/1, rowMin, rowMax, colMin, colMax)) {
+        std::cerr << "[radar-fast-tif] WARN: nothing covered -- skipping "
+                  << filename << "\n";
+        return;
+    }
+
+    rowMin = std::min(rowMin, srcRow);
+    rowMax = std::max(rowMax, srcRow);
+    colMin = std::min(colMin, srcCol);
+    colMax = std::max(colMax, srcCol);
+
+    constexpr int kPad = 10;
+    rowMin = std::max(0,            rowMin - kPad);
+    colMin = std::max(0,            colMin - kPad);
+    rowMax = std::min(gridRows - 1, rowMax + kPad);
+    colMax = std::min(gridCols - 1, colMax + kPad);
+
+    const int winCols = colMax - colMin + 1;
+    const int winRows = rowMax - rowMin + 1;
+
+    const double originX = static_cast<double>(g.conf.grid.origin_x)
+                          + static_cast<double>(colMin) * RESOLUTION;
+    const double originY = static_cast<double>(g.conf.grid.origin_y)
+                          - static_cast<double>(rowMin) * RESOLUTION;
+
     writeRGBAGeoTIFF(
         filename,
-        fastMask.data(),
+        fastMask.data() + static_cast<size_t>(rowMin) * gridCols + colMin,
         /*coveredValue=*/1, GREEN, TRANSPARENT,
-        gridCols, gridRows,
-        static_cast<double>(g.conf.grid.origin_x),
-        static_cast<double>(g.conf.grid.origin_y),
+        winCols, winRows,
+        originX, originY,
         static_cast<double>(RESOLUTION),
         reductionPercent,
-        /*markerRow=*/srcRow, /*markerCol=*/srcCol);
+        /*markerRow=*/srcRow - rowMin, /*markerCol=*/srcCol - colMin,
+        /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
+        /*palette=*/nullptr,
+        /*srcStride=*/gridCols);
 }
 
 // ======================================================================
@@ -644,37 +775,75 @@ bool writeReverseBreakPointsGeoTIFF(
         }
     }
     if (skipped > 0)
-        std::cerr << "[breakpoint-tif] WARN: " << skipped << " of "
-                  << breakPoints.size() << " break points fell outside the "
-                  << winCols << "x" << winRows << " window and were skipped\n";
+            std::cerr << "[breakpoint-tif] WARN: " << skipped << " of "
+                      << breakPoints.size() << " break points fell outside the "
+                      << winCols << "x" << winRows << " window and were skipped\n";
 
-    const double originX = static_cast<double>(g.conf.grid.origin_x)
-                          + static_cast<double>(winColMin) * RESOLUTION;
-    const double originY = static_cast<double>(g.conf.grid.origin_y)
-                          - static_cast<double>(winRowMin) * RESOLUTION;
+        // Tighten to what actually got drawn (segments + dots), rather than
+        // writing the caller's full search window verbatim.
+        int bRowMin, bRowMax, bColMin, bColMax;
+        if (!computeCoverageBBox(buf.data(), winCols, winRows, V_SEGMENT,
+                                 bRowMin, bRowMax, bColMin, bColMax)) {
+            // V_SEGMENT alone may miss an isolated dot with no fill segment
+            // (fillToBreakPoints == false); fall back to scanning for any
+            // non-empty cell in that case.
+            auto anyDrawn = [&](int& r0, int& r1, int& c0, int& c1) {
+                r0 = winRows; r1 = -1; c0 = winCols; c1 = -1;
+                for (int y = 0; y < winRows; ++y)
+                    for (int x = 0; x < winCols; ++x)
+                        if (buf[static_cast<size_t>(y) * winCols + x] != V_EMPTY) {
+                            r0 = std::min(r0, y); r1 = std::max(r1, y);
+                            c0 = std::min(c0, x); c1 = std::max(c1, x);
+                        }
+                return r1 >= r0;
+            };
+            if (!anyDrawn(bRowMin, bRowMax, bColMin, bColMax)) {
+                std::cerr << "[breakpoint-tif] WARN: nothing drawn -- skipping "
+                          << filename << "\n";
+                return false;
+            }
+        }
+        if (srcInWindow) {
+            bRowMin = std::min(bRowMin, localSrcR);
+            bRowMax = std::max(bRowMax, localSrcR);
+            bColMin = std::min(bColMin, localSrcC);
+            bColMax = std::max(bColMax, localSrcC);
+        }
+        const int kPad = std::max(10, dotRadiusCells + 2);
+        bRowMin = std::max(0,            bRowMin - kPad);
+        bColMin = std::max(0,            bColMin - kPad);
+        bRowMax = std::min(winRows - 1, bRowMax + kPad);
+        bColMax = std::min(winCols - 1, bColMax + kPad);
 
-    RGBA palette[256];
-    for (auto& e : palette) e = TRANSPARENT;
-    palette[V_SEGMENT]    = GREEN;
-    palette[V_BREAKPOINT] = BREAK_DOT;
+        const int cropCols = bColMax - bColMin + 1;
+        const int cropRows = bRowMax - bRowMin + 1;
 
-    const bool ok = writeRGBAGeoTIFF(
-        filename,
-        buf.data(),
-        // coveredValue / coveredColor / otherColor are unused in
-        // palette mode -- the palette below drives the coloring.
-        /*coveredValue=*/0, TRANSPARENT, TRANSPARENT,
-        winCols, winRows,
-        originX, originY,
-        static_cast<double>(RESOLUTION),
-        reductionPercent,
-        srcInWindow ? localSrcR : -1,
-        srcInWindow ? localSrcC : -1,
-        /*markerRadiusCells=*/8,
-        /*markerColor=*/RGBA{255, 0, 255, 255},   // magenta, as in the PNG
-        /*markerRingColor=*/RGBA{0, 0, 0, 255},   // black halo
-        /*markerRingThicknessCells=*/2,
-        palette);
+        const double originX = static_cast<double>(g.conf.grid.origin_x)
+                              + static_cast<double>(winColMin + bColMin) * RESOLUTION;
+        const double originY = static_cast<double>(g.conf.grid.origin_y)
+                              - static_cast<double>(winRowMin + bRowMin) * RESOLUTION;
+
+        RGBA palette[256];
+        for (auto& e : palette) e = TRANSPARENT;
+        palette[V_SEGMENT]    = GREEN;
+        palette[V_BREAKPOINT] = BREAK_DOT;
+
+        const bool ok = writeRGBAGeoTIFF(
+            filename,
+            buf.data() + static_cast<size_t>(bRowMin) * winCols + bColMin,
+            /*coveredValue=*/0, TRANSPARENT, TRANSPARENT,
+            cropCols, cropRows,
+            originX, originY,
+            static_cast<double>(RESOLUTION),
+            reductionPercent,
+            srcInWindow ? localSrcR - bRowMin : -1,
+            srcInWindow ? localSrcC - bColMin : -1,
+            /*markerRadiusCells=*/8,
+            /*markerColor=*/RGBA{255, 0, 255, 255},
+            /*markerRingColor=*/RGBA{0, 0, 0, 255},
+            /*markerRingThicknessCells=*/2,
+            palette,
+            /*srcStride=*/winCols);
 
     if (ok)
         std::cout << "[breakpoint-tif] "
