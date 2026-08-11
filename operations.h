@@ -42,6 +42,16 @@ enum class LOSStatus : uint8_t
     OUT_OF_GRID    = 7,
 };
 
+enum class OutputCrs { Native7755, Wgs84, Both };
+
+// Band layout of the emitted GeoTIFF.
+//   Rgba              -- 4-band R,G,B,A Byte raster (default). True alpha,
+//                        honoured by everything, ~4x the pixel data.
+//   SingleBandPalette -- 1-band Byte raster + color table. ~1/4 the size,
+//                        but transparency is expressed as NoData (index 0),
+//                        which only GIS-aware readers respect.
+enum class BandLayout { Rgba, SingleBandPalette };
+
 static const char* losStatusStr(LOSStatus s)
 {
     switch(s){
@@ -245,7 +255,12 @@ public:
     public: void writeViewshedToSVG(const std::string& filename);
     public: void writeViewshedToPNG(const std::string& filename);
     public: static std::string base64Encode(const uint8_t* data, size_t length);
-    public: void writeViewshedToGeoTIFF(const std::string& filename,int reductionPercent);
+    public: void writeViewshedToGeoTIFF(
+            const std::string& filename,
+            int reductionPercent = 0,
+            OutputCrs outCrs = OutputCrs::Native7755,
+            BandLayout bands = BandLayout::Rgba);
+
 
 };
 
@@ -409,9 +424,8 @@ public:
         double   minElevDeg, double maxElevDeg,
         double   maxRangeKM);
 
-    void writeFastToGeoTIFF(const std::vector<uint8_t>& fastMask, const std::string& filename,int reductionPercent);
-
-    void writeCoverageToGeoTIFF(const RadarCoverageResult& res, const std::string& filename,int reductionPercent);
+    void writeCoverageToGeoTIFF(const RadarCoverageResult&, const std::string&,int, OutputCrs, BandLayout = BandLayout::SingleBandPalette);
+    void writeFastToGeoTIFF(const std::vector<uint8_t>&, const std::string&,int, OutputCrs, BandLayout = BandLayout::SingleBandPalette);
 
     inline static void printLOSResult(const RadarLOSResult& r,
                                double srcLat, double srcLon,
@@ -450,12 +464,8 @@ public:
         int reduction = 50);
 };
 
-bool writeOverlapGeoTIFF(
-    Global&                        g,
-    const FeasibleGrid&            aoiGrid,
-    const std::string&             filename,
-    const std::vector<GridPoint>&  placements,
-    int                            reductionPercent);
-
+bool writeOverlapGeoTIFF(Global&, const FeasibleGrid&, const std::string&,
+                         const std::vector<GridPoint>&, int, OutputCrs,
+                         BandLayout = BandLayout::SingleBandPalette);
 
 #endif

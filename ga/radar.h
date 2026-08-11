@@ -400,7 +400,7 @@ inline std::vector<int> calculate_radar_coverage_overlap(
         if(std::string::npos != idx){
             p = tifPath.substr(0,idx+1);
         }
-        writeOverlapGeoTIFF(g, aoiGrid, tifPath, placements, reduction);
+        writeOverlapGeoTIFF(g, aoiGrid, tifPath, placements, reduction, OutputCrs::Wgs84);
         if(write_png){
             Bin::writeFeasibleGridOverlapPng(aoiGrid, p+"result.png", placements, grid,
                     g.bin.flag_road, g.bin.flag_rail,

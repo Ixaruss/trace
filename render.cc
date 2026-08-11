@@ -17,16 +17,28 @@
  *   used by Bin::getGridCoords (col grows east with +x, row grows
  *   south as y decreases), so pixelHeight is negative (north-up raster).
  *
- * TRANSPARENCY: written as a real 4-band RGBA raster (not a single-band
- * indexed palette with per-entry alpha). Palette alpha is only reliably
- * honored by GIS-aware tools; a genuine alpha band is respected by
- * QGIS, GDAL, browsers, and plain image viewers alike. "Not covered" /
- * "not visible" cells get alpha=0 so only the actual green footprint
- * shows against whatever the raster is composited over.
+ * TRANSPARENCY: written as a real 4-band RGBA raster by default (not a
+ * single-band indexed palette with per-entry alpha). Palette alpha is
+ * only reliably honored by GIS-aware tools; a genuine alpha band is
+ * respected by QGIS, GDAL, browsers, and plain image viewers alike.
+ * "Not covered" / "not visible" cells get alpha=0 so only the actual
+ * green footprint shows against whatever the raster is composited over.
  *
- * Rows are streamed one at a time rather than building full-grid RGBA
- * buffers up front — this grid is ~1.07 billion cells, so 4 full-size
- * planes would mean ~4 GB of extra pixel-data memory alone.
+ * BAND LAYOUT (bands): every writer also takes an optional BandLayout
+ * (Rgba / SingleBandPalette). Rgba is the default described above.
+ * SingleBandPalette writes one Byte band plus a GDAL color table instead
+ * of four Byte bands — about 1/4 the pixel data — but the TIFF ColorMap
+ * tag carries RGB only, GDAL does not persist per-entry alpha into it.
+ * So single-band transparency is expressed as NoData on index 0 (which
+ * is always reserved for fully-transparent) instead of a true alpha
+ * channel. QGIS and GDAL-based tools honor that NoData value; a plain
+ * image viewer will not, and will show index 0's color-table entry
+ * (black) instead of "nothing here." Pick SingleBandPalette only when
+ * the consumer is known to be GIS-aware and the size savings matter.
+ *
+ * Rows are streamed one at a time rather than building full-grid
+ * buffers up front — this grid is ~1.07 billion cells, so full-size
+ * planes would mean multiple GB of extra pixel-data memory alone.
  *
  * DOWNSAMPLING (reductionPercent): every writer takes an optional
  * `reductionPercent` in [0, 100]. 0 (the default) writes at native
@@ -42,6 +54,20 @@
  * AABB, or the mask's rowMin/colMin box) rather than the full grid.
  * The geotransform origin is shifted by that window's row/col offset,
  * so these still overlay the full-grid products correctly.
+ *
+ * OUTPUT CRS (outCrs): every writer also takes an optional OutputCrs
+ * (Native7755 / Wgs84 / Both). The raster is always *rasterized* once,
+ * in EPSG:7755 -- that's the CRS the grid math is already in, so it's
+ * the only path that's free of resampling error. When EPSG:4326 is
+ * requested, that native raster is warped (nearest-neighbour, see
+ * warpToWgs84 below) into a second file rather than reprojecting the
+ * grid coordinates per cell during rasterization. This keeps a single
+ * source of truth for "what does this cell look like" and makes the
+ * 4326 product a strict, verifiable derivative of the 7755 one. For a
+ * SingleBandPalette source, the warp is nearest with NoData=0 on both
+ * ends rather than an alpha-aware warp, so the "outside the rotated
+ * footprint" corner wedges stay NoData instead of picking up index 0's
+ * color-table entry.
  */
 
 #include "operations.h"
@@ -50,9 +76,13 @@
 #include <gdal_priv.h>
 #include <ogr_spatialref.h>
 #include <cpl_string.h>
+#include <gdal_utils.h>
+#include <cpl_vsi.h>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <unordered_map>
 
 namespace {
 
@@ -119,6 +149,153 @@ void applyGeoreferencing(GDALDataset* ds, const double gt[6],
             std::cerr << "[ERROR] SetSpatialRef failed for " << filename
                       << " -- output will not be georeferenced\n";
     }
+}
+
+// ======================================================================
+// Reprojection to EPSG:4326
+// ======================================================================
+//
+// We rasterize once in EPSG:7755 and warp that, rather than projecting
+// per cell during the write. The grid's x/y ARE 7755 metres, so the
+// native product stays byte-exact and the 4326 one is a pure resample
+// of it — the two can't disagree about what's covered.
+//
+// RESAMPLING IS NEAREST, deliberately. These are classification colors
+// with a hard alpha edge: "not covered" is (0,0,0,0), so any averaging
+// kernel blends RGB 0 into the footprint boundary and leaves a dark
+// fringe around every coverage blob, plus half-transparent cells that
+// mean nothing. Nearest keeps the palette exact.
+//
+// INIT_DEST=0 makes destination pixels the warp never touches fully
+// transparent (alpha 0) instead of undefined — the reprojected raster
+// is a rotated parallelogram inside a north-up 4326 box, so those
+// corner wedges exist in every output. For a paletted source there is
+// no alpha band to init, so srcnodata/dstnodata=0 does the equivalent
+// job: untouched pixels come out as index 0, which is also NoData.
+
+// Insert `suffix` before the extension: "cov.tif" -> "cov_wgs84.tif".
+std::string insertSuffix(const std::string& path, const std::string& suffix)
+{
+    const size_t slash = path.find_last_of("/\\");
+    const size_t dot   = path.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+        return path + suffix;                       // no extension
+    return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
+// `paletted` selects how the destination is told to preserve
+// transparency: a real alpha band (RGBA source) or NoData=0 (single-band
+// palette source, which has no alpha band to carry across the warp).
+bool warpToWgs84(const std::string& srcPath, const std::string& dstPath,
+                 bool paletted)
+{
+    GDALDatasetH src = GDALOpen(srcPath.c_str(), GA_ReadOnly);
+    if (!src) {
+        std::cerr << "[ERROR] Reprojection: could not reopen " << srcPath << "\n";
+        return false;
+    }
+
+    // If epsg7755Srs() fell all the way through, the source carries no
+    // CRS and a warp to 4326 would be a fabrication. Bail loudly and
+    // leave the untagged native raster as the only output.
+    const char* proj = GDALGetProjectionRef(src);
+    if (!proj || proj[0] == '\0') {
+        std::cerr << "[ERROR] Reprojection: " << srcPath << " has no CRS "
+                     "(EPSG:7755 lookup must have failed) -- cannot warp to "
+                     "EPSG:4326\n";
+        GDALClose(src);
+        return false;
+    }
+
+    char** argv = nullptr;
+    argv = CSLAddString(argv, "-of");     argv = CSLAddString(argv, "GTiff");
+    argv = CSLAddString(argv, "-t_srs");  argv = CSLAddString(argv, "EPSG:4326");
+    argv = CSLAddString(argv, "-r");      argv = CSLAddString(argv, "near");
+    argv = CSLAddString(argv, "-wo");     argv = CSLAddString(argv, "INIT_DEST=0");
+    argv = CSLAddString(argv, "-co");     argv = CSLAddString(argv, "COMPRESS=LZW");
+    argv = CSLAddString(argv, "-co");     argv = CSLAddString(argv, "TILED=YES");
+    argv = CSLAddString(argv, "-co");     argv = CSLAddString(argv, "BIGTIFF=IF_SAFER");
+    if (paletted) {
+        // Nearest keeps the palette indices exact (no averaging garbage
+        // indices into existence); 0 is NoData on both ends so the
+        // untouched corner wedges stay "nothing here" rather than
+        // becoming whatever colour table slot 0 happens to hold.
+        argv = CSLAddString(argv, "-srcnodata"); argv = CSLAddString(argv, "0");
+        argv = CSLAddString(argv, "-dstnodata"); argv = CSLAddString(argv, "0");
+    } else {
+        argv = CSLAddString(argv, "-co"); argv = CSLAddString(argv, "ALPHA=YES");
+        argv = CSLAddString(argv, "-co"); argv = CSLAddString(argv, "PHOTOMETRIC=RGB");
+    }
+    argv = CSLAddString(argv, "-multi");
+    argv = CSLAddString(argv, "-overwrite");
+
+    GDALWarpAppOptions* wopts = GDALWarpAppOptionsNew(argv, nullptr);
+    CSLDestroy(argv);
+    if (!wopts) {
+        std::cerr << "[ERROR] Reprojection: GDALWarpAppOptionsNew failed\n";
+        GDALClose(src);
+        return false;
+    }
+
+    int usageErr = 0;
+    GDALDatasetH out = GDALWarp(dstPath.c_str(), nullptr, 1, &src, wopts, &usageErr);
+
+    GDALWarpAppOptionsFree(wopts);
+    GDALClose(src);
+
+    if (!out) {
+        std::cerr << "[ERROR] Reprojection to EPSG:4326 failed for " << dstPath
+                  << " (GDAL: " << CPLGetLastErrorMsg() << ")\n";
+        return false;
+    }
+
+    const int w = GDALGetRasterXSize(out), h = GDALGetRasterYSize(out);
+    GDALClose(out);
+
+    std::cout << "[INFO]   Reprojected to EPSG:4326: " << dstPath
+              << " (" << w << " x " << h << ")\n";
+    return true;
+}
+
+// Path planning shared by both top-level writers. The 7755 raster is
+// always physically written first (it's the warp input); `nativePath`
+// is a temp file when the caller only asked for 4326.
+struct CrsPlan {
+    std::string nativePath;   // where the 7755 raster is written
+    std::string wgs84Path;    // where the 4326 raster goes (empty if none)
+    bool        keepNative;
+};
+
+CrsPlan planCrsOutputs(const std::string& filename, OutputCrs outCrs)
+{
+    switch (outCrs) {
+        case OutputCrs::Wgs84:
+            return { filename + ".native7755.tmp.tif", filename, false };
+        case OutputCrs::Both:
+            return { filename, insertSuffix(filename, "_wgs84"), true };
+        case OutputCrs::Native7755:
+        default:
+            return { filename, std::string(), true };
+    }
+}
+
+// Run after the native raster is closed. Returns false only if a
+// requested reprojection actually failed. `paletted` must match the
+// band layout the native raster was actually written with.
+bool finalizeCrsOutputs(const CrsPlan& plan, bool paletted)
+{
+    if (plan.wgs84Path.empty()) return true;
+
+    const bool ok = warpToWgs84(plan.nativePath, plan.wgs84Path, paletted);
+
+    if (!plan.keepNative) {
+        // Caller asked for 4326 only. Keep the intermediate if the warp
+        // failed -- losing the data entirely is worse than an extra file.
+        if (ok) VSIUnlink(plan.nativePath.c_str());
+        else    std::cerr << "[WARN] Keeping intermediate 7755 raster at "
+                          << plan.nativePath << " since the warp failed\n";
+    }
+    return ok;
 }
 
 struct RGBA { uint8_t r, g, b, a; };
@@ -215,11 +392,107 @@ inline int scaleIndex(int idx, int srcN, int outN)
     return std::min(outN - 1, std::max(0, out));
 }
 
+// ======================================================================
+// Single-band paletted output
+// ======================================================================
+//
+// The color decision per pixel is IDENTICAL to the RGBA path -- we just
+// emit an index into a color table instead of four samples. So the two
+// layouts are guaranteed to agree pixel-for-pixel on what colour a cell
+// got; only the encoding differs.
+//
+// Index 0 is reserved for fully-transparent and tagged as NoData,
+// because the TIFF ColorMap tag has no alpha channel: GDAL will write
+// the RGB triplets and silently drop the alpha we set on each entry.
+// NoData is the only transparency signal that survives the round trip
+// (and it's also what INIT_DEST=0 / srcnodata=0 leaves behind at the
+// warp step, so the two mechanisms line up).
+//
+// The whole palette is registered BEFORE the first RasterIO -- the GTiff
+// driver requires SetColorTable() to precede pixel writes, so a lazily
+// grown table would be dropped on the floor. Callers therefore pre-seed
+// this with every colour that can possibly appear (markers first, then
+// the fixed classification/ramp colours) rather than discovering colours
+// as pixels are visited.
+
+struct RgbaIndexer {
+    std::vector<RGBA>                     lut;
+    std::unordered_map<uint32_t, uint8_t> byColor;
+    size_t                                overflow = 0;
+
+    RgbaIndexer() { (void)index(RGBA{0, 0, 0, 0}); }  // slot 0 == NoData
+
+    static uint32_t pack(RGBA c) {
+        return (uint32_t(c.r) << 24) | (uint32_t(c.g) << 16) |
+               (uint32_t(c.b) <<  8) |  uint32_t(c.a);
+    }
+
+    uint8_t index(RGBA c) {
+        const uint32_t key = pack(c);
+        auto it = byColor.find(key);
+        if (it != byColor.end()) return it->second;
+        if (lut.size() >= 256) { ++overflow; return nearest(c); }
+        const uint8_t idx = static_cast<uint8_t>(lut.size());
+        lut.push_back(c);
+        byColor.emplace(key, idx);
+        return idx;
+    }
+
+    // Only reachable with a >256-colour source palette. Alpha is
+    // weighted hard so an opaque colour never collapses onto a
+    // transparent entry (that would punch holes in the footprint,
+    // which is far worse than a slightly-off hue).
+    uint8_t nearest(RGBA c) const {
+        uint8_t best = 0;
+        long long bestD = std::numeric_limits<long long>::max();
+        for (size_t i = 0; i < lut.size(); ++i) {
+            const long long dr = int(lut[i].r) - c.r, dg = int(lut[i].g) - c.g;
+            const long long db = int(lut[i].b) - c.b, da = int(lut[i].a) - c.a;
+            const long long d  = dr*dr + dg*dg + db*db + 64*da*da;
+            if (d < bestD) { bestD = d; best = static_cast<uint8_t>(i); }
+        }
+        return best;
+    }
+};
+
+void applyColorTable(GDALRasterBand* band, const RgbaIndexer& ix,
+                     const std::string& filename)
+{
+    GDALColorTable ct(GPI_RGB);
+    for (size_t i = 0; i < ix.lut.size(); ++i) {
+        const RGBA& c = ix.lut[i];
+        // The 4th component is set for readers that do carry alpha
+        // through a color table copy; GTiff itself ignores it, which is
+        // exactly why index 0 is also marked NoData below.
+        GDALColorEntry e{ short(c.r), short(c.g), short(c.b), short(c.a) };
+        ct.SetColorEntry(static_cast<int>(i), &e);
+    }
+
+    band->SetColorInterpretation(GCI_PaletteIndex);
+    if (band->SetColorTable(&ct) != CE_None)
+        std::cerr << "[ERROR] SetColorTable failed for " << filename
+                  << " -- single-band raster will have no colours\n";
+    if (band->SetNoDataValue(0.0) != CE_None)
+        std::cerr << "[WARN] SetNoDataValue(0) failed for " << filename
+                  << " -- uncovered cells may render opaque\n";
+
+    if (ix.overflow)
+        std::cerr << "[WARN] " << filename << ": palette exceeded 256 entries ("
+                  << ix.overflow << " colour(s) snapped to the nearest slot)\n";
+}
+
 // ----------------------------------------------------------------------
-// Core writer: 4-band (R,G,B,A) Byte GeoTIFF, LZW-compressed.
+// Core writer: Byte GeoTIFF, LZW-compressed, in one of two band layouts
+// (see BandLayout in operations.h):
+//
+//   BandLayout::Rgba              -- 4-band (R,G,B,A), true alpha.
+//   BandLayout::SingleBandPalette -- 1-band + GDAL color table, NoData=0
+//       standing in for alpha (see the "Single-band paletted output"
+//       section above for why).
 //
 // `src` is a single-band classification buffer (cols*rows bytes,
-// row-major, row 0 = north/top). Two coloring modes:
+// row-major, row 0 = north/top). Two coloring modes, independent of the
+// band layout above:
 //
 //   palette == nullptr  -- each cell is `coveredColor` if it equals
 //       coveredValue, else `otherColor`. Downsampling rule: a block is
@@ -237,6 +510,11 @@ inline int scaleIndex(int idx, int srcN, int outN)
 // majority, both of which erase single-cell slivers and thin ridgeline
 // coverage -- exactly the detail worth keeping when you're zoomed out
 // far enough to need a reduced raster in the first place.
+//
+// `outCrs` controls what gets written to disk: the native EPSG:7755
+// raster (default), an EPSG:4326 warp of it, or both. See the
+// "Reprojection to EPSG:4326" section above for why this is a
+// warp-after-write rather than a per-cell reprojection.
 // ----------------------------------------------------------------------
 bool writeRGBAGeoTIFF(
     const std::string& filename,
@@ -257,7 +535,9 @@ bool writeRGBAGeoTIFF(
     RGBA                   markerRingColor = {255, 255, 255, 255},
     int                    markerRingThicknessCells = 2,
     const RGBA*            palette = nullptr,
-    int                    srcStride = -1)     // 256 entries, or null
+    int                    srcStride = -1,     // 256 entries, or null
+    OutputCrs              outCrs = OutputCrs::Native7755,
+    BandLayout             bands = BandLayout::Rgba)
 {
     if (cols <= 0 || rows <= 0) {
         std::cerr << "[ERROR] Invalid raster dimensions "
@@ -266,6 +546,7 @@ bool writeRGBAGeoTIFF(
     }
 
     const int stride = (srcStride > 0) ? srcStride : cols;
+    const bool paletted = (bands == BandLayout::SingleBandPalette);
 
     reductionPercent = clampReduction(reductionPercent, "writeRGBAGeoTIFF");
     const int outCols = reducedDim(cols, reductionPercent);
@@ -280,18 +561,25 @@ bool writeRGBAGeoTIFF(
     }
 
     char** opts = nullptr;
-    opts = CSLSetNameValue(opts, "COMPRESS",   "LZW");
-    opts = CSLSetNameValue(opts, "TILED",      "YES");
-    opts = CSLSetNameValue(opts, "BIGTIFF",    "IF_SAFER");
-    opts = CSLSetNameValue(opts, "ALPHA",      "YES");
-    opts = CSLSetNameValue(opts, "PHOTOMETRIC","RGB");
+    opts = CSLSetNameValue(opts, "COMPRESS", "LZW");
+    opts = CSLSetNameValue(opts, "TILED",    "YES");
+    opts = CSLSetNameValue(opts, "BIGTIFF",  "IF_SAFER");
+    if (paletted) {
+        opts = CSLSetNameValue(opts, "PHOTOMETRIC", "PALETTE");
+    } else {
+        opts = CSLSetNameValue(opts, "ALPHA",       "YES");
+        opts = CSLSetNameValue(opts, "PHOTOMETRIC", "RGB");
+    }
+
+    const CrsPlan plan = planCrsOutputs(filename, outCrs);
 
     GDALDataset* ds = driver->Create(
-        filename.c_str(), outCols, outRows, /*bands=*/4, GDT_Byte, opts);
+        plan.nativePath.c_str(), outCols, outRows,
+        /*bands=*/paletted ? 1 : 4, GDT_Byte, opts);
     CSLDestroy(opts);
 
     if (!ds) {
-        std::cerr << "[ERROR] Failed to create GeoTIFF: " << filename << "\n";
+        std::cerr << "[ERROR] Failed to create GeoTIFF: " << plan.nativePath << "\n";
         return false;
     }
 
@@ -305,20 +593,13 @@ bool writeRGBAGeoTIFF(
         originX, pixelW, 0.0,
         originY, 0.0,    -pixelH
     };
-    applyGeoreferencing(ds, gt, filename);
-
-    GDALRasterBand* rBand = ds->GetRasterBand(1);
-    GDALRasterBand* gBand = ds->GetRasterBand(2);
-    GDALRasterBand* bBand = ds->GetRasterBand(3);
-    GDALRasterBand* aBand = ds->GetRasterBand(4);
-    rBand->SetColorInterpretation(GCI_RedBand);
-    gBand->SetColorInterpretation(GCI_GreenBand);
-    bBand->SetColorInterpretation(GCI_BlueBand);
-    aBand->SetColorInterpretation(GCI_AlphaBand);
+    applyGeoreferencing(ds, gt, plan.nativePath);
 
     // Marker geometry lives in OUTPUT pixel space: only the center is
     // rescaled, the radius stays put, so the marker keeps the same
-    // on-screen size instead of shrinking away with the raster.
+    // on-screen size instead of shrinking away with the raster. Computed
+    // before band setup because the palette (if any) needs to know
+    // whether marker colours will actually appear.
     const bool hasMarker = (markerRow >= 0 && markerCol >= 0 &&
                             markerRow < rows && markerCol < cols);
     const int outMarkerRow = hasMarker ? scaleIndex(markerRow, rows, outRows) : -1;
@@ -328,15 +609,42 @@ bool writeRGBAGeoTIFF(
     const long long innerRSq = (long long)(markerRadiusCells - markerRingThicknessCells)
                               * (markerRadiusCells - markerRingThicknessCells);
 
+    GDALRasterBand *rBand = nullptr, *gBand = nullptr,
+                   *bBand = nullptr, *aBand = nullptr, *iBand = nullptr;
+    RgbaIndexer ix;
+
+    if (paletted) {
+        iBand = ds->GetRasterBand(1);
+        // Register every colour that can possibly be emitted, before any
+        // pixel is written. Markers first: they're few and must never be
+        // the ones that get squeezed out by a large source palette.
+        if (hasMarker) { ix.index(markerColor); ix.index(markerRingColor); }
+        if (palette) { for (int i = 0; i < 256; ++i) ix.index(palette[i]); }
+        else         { ix.index(otherColor); ix.index(coveredColor); }
+        applyColorTable(iBand, ix, plan.nativePath);
+    } else {
+        rBand = ds->GetRasterBand(1);
+        gBand = ds->GetRasterBand(2);
+        bBand = ds->GetRasterBand(3);
+        aBand = ds->GetRasterBand(4);
+        rBand->SetColorInterpretation(GCI_RedBand);
+        gBand->SetColorInterpretation(GCI_GreenBand);
+        bBand->SetColorInterpretation(GCI_BlueBand);
+        aBand->SetColorInterpretation(GCI_AlphaBand);
+    }
+
     // Column blocks are identical for every row, so resolve them once
     // instead of redoing the integer math per pixel.
     std::vector<int> colLo(outCols), colHi(outCols);
     for (int x = 0; x < outCols; ++x)
         srcSpan(x, outCols, cols, colLo[x], colHi[x]);
 
-    // Bounded to O(outCols) per iteration -- one scanline of each band
-    // at a time, not the full W*H*4 image at once.
-    std::vector<uint8_t> rowR(outCols), rowG(outCols), rowB(outCols), rowA(outCols);
+    // Bounded to O(outCols) per iteration -- one scanline at a time, not
+    // the full image at once.
+    std::vector<uint8_t> rowR, rowG, rowB, rowA, rowI;
+    if (paletted) rowI.resize(outCols);
+    else { rowR.resize(outCols); rowG.resize(outCols);
+           rowB.resize(outCols); rowA.resize(outCols); }
 
     bool ok = true;
     for (int y = 0; y < outRows && ok; ++y) {
@@ -382,34 +690,47 @@ bool writeRGBAGeoTIFF(
                     c = (distSq >= innerRSq) ? markerRingColor : markerColor;
             }
 
-            rowR[x] = c.r; rowG[x] = c.g; rowB[x] = c.b; rowA[x] = c.a;
+            if (paletted) {
+                rowI[x] = ix.index(c);
+            } else {
+                rowR[x] = c.r; rowG[x] = c.g; rowB[x] = c.b; rowA[x] = c.a;
+            }
         }
-        ok = ok && rBand->RasterIO(GF_Write, 0, y, outCols, 1, rowR.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && gBand->RasterIO(GF_Write, 0, y, outCols, 1, rowG.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && bBand->RasterIO(GF_Write, 0, y, outCols, 1, rowB.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && aBand->RasterIO(GF_Write, 0, y, outCols, 1, rowA.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+
+        if (paletted) {
+            ok = ok && iBand->RasterIO(GF_Write, 0, y, outCols, 1, rowI.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+        } else {
+            ok = ok && rBand->RasterIO(GF_Write, 0, y, outCols, 1, rowR.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+            ok = ok && gBand->RasterIO(GF_Write, 0, y, outCols, 1, rowG.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+            ok = ok && bBand->RasterIO(GF_Write, 0, y, outCols, 1, rowB.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+            ok = ok && aBand->RasterIO(GF_Write, 0, y, outCols, 1, rowA.data(), outCols, 1, GDT_Byte, 0, 0) == CE_None;
+        }
     }
 
     GDALClose(ds);
 
     if (!ok) {
-        std::cerr << "[ERROR] RasterIO write failed for " << filename << "\n";
+        std::cerr << "[ERROR] RasterIO write failed for " << plan.nativePath << "\n";
         return false;
     }
 
-    std::cout << "[INFO]   Wrote GeoTIFF: " << filename
-              << " (" << outCols << " x " << outRows << ", RGBA";
+    std::cout << "[INFO]   Wrote GeoTIFF: " << plan.nativePath
+              << " (" << outCols << " x " << outRows
+              << (paletted ? ", 1-band palette" : ", RGBA");
     if (reductionPercent > 0)
         std::cout << ", reduced " << reductionPercent << "% from "
                   << cols << " x " << rows
                   << ", pixel " << pixelW << "m";
     std::cout << ")\n";
-    return true;
+
+    return finalizeCrsOutputs(plan, paletted);
 }
 
 // Alpha=160/255 (~63% opaque) so the basemap underneath remains visible
 // through the coverage overlay. Bump toward 255 for a more solid fill,
-// or lower for more see-through.
+// or lower for more see-through. (In SingleBandPalette mode this alpha
+// value is only meaningful for the color-table entry itself; the
+// per-pixel transparency is still all-or-nothing via NoData.)
 constexpr RGBA GREEN       { 0, 200, 0, 160 };
 constexpr RGBA TRANSPARENT { 0,   0, 0,   0 };
 
@@ -427,7 +748,8 @@ constexpr RGBA    BREAK_DOT { 220, 30, 30, 255 };
 // ViewshedEngine — binary mask (0 = not visible, 1 = visible)
 // ----------------------------------------------------------------------
 void ViewshedEngine::writeViewshedToGeoTIFF(
-    const std::string& filename, int reductionPercent)
+    const std::string& filename, int reductionPercent, OutputCrs outCrs,
+    BandLayout bands)
 {
     int rowMin, rowMax, colMin, colMax;
     if (!computeCoverageBBox(viewshedMask.data(), gridCols, gridRows,
@@ -471,7 +793,9 @@ void ViewshedEngine::writeViewshedToGeoTIFF(
         /*markerRow=*/centerX - rowMin, /*markerCol=*/centerY - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
         /*palette=*/nullptr,
-        /*srcStride=*/gridCols);
+        /*srcStride=*/gridCols,
+        outCrs,
+        bands);
 }
 
 // ----------------------------------------------------------------------
@@ -483,7 +807,7 @@ void ViewshedEngine::writeViewshedToGeoTIFF(
 // ----------------------------------------------------------------------
 void RadarEngine::writeCoverageToGeoTIFF(
     const RadarCoverageResult& res, const std::string& filename,
-    int reductionPercent)
+    int reductionPercent, OutputCrs outCrs, BandLayout bands)
 {
     static_assert(sizeof(CoverageStatus) == sizeof(uint8_t),
         "CoverageStatus must be byte-sized for the reinterpret_cast below "
@@ -532,7 +856,9 @@ void RadarEngine::writeCoverageToGeoTIFF(
         /*markerRow=*/res.srcRow - rowMin, /*markerCol=*/res.srcCol - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
         /*palette=*/nullptr,
-        /*srcStride=*/res.gridCols);
+        /*srcStride=*/res.gridCols,
+        outCrs,
+        bands);
 }
 
 // ----------------------------------------------------------------------
@@ -540,7 +866,7 @@ void RadarEngine::writeCoverageToGeoTIFF(
 // ----------------------------------------------------------------------
 void RadarEngine::writeFastToGeoTIFF(
     const std::vector<uint8_t>& fastMask, const std::string& filename,
-    int reductionPercent)
+    int reductionPercent, OutputCrs outCrs, BandLayout bands)
 {
     int rowMin, rowMax, colMin, colMax;
     if (!computeCoverageBBox(fastMask.data(), gridCols, gridRows,
@@ -580,7 +906,9 @@ void RadarEngine::writeFastToGeoTIFF(
         /*markerRow=*/srcRow - rowMin, /*markerCol=*/srcCol - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
         /*palette=*/nullptr,
-        /*srcStride=*/gridCols);
+        /*srcStride=*/gridCols,
+        outCrs,
+        bands);
 }
 
 // ======================================================================
@@ -604,7 +932,9 @@ bool writeReverseMaskGeoTIFF(
     int                         srcRow,
     int                         srcCol,
     const std::string&          filename,
-    int                         reductionPercent)
+    int                         reductionPercent,
+    OutputCrs                   outCrs,
+    BandLayout                  bands)
 {
     const int cols = mask.localCols;
     const int rows = mask.rowMax - mask.rowMin;
@@ -653,7 +983,11 @@ bool writeReverseMaskGeoTIFF(
         originX, originY,
         static_cast<double>(RESOLUTION),
         reductionPercent,
-        markerRow, markerCol);
+        markerRow, markerCol,
+        /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
+        /*palette=*/nullptr, /*srcStride=*/-1,
+        outCrs,
+        bands);
 }
 
 // Break points from get_coverage_reverse, rendered the same way
@@ -693,7 +1027,9 @@ bool writeReverseBreakPointsGeoTIFF(
     const std::vector<GridPoint>& breakPoints,
     int                           reductionPercent,
     int                           dotRadiusCells,
-    bool                          fillToBreakPoints)
+    bool                          fillToBreakPoints,
+    OutputCrs                     outCrs,
+    BandLayout                    bands)
 {
     if (winCols <= 0 || winRows <= 0) {
         std::cerr << "[breakpoint-tif] FAIL: invalid window "
@@ -843,7 +1179,9 @@ bool writeReverseBreakPointsGeoTIFF(
             /*markerRingColor=*/RGBA{0, 0, 0, 255},
             /*markerRingThicknessCells=*/2,
             palette,
-            /*srcStride=*/winCols);
+            /*srcStride=*/winCols,
+            outCrs,
+            bands);
 
     if (ok)
         std::cout << "[breakpoint-tif] "
@@ -863,7 +1201,9 @@ bool writeOverlapGeoTIFF(
     const FeasibleGrid&            aoiGrid,
     const std::string&             filename,
     const std::vector<GridPoint>&  placements,
-    int                            reductionPercent)
+    int                            reductionPercent,
+    OutputCrs                      outCrs,
+    BandLayout                     bands)
 {
     if (aoiGrid.height <= 0 || aoiGrid.width <= 0) {
         std::cerr << "[overlap-tif] FAIL: invalid grid dimensions "
@@ -873,6 +1213,7 @@ bool writeOverlapGeoTIFF(
 
     const int width  = aoiGrid.width;
     const int height = aoiGrid.height;
+    const bool paletted = (bands == BandLayout::SingleBandPalette);
 
     reductionPercent = clampReduction(reductionPercent, "writeOverlapGeoTIFF");
     const int outWidth  = reducedDim(width,  reductionPercent);
@@ -918,17 +1259,24 @@ bool writeOverlapGeoTIFF(
     }
 
     char** opts = nullptr;
-    opts = CSLSetNameValue(opts, "COMPRESS",   "LZW");
-    opts = CSLSetNameValue(opts, "TILED",      "YES");
-    opts = CSLSetNameValue(opts, "ALPHA",      "YES");
-    opts = CSLSetNameValue(opts, "PHOTOMETRIC","RGB");
+    opts = CSLSetNameValue(opts, "COMPRESS", "LZW");
+    opts = CSLSetNameValue(opts, "TILED",    "YES");
+    if (paletted) {
+        opts = CSLSetNameValue(opts, "PHOTOMETRIC", "PALETTE");
+    } else {
+        opts = CSLSetNameValue(opts, "ALPHA",       "YES");
+        opts = CSLSetNameValue(opts, "PHOTOMETRIC", "RGB");
+    }
+
+    const CrsPlan plan = planCrsOutputs(filename, outCrs);
 
     GDALDataset* ds = driver->Create(
-        filename.c_str(), outWidth, outHeight, /*bands=*/4, GDT_Byte, opts);
+        plan.nativePath.c_str(), outWidth, outHeight,
+        /*bands=*/paletted ? 1 : 4, GDT_Byte, opts);
     CSLDestroy(opts);
 
     if (!ds) {
-        std::cerr << "[ERROR] Failed to create GeoTIFF: " << filename << "\n";
+        std::cerr << "[ERROR] Failed to create GeoTIFF: " << plan.nativePath << "\n";
         return false;
     }
 
@@ -936,19 +1284,11 @@ bool writeOverlapGeoTIFF(
         originX, pixelW, 0.0,
         originY, 0.0,    -pixelH
     };
-    applyGeoreferencing(ds, gt, filename);
-
-    GDALRasterBand* rBand = ds->GetRasterBand(1);
-    GDALRasterBand* gBand = ds->GetRasterBand(2);
-    GDALRasterBand* bBand = ds->GetRasterBand(3);
-    GDALRasterBand* aBand = ds->GetRasterBand(4);
-    rBand->SetColorInterpretation(GCI_RedBand);
-    gBand->SetColorInterpretation(GCI_GreenBand);
-    bBand->SetColorInterpretation(GCI_BlueBand);
-    aBand->SetColorInterpretation(GCI_AlphaBand);
+    applyGeoreferencing(ds, gt, plan.nativePath);
 
     // Marker centers in this AOI's local pixel space, then rescaled into
-    // the reduced raster's pixel space.
+    // the reduced raster's pixel space. Computed before band setup so a
+    // paletted output can pre-register the marker colours.
     struct LocalMarker { int lr, lc; };
     std::vector<LocalMarker> markers;
     markers.reserve(placements.size());
@@ -969,11 +1309,36 @@ bool writeOverlapGeoTIFF(
     constexpr long long INNER_R_SQ =
         (long long)(MARKER_RADIUS - MARKER_RING_THICK) * (MARKER_RADIUS - MARKER_RING_THICK);
 
+    GDALRasterBand *rBand = nullptr, *gBand = nullptr,
+                   *bBand = nullptr, *aBand = nullptr, *iBand = nullptr;
+    RgbaIndexer ix;
+
+    if (paletted) {
+        iBand = ds->GetRasterBand(1);
+        // Overlap ramp is closed: 0 (transparent) + counts 1..5+ + two
+        // marker colours == 8 entries, so this never overflows.
+        ix.index(MARKER_FILL); ix.index(MARKER_RING);
+        for (int n = 1; n <= 5; ++n) ix.index(overlapColorAlpha(n, 160));
+        applyColorTable(iBand, ix, plan.nativePath);
+    } else {
+        rBand = ds->GetRasterBand(1);
+        gBand = ds->GetRasterBand(2);
+        bBand = ds->GetRasterBand(3);
+        aBand = ds->GetRasterBand(4);
+        rBand->SetColorInterpretation(GCI_RedBand);
+        gBand->SetColorInterpretation(GCI_GreenBand);
+        bBand->SetColorInterpretation(GCI_BlueBand);
+        aBand->SetColorInterpretation(GCI_AlphaBand);
+    }
+
     std::vector<int> colLo(outWidth), colHi(outWidth);
     for (int x = 0; x < outWidth; ++x)
         srcSpan(x, outWidth, width, colLo[x], colHi[x]);
 
-    std::vector<uint8_t> rowR(outWidth), rowG(outWidth), rowB(outWidth), rowA(outWidth);
+    std::vector<uint8_t> rowR, rowG, rowB, rowA, rowI;
+    if (paletted) rowI.resize(outWidth);
+    else { rowR.resize(outWidth); rowG.resize(outWidth);
+           rowB.resize(outWidth); rowA.resize(outWidth); }
 
     bool ok = true;
     for (int y = 0; y < outHeight && ok; ++y) {
@@ -992,7 +1357,8 @@ bool writeOverlapGeoTIFF(
                     if (srcRow[sx] > best) best = srcRow[sx];
             }
             RGBA c = overlapColorAlpha(best, /*alpha=*/160);
-            rowR[x] = c.r; rowG[x] = c.g; rowB[x] = c.b; rowA[x] = c.a;
+            if (paletted) rowI[x] = ix.index(c);
+            else { rowR[x] = c.r; rowG[x] = c.g; rowB[x] = c.b; rowA[x] = c.a; }
         }
 
         // Stamp markers whose vertical extent touches this row -- bounded
@@ -1011,30 +1377,37 @@ bool writeOverlapGeoTIFF(
                 const long long d2 = dx * dx + dy2;
                 if (d2 > OUTER_R_SQ) continue;
                 const RGBA& c = (d2 >= INNER_R_SQ) ? MARKER_RING : MARKER_FILL;
-                rowR[x] = c.r; rowG[x] = c.g; rowB[x] = c.b; rowA[x] = c.a;
+                if (paletted) rowI[x] = ix.index(c);
+                else { rowR[x] = c.r; rowG[x] = c.g; rowB[x] = c.b; rowA[x] = c.a; }
             }
         }
 
-        ok = ok && rBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowR.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && gBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowG.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && bBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowB.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
-        ok = ok && aBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowA.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+        if (paletted) {
+            ok = ok && iBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowI.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+        } else {
+            ok = ok && rBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowR.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+            ok = ok && gBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowG.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+            ok = ok && bBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowB.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+            ok = ok && aBand->RasterIO(GF_Write, 0, y, outWidth, 1, rowA.data(), outWidth, 1, GDT_Byte, 0, 0) == CE_None;
+        }
     }
 
     GDALClose(ds);
 
     if (!ok) {
-        std::cerr << "[ERROR] RasterIO write failed for " << filename << "\n";
+        std::cerr << "[ERROR] RasterIO write failed for " << plan.nativePath << "\n";
         return false;
     }
 
-    std::cout << "[overlap-tif] Wrote GeoTIFF: " << filename
-              << " (" << outWidth << " x " << outHeight << ", RGBA, "
+    std::cout << "[overlap-tif] Wrote GeoTIFF: " << plan.nativePath
+              << " (" << outWidth << " x " << outHeight
+              << (paletted ? ", 1-band palette, " : ", RGBA, ")
               << placements.size() << " marker(s)";
     if (reductionPercent > 0)
         std::cout << ", reduced " << reductionPercent << "% from "
                   << width << " x " << height
                   << ", pixel " << pixelW << "m";
     std::cout << ")\n";
-    return true;
+
+    return finalizeCrsOutputs(plan, paletted);
 }
