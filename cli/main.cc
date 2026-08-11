@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
          if (has_sector) {
              engine->computeViewshed(loa,roa);
              if(tiff){
-                  engine->writeViewshedToGeoTIFF(vs_output,50);
+                  engine->writeViewshedToGeoTIFF(vs_output,50,OutputCrs::Wgs84);
              }else if(svg) {
                   engine->writeViewshedToSVG(vs_output);
              } else {
@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
              engine->computeViewshed();
              cout << "writing: " << vs_output <<endl;
              if(tiff){
-                  engine->writeViewshedToGeoTIFF(vs_output,50);
+                  engine->writeViewshedToGeoTIFF(vs_output,50,OutputCrs::Wgs84);
              }else if(svg) {
                   engine->writeViewshedToSVG(vs_output);
              } else {
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
             if (has_sector) {
                 auto res = engine.compute(loa,roa);
                 if(tiff){
-                     engine.writeCoverageToGeoTIFF(res,r_output,50);
+                     engine.writeCoverageToGeoTIFF(res,r_output,50,OutputCrs::Wgs84);
                 }else if(svg) {
                      engine.writeToSVG(res,r_output);
                 } else {
@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
                 auto res = engine.compute();
                 cout << "writing: " << r_output <<endl;
                 if(tiff){
-                     engine.writeCoverageToGeoTIFF(res,r_output,50);
+                     engine.writeCoverageToGeoTIFF(res,r_output,50,OutputCrs::Wgs84);
                 }else if(svg) {
                      engine.writeToSVG(res,r_output);
                 } else {

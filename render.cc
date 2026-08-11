@@ -42,6 +42,16 @@
  * AABB, or the mask's rowMin/colMin box) rather than the full grid.
  * The geotransform origin is shifted by that window's row/col offset,
  * so these still overlay the full-grid products correctly.
+ *
+ * OUTPUT CRS (outCrs): every writer also takes an optional OutputCrs
+ * (Native7755 / Wgs84 / Both). The raster is always *rasterized* once,
+ * in EPSG:7755 -- that's the CRS the grid math is already in, so it's
+ * the only path that's free of resampling error. When EPSG:4326 is
+ * requested, that native raster is warped (nearest-neighbour, see
+ * warpToWgs84 below) into a second file rather than reprojecting the
+ * grid coordinates per cell during rasterization. This keeps a single
+ * source of truth for "what does this cell look like" and makes the
+ * 4326 product a strict, verifiable derivative of the 7755 one.
  */
 
 #include "operations.h"
@@ -50,6 +60,8 @@
 #include <gdal_priv.h>
 #include <ogr_spatialref.h>
 #include <cpl_string.h>
+#include <gdal_utils.h>
+#include <cpl_vsi.h>
 
 #include <algorithm>
 #include <cmath>
@@ -119,6 +131,137 @@ void applyGeoreferencing(GDALDataset* ds, const double gt[6],
             std::cerr << "[ERROR] SetSpatialRef failed for " << filename
                       << " -- output will not be georeferenced\n";
     }
+}
+
+// ======================================================================
+// Reprojection to EPSG:4326
+// ======================================================================
+//
+// We rasterize once in EPSG:7755 and warp that, rather than projecting
+// per cell during the write. The grid's x/y ARE 7755 metres, so the
+// native product stays byte-exact and the 4326 one is a pure resample
+// of it — the two can't disagree about what's covered.
+//
+// RESAMPLING IS NEAREST, deliberately. These are classification colors
+// with a hard alpha edge: "not covered" is (0,0,0,0), so any averaging
+// kernel blends RGB 0 into the footprint boundary and leaves a dark
+// fringe around every coverage blob, plus half-transparent cells that
+// mean nothing. Nearest keeps the palette exact.
+//
+// INIT_DEST=0 makes destination pixels the warp never touches fully
+// transparent (alpha 0) instead of undefined — the reprojected raster
+// is a rotated parallelogram inside a north-up 4326 box, so those
+// corner wedges exist in every output.
+
+// Insert `suffix` before the extension: "cov.tif" -> "cov_wgs84.tif".
+std::string insertSuffix(const std::string& path, const std::string& suffix)
+{
+    const size_t slash = path.find_last_of("/\\");
+    const size_t dot   = path.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+        return path + suffix;                       // no extension
+    return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
+bool warpToWgs84(const std::string& srcPath, const std::string& dstPath)
+{
+    GDALDatasetH src = GDALOpen(srcPath.c_str(), GA_ReadOnly);
+    if (!src) {
+        std::cerr << "[ERROR] Reprojection: could not reopen " << srcPath << "\n";
+        return false;
+    }
+
+    // If epsg7755Srs() fell all the way through, the source carries no
+    // CRS and a warp to 4326 would be a fabrication. Bail loudly and
+    // leave the untagged native raster as the only output.
+    const char* proj = GDALGetProjectionRef(src);
+    if (!proj || proj[0] == '\0') {
+        std::cerr << "[ERROR] Reprojection: " << srcPath << " has no CRS "
+                     "(EPSG:7755 lookup must have failed) -- cannot warp to "
+                     "EPSG:4326\n";
+        GDALClose(src);
+        return false;
+    }
+
+    char** argv = nullptr;
+    argv = CSLAddString(argv, "-of");     argv = CSLAddString(argv, "GTiff");
+    argv = CSLAddString(argv, "-t_srs");  argv = CSLAddString(argv, "EPSG:4326");
+    argv = CSLAddString(argv, "-r");      argv = CSLAddString(argv, "near");
+    argv = CSLAddString(argv, "-wo");     argv = CSLAddString(argv, "INIT_DEST=0");
+    argv = CSLAddString(argv, "-co");     argv = CSLAddString(argv, "COMPRESS=LZW");
+    argv = CSLAddString(argv, "-co");     argv = CSLAddString(argv, "TILED=YES");
+    argv = CSLAddString(argv, "-co");     argv = CSLAddString(argv, "BIGTIFF=IF_SAFER");
+    argv = CSLAddString(argv, "-co");     argv = CSLAddString(argv, "ALPHA=YES");
+    argv = CSLAddString(argv, "-co");     argv = CSLAddString(argv, "PHOTOMETRIC=RGB");
+    argv = CSLAddString(argv, "-multi");
+    argv = CSLAddString(argv, "-overwrite");
+
+    GDALWarpAppOptions* wopts = GDALWarpAppOptionsNew(argv, nullptr);
+    CSLDestroy(argv);
+    if (!wopts) {
+        std::cerr << "[ERROR] Reprojection: GDALWarpAppOptionsNew failed\n";
+        GDALClose(src);
+        return false;
+    }
+
+    int usageErr = 0;
+    GDALDatasetH out = GDALWarp(dstPath.c_str(), nullptr, 1, &src, wopts, &usageErr);
+
+    GDALWarpAppOptionsFree(wopts);
+    GDALClose(src);
+
+    if (!out) {
+        std::cerr << "[ERROR] Reprojection to EPSG:4326 failed for " << dstPath
+                  << " (GDAL: " << CPLGetLastErrorMsg() << ")\n";
+        return false;
+    }
+
+    const int w = GDALGetRasterXSize(out), h = GDALGetRasterYSize(out);
+    GDALClose(out);
+
+    std::cout << "[INFO]   Reprojected to EPSG:4326: " << dstPath
+              << " (" << w << " x " << h << ")\n";
+    return true;
+}
+
+// Path planning shared by both top-level writers. The 7755 raster is
+// always physically written first (it's the warp input); `nativePath`
+// is a temp file when the caller only asked for 4326.
+struct CrsPlan {
+    std::string nativePath;   // where the 7755 raster is written
+    std::string wgs84Path;    // where the 4326 raster goes (empty if none)
+    bool        keepNative;
+};
+
+CrsPlan planCrsOutputs(const std::string& filename, OutputCrs outCrs)
+{
+    switch (outCrs) {
+        case OutputCrs::Wgs84:
+            return { filename + ".native7755.tmp.tif", filename, false };
+        case OutputCrs::Both:
+            return { filename, insertSuffix(filename, "_wgs84"), true };
+        case OutputCrs::Native7755:
+        default:
+            return { filename, std::string(), true };
+    }
+}
+
+// Run after the native raster is closed. Returns false only if a
+// requested reprojection actually failed.
+bool finalizeCrsOutputs(const CrsPlan& plan)
+{
+    if (plan.wgs84Path.empty()) return true;
+
+    const bool ok = warpToWgs84(plan.nativePath, plan.wgs84Path);
+
+    if (!plan.keepNative) {
+        // Caller asked for 4326 only. Keep the intermediate if the warp
+        // failed -- losing the data entirely is worse than an extra file.
+        if (ok) VSIUnlink(plan.nativePath.c_str());
+        else    std::cerr << "[WARN] Keeping intermediate 7755 raster at "
+                          << plan.nativePath << " since the warp failed\n";
+    }
+    return ok;
 }
 
 struct RGBA { uint8_t r, g, b, a; };
@@ -237,6 +380,11 @@ inline int scaleIndex(int idx, int srcN, int outN)
 // majority, both of which erase single-cell slivers and thin ridgeline
 // coverage -- exactly the detail worth keeping when you're zoomed out
 // far enough to need a reduced raster in the first place.
+//
+// `outCrs` controls what gets written to disk: the native EPSG:7755
+// raster (default), an EPSG:4326 warp of it, or both. See the
+// "Reprojection to EPSG:4326" section above for why this is a
+// warp-after-write rather than a per-cell reprojection.
 // ----------------------------------------------------------------------
 bool writeRGBAGeoTIFF(
     const std::string& filename,
@@ -257,7 +405,8 @@ bool writeRGBAGeoTIFF(
     RGBA                   markerRingColor = {255, 255, 255, 255},
     int                    markerRingThicknessCells = 2,
     const RGBA*            palette = nullptr,
-    int                    srcStride = -1)     // 256 entries, or null
+    int                    srcStride = -1,     // 256 entries, or null
+    OutputCrs              outCrs = OutputCrs::Native7755)
 {
     if (cols <= 0 || rows <= 0) {
         std::cerr << "[ERROR] Invalid raster dimensions "
@@ -286,12 +435,14 @@ bool writeRGBAGeoTIFF(
     opts = CSLSetNameValue(opts, "ALPHA",      "YES");
     opts = CSLSetNameValue(opts, "PHOTOMETRIC","RGB");
 
+    const CrsPlan plan = planCrsOutputs(filename, outCrs);
+
     GDALDataset* ds = driver->Create(
-        filename.c_str(), outCols, outRows, /*bands=*/4, GDT_Byte, opts);
+        plan.nativePath.c_str(), outCols, outRows, /*bands=*/4, GDT_Byte, opts);
     CSLDestroy(opts);
 
     if (!ds) {
-        std::cerr << "[ERROR] Failed to create GeoTIFF: " << filename << "\n";
+        std::cerr << "[ERROR] Failed to create GeoTIFF: " << plan.nativePath << "\n";
         return false;
     }
 
@@ -305,7 +456,7 @@ bool writeRGBAGeoTIFF(
         originX, pixelW, 0.0,
         originY, 0.0,    -pixelH
     };
-    applyGeoreferencing(ds, gt, filename);
+    applyGeoreferencing(ds, gt, plan.nativePath);
 
     GDALRasterBand* rBand = ds->GetRasterBand(1);
     GDALRasterBand* gBand = ds->GetRasterBand(2);
@@ -393,18 +544,19 @@ bool writeRGBAGeoTIFF(
     GDALClose(ds);
 
     if (!ok) {
-        std::cerr << "[ERROR] RasterIO write failed for " << filename << "\n";
+        std::cerr << "[ERROR] RasterIO write failed for " << plan.nativePath << "\n";
         return false;
     }
 
-    std::cout << "[INFO]   Wrote GeoTIFF: " << filename
+    std::cout << "[INFO]   Wrote GeoTIFF: " << plan.nativePath
               << " (" << outCols << " x " << outRows << ", RGBA";
     if (reductionPercent > 0)
         std::cout << ", reduced " << reductionPercent << "% from "
                   << cols << " x " << rows
                   << ", pixel " << pixelW << "m";
     std::cout << ")\n";
-    return true;
+
+    return finalizeCrsOutputs(plan);
 }
 
 // Alpha=160/255 (~63% opaque) so the basemap underneath remains visible
@@ -427,7 +579,7 @@ constexpr RGBA    BREAK_DOT { 220, 30, 30, 255 };
 // ViewshedEngine — binary mask (0 = not visible, 1 = visible)
 // ----------------------------------------------------------------------
 void ViewshedEngine::writeViewshedToGeoTIFF(
-    const std::string& filename, int reductionPercent)
+    const std::string& filename, int reductionPercent, OutputCrs outCrs)
 {
     int rowMin, rowMax, colMin, colMax;
     if (!computeCoverageBBox(viewshedMask.data(), gridCols, gridRows,
@@ -471,7 +623,8 @@ void ViewshedEngine::writeViewshedToGeoTIFF(
         /*markerRow=*/centerX - rowMin, /*markerCol=*/centerY - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
         /*palette=*/nullptr,
-        /*srcStride=*/gridCols);
+        /*srcStride=*/gridCols,
+        outCrs);
 }
 
 // ----------------------------------------------------------------------
@@ -483,7 +636,7 @@ void ViewshedEngine::writeViewshedToGeoTIFF(
 // ----------------------------------------------------------------------
 void RadarEngine::writeCoverageToGeoTIFF(
     const RadarCoverageResult& res, const std::string& filename,
-    int reductionPercent)
+    int reductionPercent, OutputCrs outCrs)
 {
     static_assert(sizeof(CoverageStatus) == sizeof(uint8_t),
         "CoverageStatus must be byte-sized for the reinterpret_cast below "
@@ -532,7 +685,8 @@ void RadarEngine::writeCoverageToGeoTIFF(
         /*markerRow=*/res.srcRow - rowMin, /*markerCol=*/res.srcCol - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
         /*palette=*/nullptr,
-        /*srcStride=*/res.gridCols);
+        /*srcStride=*/res.gridCols,
+        outCrs);
 }
 
 // ----------------------------------------------------------------------
@@ -540,7 +694,7 @@ void RadarEngine::writeCoverageToGeoTIFF(
 // ----------------------------------------------------------------------
 void RadarEngine::writeFastToGeoTIFF(
     const std::vector<uint8_t>& fastMask, const std::string& filename,
-    int reductionPercent)
+    int reductionPercent, OutputCrs outCrs)
 {
     int rowMin, rowMax, colMin, colMax;
     if (!computeCoverageBBox(fastMask.data(), gridCols, gridRows,
@@ -580,7 +734,8 @@ void RadarEngine::writeFastToGeoTIFF(
         /*markerRow=*/srcRow - rowMin, /*markerCol=*/srcCol - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
         /*palette=*/nullptr,
-        /*srcStride=*/gridCols);
+        /*srcStride=*/gridCols,
+        outCrs);
 }
 
 // ======================================================================
@@ -604,7 +759,8 @@ bool writeReverseMaskGeoTIFF(
     int                         srcRow,
     int                         srcCol,
     const std::string&          filename,
-    int                         reductionPercent)
+    int                         reductionPercent,
+    OutputCrs                   outCrs)
 {
     const int cols = mask.localCols;
     const int rows = mask.rowMax - mask.rowMin;
@@ -653,7 +809,10 @@ bool writeReverseMaskGeoTIFF(
         originX, originY,
         static_cast<double>(RESOLUTION),
         reductionPercent,
-        markerRow, markerCol);
+        markerRow, markerCol,
+        /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
+        /*palette=*/nullptr, /*srcStride=*/-1,
+        outCrs);
 }
 
 // Break points from get_coverage_reverse, rendered the same way
@@ -693,7 +852,8 @@ bool writeReverseBreakPointsGeoTIFF(
     const std::vector<GridPoint>& breakPoints,
     int                           reductionPercent,
     int                           dotRadiusCells,
-    bool                          fillToBreakPoints)
+    bool                          fillToBreakPoints,
+    OutputCrs                     outCrs)
 {
     if (winCols <= 0 || winRows <= 0) {
         std::cerr << "[breakpoint-tif] FAIL: invalid window "
@@ -843,7 +1003,8 @@ bool writeReverseBreakPointsGeoTIFF(
             /*markerRingColor=*/RGBA{0, 0, 0, 255},
             /*markerRingThicknessCells=*/2,
             palette,
-            /*srcStride=*/winCols);
+            /*srcStride=*/winCols,
+            outCrs);
 
     if (ok)
         std::cout << "[breakpoint-tif] "
@@ -863,7 +1024,8 @@ bool writeOverlapGeoTIFF(
     const FeasibleGrid&            aoiGrid,
     const std::string&             filename,
     const std::vector<GridPoint>&  placements,
-    int                            reductionPercent)
+    int                            reductionPercent,
+    OutputCrs                      outCrs)
 {
     if (aoiGrid.height <= 0 || aoiGrid.width <= 0) {
         std::cerr << "[overlap-tif] FAIL: invalid grid dimensions "
@@ -923,12 +1085,14 @@ bool writeOverlapGeoTIFF(
     opts = CSLSetNameValue(opts, "ALPHA",      "YES");
     opts = CSLSetNameValue(opts, "PHOTOMETRIC","RGB");
 
+    const CrsPlan plan = planCrsOutputs(filename, outCrs);
+
     GDALDataset* ds = driver->Create(
-        filename.c_str(), outWidth, outHeight, /*bands=*/4, GDT_Byte, opts);
+        plan.nativePath.c_str(), outWidth, outHeight, /*bands=*/4, GDT_Byte, opts);
     CSLDestroy(opts);
 
     if (!ds) {
-        std::cerr << "[ERROR] Failed to create GeoTIFF: " << filename << "\n";
+        std::cerr << "[ERROR] Failed to create GeoTIFF: " << plan.nativePath << "\n";
         return false;
     }
 
@@ -936,7 +1100,7 @@ bool writeOverlapGeoTIFF(
         originX, pixelW, 0.0,
         originY, 0.0,    -pixelH
     };
-    applyGeoreferencing(ds, gt, filename);
+    applyGeoreferencing(ds, gt, plan.nativePath);
 
     GDALRasterBand* rBand = ds->GetRasterBand(1);
     GDALRasterBand* gBand = ds->GetRasterBand(2);
@@ -1024,11 +1188,11 @@ bool writeOverlapGeoTIFF(
     GDALClose(ds);
 
     if (!ok) {
-        std::cerr << "[ERROR] RasterIO write failed for " << filename << "\n";
+        std::cerr << "[ERROR] RasterIO write failed for " << plan.nativePath << "\n";
         return false;
     }
 
-    std::cout << "[overlap-tif] Wrote GeoTIFF: " << filename
+    std::cout << "[overlap-tif] Wrote GeoTIFF: " << plan.nativePath
               << " (" << outWidth << " x " << outHeight << ", RGBA, "
               << placements.size() << " marker(s)";
     if (reductionPercent > 0)
@@ -1036,5 +1200,6 @@ bool writeOverlapGeoTIFF(
                   << width << " x " << height
                   << ", pixel " << pixelW << "m";
     std::cout << ")\n";
-    return true;
+
+    return finalizeCrsOutputs(plan);
 }

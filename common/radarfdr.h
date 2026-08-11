@@ -13,6 +13,7 @@
 #include "../common.h"   // Global, FeasibleGrid, GridPoint, RESOLUTION,
 #include "../ga/radar.h"
 
+
 using namespace rc_detail;
 // ═══════════════════════════════════════════════════════════════════════════
 // ADDED: reverse ray cast (target -> source)
@@ -308,7 +309,7 @@ inline LocalMask computeLocalMaskReverse(
 bool writeReverseMaskGeoTIFF(Global& g, const rc_detail::LocalMask& mask,
                              int srcRow, int srcCol,
                              const std::string& filename,
-                             int reductionPercent = 0);
+                             int reductionPercent = 0, OutputCrs outCrs = OutputCrs::Wgs84);
 
 bool writeReverseBreakPointsGeoTIFF(Global& g, const std::string& filename,
                                     int winRowMin, int winColMin,
@@ -317,4 +318,5 @@ bool writeReverseBreakPointsGeoTIFF(Global& g, const std::string& filename,
                                     const std::vector<GridPoint>& breakPoints,
                                     int  reductionPercent   = 0,
                                     int  dotRadiusCells     = 2,
-                                    bool fillToBreakPoints  = true);
+                                    bool fillToBreakPoints  = true,
+                                    OutputCrs outCrs = OutputCrs::Wgs84);

@@ -42,6 +42,8 @@ enum class LOSStatus : uint8_t
     OUT_OF_GRID    = 7,
 };
 
+enum class OutputCrs { Native7755, Wgs84, Both };
+
 static const char* losStatusStr(LOSStatus s)
 {
     switch(s){
@@ -245,7 +247,7 @@ public:
     public: void writeViewshedToSVG(const std::string& filename);
     public: void writeViewshedToPNG(const std::string& filename);
     public: static std::string base64Encode(const uint8_t* data, size_t length);
-    public: void writeViewshedToGeoTIFF(const std::string& filename,int reductionPercent);
+    public: void writeViewshedToGeoTIFF(const std::string& filename,int reductionPercent,OutputCrs outCrs);
 
 };
 
@@ -409,9 +411,9 @@ public:
         double   minElevDeg, double maxElevDeg,
         double   maxRangeKM);
 
-    void writeFastToGeoTIFF(const std::vector<uint8_t>& fastMask, const std::string& filename,int reductionPercent);
+    void writeFastToGeoTIFF(const std::vector<uint8_t>& fastMask, const std::string& filename,int reductionPercent,OutputCrs outCrs);
 
-    void writeCoverageToGeoTIFF(const RadarCoverageResult& res, const std::string& filename,int reductionPercent);
+    void writeCoverageToGeoTIFF(const RadarCoverageResult& res, const std::string& filename,int reductionPercent,OutputCrs outCrs);
 
     inline static void printLOSResult(const RadarLOSResult& r,
                                double srcLat, double srcLon,
@@ -455,7 +457,7 @@ bool writeOverlapGeoTIFF(
     const FeasibleGrid&            aoiGrid,
     const std::string&             filename,
     const std::vector<GridPoint>&  placements,
-    int                            reductionPercent);
+    int                            reductionPercent,OutputCrs outCrs);
 
 
 #endif
