@@ -1,17 +1,16 @@
 {
-    "case" :
-    {
-        "ib" : true,
-        "rails" : true,
-        "roads" : true,
-        "slope" : true,
-        "waterbodies" : true,
-        "waterlines" : true
+    "case": {
+        "ib": false,
+        "rails": true,
+        "roads": false,
+        "slope": false,
+        "waterbodies": false,
+        "waterlines": false
     },
     "distance" :
     {
         "from_ib" : 1000,
-        "from_rail" : 0,
+        "from_rail" : 1000,
         "from_road" : 0,
         "from_water" : 0
     },
@@ -36,15 +35,22 @@
         "water_area" : "./preprocess/maps/water-areas/water_areas.shp",
         "water_lines" : "./preprocess/maps/water-lines/water_lines.shp"
     },
-    "operation_area" :
-    [
-        28.557712479999999,
-        74.366416689999994,
-        30.585609760000001,
-        76.039734100000004,
-        28.302369630000001,
-        77.345159030000005
-    ],
+    "operation_area": [
+            20.16418397910364,
+            80.14123979388097,
+            20.541786577469423,
+            82.34784476600703,
+            18.020146075400945,
+            82.53503747572483,
+            17.917625412330324,
+            79.90299452696797,
+            17.917625412330324,
+            79.90299452696797
+        ],
+        "feasiblity": {
+            "max-deployment-height": 3000,
+            "slope": 45
+        },
     "output" :
     {
         "elevation_file" : "./bin/elev.bin",
