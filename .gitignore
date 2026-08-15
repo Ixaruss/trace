@@ -15,3 +15,8 @@ __MACOSX/
 *.tiff
 *.h5
 /output/
+# Real (machine-specific) configs -- see config/*.example.jsonc for templates.
+config/config.json
+config/gaconf.json
+config/psoconf.json
+config/radar.json
