@@ -573,6 +573,7 @@ bool writeRGBAGeoTIFF(
 
     const CrsPlan plan = planCrsOutputs(filename, outCrs);
 
+
     GDALDataset* ds = driver->Create(
         plan.nativePath.c_str(), outCols, outRows,
         /*bands=*/paletted ? 1 : 4, GDT_Byte, opts);
@@ -1269,6 +1270,7 @@ bool writeOverlapGeoTIFF(
     }
 
     const CrsPlan plan = planCrsOutputs(filename, outCrs);
+
 
     GDALDataset* ds = driver->Create(
         plan.nativePath.c_str(), outWidth, outHeight,
