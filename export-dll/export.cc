@@ -1,16 +1,35 @@
 #include <debugapi.h>
 #define ODLIB_EXPORTS
 #include "export.h"
+#include "../iad/coverage.h"
 using namespace std;
 
 std::vector<std::vector<int>> bin_matrix;
+
+// std::unique_ptr<ThreadPool>pool;
+// std::unique_ptr<GaEngine> AdaptDLL;
+
 ThreadPool pool;
 GaEngine AdaptDLL(pool);
 
 extern "C" {
+ODLIB_API int DLL_Init(){
+    // pool = std::make_unique<ThreadPool>();
+    // AdaptDLL = std::make_unique<GaEngine>(*pool);
+    return 0;
+}
+
 ODLIB_API int DLL_TestFunction(){
     OutputDebugStringA("DLL : Testing Successful...");
     return 123456;
+}
+
+ODLIB_API int DLL_SurvGridCoverage(bool single_band_flag){
+    OutputDebugStringA("DLL : SGrid Coverage Computation Starts...");
+    Iad::get_iad_coverage_tif(AdaptDLL.g, OutputCrs::Wgs84, single_band_flag ? BandLayout::SingleBandPalette : BandLayout::Rgba);
+
+    OutputDebugStringA("DLL : SGrid Coverage Ends...");
+    return 0;
 }
 
 ODLIB_API int DLL_PreprocessMaps(bool ImageFlag, bool IndividualFlag){
@@ -31,31 +50,31 @@ ODLIB_API int DLL_RunPSO() {
     return 0;
 }
 
-ODLIB_API int DLL_RunAutoGA(int res_reduction_factor) {
+ODLIB_API int DLL_RunAutoGA(int res_reduction_factor, bool single_band_flag) {
     OutputDebugStringA("DLL : GA (Auto Case Starts)...");
     AdaptDLL.reloadConfig();
-    AdaptDLL.run_auto(res_reduction_factor);
+    AdaptDLL.run_auto(res_reduction_factor, false, OutputCrs::Wgs84, single_band_flag ? BandLayout::SingleBandPalette : BandLayout::Rgba);
     OutputDebugStringA("DLL : GA (Auto Case Ends)...");
     return 0;
 }
 
-ODLIB_API int DLL_RunHomoGA(int res_reduction_factor) {
+ODLIB_API int DLL_RunHomoGA(int res_reduction_factor, bool single_band_flag) {
     OutputDebugStringA("DLL : GA (Optimal Deployment - Homogeneous Case Starts)...");
     AdaptDLL.reloadConfig();
-    AdaptDLL.run_homogenous(res_reduction_factor);
+    AdaptDLL.run_homogenous(res_reduction_factor, false, OutputCrs::Wgs84, single_band_flag ? BandLayout::SingleBandPalette : BandLayout::Rgba);
     OutputDebugStringA("DLL : GA (Optimal Deployment - Homogeneous Case Ends)...");
     return 0;
 }
 
-ODLIB_API int DLL_RunHeteroGA(int res_reduction_factor) {
+ODLIB_API int DLL_RunHeteroGA(int res_reduction_factor, bool single_band_flag) {
     OutputDebugStringA("DLL : GA (Optimal Deployment - Heterogeneous Case Starts)...");
     AdaptDLL.reloadConfig();
-    AdaptDLL.run_heterogenous(res_reduction_factor);
+    AdaptDLL.run_heterogenous(res_reduction_factor, false, OutputCrs::Wgs84, single_band_flag ? BandLayout::SingleBandPalette : BandLayout::Rgba);
     OutputDebugStringA("DLL : GA (Optimal Deployment - Heterogeneous Case Starts)...");
     return 0;
 }
 
-ODLIB_API int DLL_ViewShed(double s_lat, double s_lon, int s_hgt_m, int rng_km, int loa, int roa, bool is_sector, bool GeoTifFlag, bool SvgFlag, int res_reduction_factor, bool use_curvature_flag) {
+ODLIB_API int DLL_ViewShed(double s_lat, double s_lon, int s_hgt_m, int rng_km, int loa, int roa, bool is_sector, bool GeoTifFlag, bool SvgFlag, int res_reduction_factor, bool use_curvature_flag, bool single_band_flag) {
     OutputDebugStringA("DLL : Viewshed Computation Starts...");
     ViewshedEngine VShedDLL(AdaptDLL.g, s_lat,s_lon,rng_km,s_hgt_m, use_curvature_flag);
 
@@ -64,36 +83,36 @@ ODLIB_API int DLL_ViewShed(double s_lat, double s_lon, int s_hgt_m, int rng_km, 
         VShedDLL.writeViewshedToPNG("./output/viewshed/viewshed.png");
 
         if (SvgFlag) VShedDLL.writeViewshedToSVG("./output/viewshed/viewshed.svg");
-        if (GeoTifFlag) VShedDLL.writeViewshedToGeoTIFF("./output/viewshed/viewshed.tif", res_reduction_factor);
+        if (GeoTifFlag) VShedDLL.writeViewshedToGeoTIFF("./output/viewshed/viewshed.tif", res_reduction_factor, OutputCrs::Wgs84, single_band_flag ? BandLayout::SingleBandPalette : BandLayout::Rgba);
     }
     else{
         VShedDLL.computeViewshed();
         VShedDLL.writeViewshedToPNG("./output/viewshed/viewshed.png");
 
         if (SvgFlag) VShedDLL.writeViewshedToSVG("./output/viewshed/viewshed.svg");
-        if (GeoTifFlag) VShedDLL.writeViewshedToGeoTIFF("./output/viewshed/viewshed.tif", res_reduction_factor);
+        if (GeoTifFlag) VShedDLL.writeViewshedToGeoTIFF("./output/viewshed/viewshed.tif", res_reduction_factor, OutputCrs::Wgs84, BandLayout::SingleBandPalette);
     }
     OutputDebugStringA("DLL : Viewshed Computation Ends...");
     return 0;
 }
 
-ODLIB_API int DLL_RadarCoverage(double s_lat, double s_lon, double s_hgt_m, double rng_km, double ba_min, double ba_max, double tgt_hgt_m, double loa, double roa, bool is_sector, bool GeoTifFlag, bool SvgFlag, int res_reduction_factor) {
+ODLIB_API int DLL_RadarCoverage(double s_lat, double s_lon, double s_hgt_m, double rng_km, double ba_min, double ba_max, double tgt_hgt_m, double loa, double roa, bool is_sector, bool GeoTifFlag, bool SvgFlag, int res_reduction_factor, bool single_band_flag, bool earth_curv_flag) {
     OutputDebugStringA("DLL : Radar Coverage Computation Starts...");
 
-    RadarEngine RadarDLL(AdaptDLL.g, s_lat,s_lon,s_hgt_m, tgt_hgt_m, ba_min, ba_max, rng_km, true);
+    RadarEngine RadarDLL(AdaptDLL.g, s_lat,s_lon,s_hgt_m, tgt_hgt_m, ba_min, ba_max, rng_km, earth_curv_flag);
     if (is_sector){
         auto res = RadarDLL.compute(loa,roa);
         RadarDLL.writeToPNG(res, "./output/radar/radarcov.png");
 
         if (SvgFlag) RadarDLL.writeToSVG(res, "./output/radar/radarcov.svg");
-        if (GeoTifFlag) RadarDLL.writeCoverageToGeoTIFF(res, "./output/radar/radarcov.tif", res_reduction_factor);
+        if (GeoTifFlag) RadarDLL.writeCoverageToGeoTIFF(res, "./output/radar/radarcov.tif", res_reduction_factor, OutputCrs::Wgs84, single_band_flag ? BandLayout::SingleBandPalette : BandLayout::Rgba);
     }
     else{
         auto res = RadarDLL.compute();
         RadarDLL.writeToPNG(res, "./output/radar/radarcov.png");
 
         if (SvgFlag) RadarDLL.writeToSVG(res, "./output/radar/radarcov.svg");
-        if (GeoTifFlag) RadarDLL.writeCoverageToGeoTIFF(res, "./output/radar/radarcov.tif", res_reduction_factor);
+        if (GeoTifFlag) RadarDLL.writeCoverageToGeoTIFF(res, "./output/radar/radarcov.tif", res_reduction_factor, OutputCrs::Wgs84, single_band_flag ? BandLayout::SingleBandPalette : BandLayout::Rgba);
     }
     OutputDebugStringA("DLL : Radar Coverage Computation Ends...");
     return 0;
