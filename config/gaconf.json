@@ -1,81 +1,82 @@
 {
-    "auto": {
-        "case": false,
-        "max-radar": 20,
-        "min-radar": 2,
-        "radars": [
-            {
-                "radar": {
-                    "antenna": 20,
-                    "max-angle": 60,
-                    "min-angle": 0.5,
-                    "range": 25,
-                    "target": 2000
-                }
-            },
-            {
-                "radar": {
-                    "antenna": 20,
-                    "max-angle": 60,
-                    "min-angle": 0.5,
-                    "range": 10,
-                    "target": 2000
-                }
-            }
-        ]
-    },
-    "crossover-rate": 0.9,
-    "display_solutions": 5,
-    "heterogenous": {
-        "case": false,
-        "chromosome-length": 4,
-        "radars": [
-            {
-                "radar": {
-                    "antenna": 100,
-                    "max-angle": 30,
-                    "min-angle": 0.5,
-                    "quantity": 3,
-                    "range": 65
-                }
-            },
-            {
-                "radar": {
-                    "antenna": 100,
-                    "max-angle": 30,
-                    "min-angle": 0.5,
-                    "quantity": 1,
-                    "range": 30
-                }
-            }
-        ],
-        "target": 1000
-    },
-    "homogenous": {
-        "case": true,
-        "chromosome-length": 3,
+  "auto": {
+    "case": false,
+    "max-radar": 20,
+    "min-radar": 2,
+    "radars": [
+      {
         "radar": {
-            "antenna": 10,
-            "max-angle": 60,
-            "min-angle": 0.5,
-            "range": 50,
-            "target": 2500
+          "antenna": 20,
+          "max-angle": 60,
+          "min-angle": 0.5,
+          "range": 25,
+          "target": 2000
         }
-    },
-    "mutation-rate": 0.1,
-    "num-generation": 50,
-    "num-population": 100,
-    "output": "output/ga/ga.tif",
-    "overlap-factor": 0.25,
-    "save": false,
-    "save_solutions": 15,
-    "variance-threshold": 1e-05,
-    "variance-threshold-forgive-factor": 5,
-    "weights": {
-        "w1": 0.9,
-        "w2": 0.7,
-        "w3": 0.5,
-        "w4": 0.92,
-        "x": 0.2
+      },
+      {
+        "radar": {
+          "antenna": 20,
+          "max-angle": 60,
+          "min-angle": 0.5,
+          "range": 10,
+          "target": 2000
+        }
+      }
+    ]
+  },
+  "crossover-rate": 0.90000000000000002,
+  "display_solutions": 5,
+  "heterogenous": {
+    "case": false,
+    "chromosome-length": 4,
+    "radars": [
+      {
+        "radar": {
+          "antenna": 100,
+          "max-angle": 30,
+          "min-angle": 0.5,
+          "quantity": 3,
+          "range": 65
+        }
+      },
+      {
+        "radar": {
+          "antenna": 100,
+          "max-angle": 30,
+          "min-angle": 0.5,
+          "quantity": 1,
+          "range": 30
+        }
+      }
+    ],
+    "target": 1000
+  },
+  "homogenous": {
+    "case": true,
+    "chromosome-length": 3,
+    "radar": {
+      "antenna": 10,
+      "max-angle": 60,
+      "min-angle": 0.5,
+      "range": 100,
+      "target": 1000
     }
+  },
+  "mutation-rate": 0.10000000000000001,
+  "num-generation": 50,
+  "num-population": 50,
+  "output": "output/ga/ga.tif",
+  "overlap-factor": 0.25,
+  "save": false,
+  "save_solutions": 15,
+  "variance-threshold": 1.0000000000000001E-05,
+  "variance-threshold-forgive-factor": 5,
+  "use_earth_curvature": false,
+  "weights": {
+    "w1": 0.90000000000000002,
+    "w2": 0.69999999999999996,
+    "w3": 0.5,
+    "w4": 0.92000000000000004,
+    "x": 0.20000000000000001
+  }
 }
