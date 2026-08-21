@@ -132,7 +132,7 @@ inline void castRayFast(
     const short* __restrict__ dem,
     uint8_t* __restrict__ statBase,
     int localCols,
-    int gridCols)
+    int gridCols, bool use_curv)
 {
     const int adr = std::abs(endRow - srcRow);
     const int adc = std::abs(endCol - srcCol);
@@ -169,9 +169,9 @@ inline void castRayFast(
         const double drow = static_cast<double>(row - srcRow);
         const double dcol = static_cast<double>(col - srcCol);
         const double dist = std::sqrt(drow * drow + dcol * dcol) * RESOLUTION;
-        const double curvDrop = (dist * dist) * INV_2_KEFFR;
+        const double curvDrop = use_curv ? (dist * dist) * INV_2_KEFFR : 0;
 
-        if (dist > horizonM) break;
+        if(use_curv) if (dist > horizonM) break;
 
         const short raw = *demCell;
         if (raw < -9000) break;   // no-data sentinel
@@ -198,7 +198,7 @@ inline LocalMask computeLocalMask(
     int     srcRow,     int srcCol,
     double  antennaH,   double targetH,
     double  minElevDeg, double maxElevDeg,
-    double  maxRangeM)
+    double  maxRangeM,bool use_curv)
 {
     const int gridCols = g.conf.grid.cols;
     const int gridRows = g.conf.grid.rows;
@@ -261,7 +261,7 @@ inline LocalMask computeLocalMask(
                 minSlope, maxSlope,
                 horizonM, R,
                 demPtr, statBase,
-                m.localCols, gridCols);
+                m.localCols, gridCols, use_curv);
     }
 
     return m;  // moves the buf vector — no copy
@@ -297,7 +297,7 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     const std::vector<GridPoint>& placements,
     double                        minSpacingCells = 5.0,
     const std::string&            tifPath         = "",
-
+    OutputCrs opt = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba,
     double                        antennaHeight   = 10.0,    // metres AGL
     double                        minAngle        = -5,     // degrees
     double                        target          = 1000.0,  // metres
@@ -306,7 +306,8 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     const std::vector<RadarConf>& radarRanges = {},
     FeasibleGrid                  aoiGrid         = {} ,
     bool write_png = false,
-    int reduction = 50// BY VALUE — unfiltered AOI (allCells=WITHALL); overlap computed here too, purely for the PNG
+    int reduction = 50,
+    bool use_curv = true// BY VALUE — unfiltered AOI (allCells=WITHALL); overlap computed here too, purely for the PNG
 )
 {
     std::vector<int> result(4, 0);
@@ -352,7 +353,7 @@ inline std::vector<int> calculate_radar_coverage_overlap(
                     r.target,
                     r.minAngle,
                     r.maxAngle,
-                    r.range * 1000);
+                    r.range * 1000,use_curv);
 
             applyMask(cov, grid.cells);
             applyMask(cov, aoiGrid.cells); // same mask, no extra ray-casting cost
@@ -369,7 +370,7 @@ inline std::vector<int> calculate_radar_coverage_overlap(
                     target,
                     minAngle,
                     maxAngle,
-                    rangeM);   // ← was `range` (int 25 = 25 m), now correct metres
+                    rangeM,use_curv);   // ← was `range` (int 25 = 25 m), now correct metres
 
             applyMask(mask, grid.cells);
             applyMask(mask, aoiGrid.cells); // same mask, no extra ray-casting cost
@@ -400,7 +401,7 @@ inline std::vector<int> calculate_radar_coverage_overlap(
         if(std::string::npos != idx){
             p = tifPath.substr(0,idx+1);
         }
-        writeOverlapGeoTIFF(g, aoiGrid, tifPath, placements, reduction, OutputCrs::Wgs84);
+        writeOverlapGeoTIFF(g, aoiGrid, tifPath, placements, reduction, opt, band);
         if(write_png){
             Bin::writeFeasibleGridOverlapPng(aoiGrid, p+"result.png", placements, grid,
                     g.bin.flag_road, g.bin.flag_rail,
@@ -431,7 +432,7 @@ inline double get_individual_coverage(
     double               targetH       = 1000.0,
     double               minAngle      = 0.5,
     double               maxAngle      = 30.0,
-    double               maxRangeM     = 25000.0)
+    double               maxRangeM     = 25000.0, bool use_curv = true)
 {
     using namespace rc_detail;
 
@@ -443,7 +444,7 @@ inline double get_individual_coverage(
         g, srcRow, srcCol,
         antennaHeight, targetH,
         minAngle, maxAngle,
-        maxRangeM);
+        maxRangeM, use_curv);
 
     // Reproduce the same R clamping computeLocalMask applies so the
     // radius we test feasible cells against is identical to the one

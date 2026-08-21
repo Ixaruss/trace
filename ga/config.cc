@@ -43,7 +43,7 @@ GaConf from_json(const Json::Value& root) {
     config.parameters.forgiveFactor = root["variance-threshold-forgive-factor"].asInt();
     config.parameters.save = root["save"].asBool();
     config.parameters.output = root["output"].asString();
-
+    config.parameters.use_curv = root["use_earth_curvature"].asBool();
     // --- Weights Sub-Object ---
     Json::Value wNode = root["weights"];
     config.parameters.weights.w1 = wNode["w1"].asDouble();

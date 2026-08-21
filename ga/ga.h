@@ -310,7 +310,7 @@ class GaEngine {
         Global& g, const FeasibleGrid& base_grid,
         Chromosome& cn, int index,
         const Weights& w, const RadarConf& rp, bool writePng, vector<RadarConf> radar = {},
-        const FeasibleGrid& aoi_grid = {}, bool wf = 0, double overlapping_factor = 0.25)   // full AOI (allCells=WITHALL); fitness now scored against this
+        const FeasibleGrid& aoi_grid = {}, bool wf = 0, double overlapping_factor = 0.25,OutputCrs opt = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba)   // full AOI (allCells=WITHALL); fitness now scored against this
     {
         std::string png_path = writePng
                    ? "./output/ga/chromosome_" + std::to_string(index) + "_coverage.png" : "";
@@ -321,6 +321,7 @@ class GaEngine {
                    g, base_grid, cn.radar,
                    5.0,
                    png_path,
+                   opt, band,
                    rp.antennaHeight,
                    rp.minAngle,
                    rp.target,
@@ -331,7 +332,7 @@ class GaEngine {
         }else
         {
             res = calculate_radar_coverage_overlap(
-                g, base_grid, cn.radar, 5.0, png_path,0,0,0,0,0, radar, aoi_grid);
+                g, base_grid, cn.radar, 5.0, png_path, opt,band,0,0,0,0,0, radar, aoi_grid);
         }
 
                // total denominator matches whatever calculate_radar_coverage_overlap scored
@@ -366,7 +367,7 @@ class GaEngine {
     void parallelEvaluatePopulation(
         std::vector<Chromosome>& pop, Global& globalRef,
         const FeasibleGrid& base_grid, bool writePng = false,
-        const FeasibleGrid& aoi_grid = {})
+        const FeasibleGrid& aoi_grid = {},OutputCrs opt = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba)
     {
         auto startTime = std::chrono::high_resolution_clock::now();
 
@@ -404,13 +405,13 @@ class GaEngine {
                     evaluate_fitness,
                     std::ref(globalRef), std::ref(base_grid),
                     std::ref(pop[i]), (int)i,
-                    weights, homoParams, writePng, empty, std::ref(aoi_grid), wf, overlapping_factor));
+                    weights, homoParams, writePng, empty, std::ref(aoi_grid), wf, overlapping_factor,opt,band));
             } else {
                 futures.push_back(pool.enqueue(
                     evaluate_fitness,
                     std::ref(globalRef), std::ref(base_grid),
                     std::ref(pop[i]), (int)i,
-                    weights, homoParams, writePng, std::ref(conf.hetero.radars), std::ref(aoi_grid), wf, overlapping_factor));
+                    weights, homoParams, writePng, std::ref(conf.hetero.radars), std::ref(aoi_grid), wf, overlapping_factor, opt, band));
             }
         }
 
@@ -677,7 +678,7 @@ class GaEngine {
         const std::vector<FlexRadarConfig>& configs,
         const std::vector<RadarConf>& typeSpecs,
         const Weights& w, bool writePng,
-        const FeasibleGrid& aoi_grid = {}, bool wf = false)
+        const FeasibleGrid& aoi_grid = {}, bool wf = false,OutputCrs opt = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba)
     {
         auto positions    = extractPositions(cn.radar);
         auto radarConfigs = extractRadarConfigs(cn.radar, typeSpecs);
@@ -686,7 +687,7 @@ class GaEngine {
             ? "chromosome_" + std::to_string(index) + "_coverage.png" : "";
 
         auto res = calculate_radar_coverage_overlap(
-            g, base_grid, positions, 5.0, png_path,
+            g, base_grid, positions, 5.0, png_path, opt, band,
             0, 0, 0, 0, 0, radarConfigs, aoi_grid);
         // int    total = !aoi_grid.cells.empty()
         //                       ? (int)aoi_grid.cells.size()
@@ -724,7 +725,7 @@ class GaEngine {
         const std::vector<FlexRadarConfig>& configs,
         const std::vector<RadarConf>& typeSpecs,
         bool writePng = false,
-        const FeasibleGrid& aoi_grid = {})
+        const FeasibleGrid& aoi_grid = {},OutputCrs opt = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba)
     {
         std::vector<std::future<void>> futures;
         std::vector<size_t>   pendingIdx;
@@ -758,7 +759,7 @@ class GaEngine {
                 std::ref(globalRef), std::ref(base_grid),
                 std::ref(pop[i]), (int)i,
                 std::ref(configs), std::ref(typeSpecs), weights, writePng,
-                std::ref(aoi_grid), wf));
+                std::ref(aoi_grid), wf, opt,band));
         }
 
         for (auto& f : futures) f.wait();
@@ -1075,6 +1076,7 @@ public:
     bool wf = 0;
     double overlapping_factor = conf.parameters.overlapFactor;
     Global g;
+    bool use_curv = true;
     void reloadConfig() {
         if (GaConf::is_available()) {
             conf = GaConf::load();
@@ -1092,10 +1094,12 @@ public:
         // Load config if available; otherwise the defaults declared above are used
         if (GaConf::is_available()) {
             conf = GaConf::load();
+            use_curv = conf.parameters.use_curv;
             confLoaded = true;
             applyConfig();
         } else {
-            std::cout << "[ga] No config file found — using built-in defaults.\n";
+            std::cout << "[ga] No config file found — exiting\n";
+            return;
         }
 
         std::cout << "[ga] Synchronously pre-loading all .bin matrices to memory...\n";
@@ -1223,7 +1227,7 @@ public:
     // All radar share a single fixed range (set in radar.h defaults).
     // chromosomeLength and generations sourced from config when available.
     // ------------------------------------------------------------------
-    double run_homogenous(int reduction = 50, bool write_png = false, int pathLength   = 2,
+    double run_homogenous(int reduction = 50, bool write_png = false, OutputCrs opts = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba, int pathLength   = 2,
                         int generations  = 50,
                         bool opt         = false,
                         int  num_top_k   = 15)
@@ -1345,7 +1349,7 @@ public:
         totalcount = 0;
         calculate_radar_coverage_overlap(
             g, f, finalBest.radar,
-            5.0, coverageOutput,
+            5.0, coverageOutput, opts, band,
             homoParams.antennaHeight,
             homoParams.minAngle,
             homoParams.target,
@@ -1361,7 +1365,7 @@ public:
     // Fixed fleet; each chromosome locus maps to a specific radar range.
     // Fleet sourced from config (hetero.radar) when available.
     // ------------------------------------------------------------------
-    void run_heterogenous(int reduction = 50, bool write_png = false, std::vector<RadarConfig> fleetConfig = {},
+    void run_heterogenous(int reduction = 50, bool write_png = false,OutputCrs opts = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba, std::vector<RadarConfig> fleetConfig = {},
                           int generations = 50)
     {
         if (confLoaded && conf.hetero.is_case) {
@@ -1470,7 +1474,7 @@ public:
         cachehits = 0;
         totalcount = 0;
         calculate_radar_coverage_overlap(g, f, finalBest->radar,
-                                         5.0, coverageOutput,0,0,0,0,0, conf.hetero.radars,
+                                         5.0, coverageOutput,opts, band,0,0,0,0,0, conf.hetero.radars,
                                          aoiGrid,write_png,reduction);
 
     }
@@ -1480,7 +1484,7 @@ public:
     // Variable-length, variable-count, heterogeneous fleet.
     // Fleet sourced from config (autoG.radar) when available.
     // ------------------------------------------------------------------
-    void run_auto(int reduction = 50, bool write_png = false, std::vector<FlexRadarConfig> configs = {},
+    void run_auto(int reduction = 50, bool write_png = false,OutputCrs opts = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba, std::vector<FlexRadarConfig> configs = {},
                       int generations = 50)
         {
             if (confLoaded && conf.autoG.is_case) {
@@ -1629,7 +1633,7 @@ public:
             auto positions    = extractPositions(finalBest->radar);
             auto radarConfigs = extractRadarConfigs(finalBest->radar, typeSpecs);
             calculate_radar_coverage_overlap(g, f, positions,
-                                             5.0, coverageOutput,
+                                             5.0, coverageOutput, opts, band,
                                              0, 0, 0, 0, 0, radarConfigs,
                                              aoiGrid,write_png,reduction);
         }

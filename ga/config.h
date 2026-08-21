@@ -25,6 +25,7 @@ struct Parameters {
     int forgiveFactor;
     int saveSolutions;
     std::string output;
+    bool use_curv;
 };
 
 struct RadarConf {
