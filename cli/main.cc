@@ -3,6 +3,7 @@
 #include "../operations.h"
 #include "../ga/config.h"
 #include "../ga/ga.h"
+#include "../iad/coverage.h"
 int main(int argc, char** argv) {
 
     CLI::App app{"Geospatial Analysis and Radar CLI Tool"};
@@ -32,6 +33,8 @@ int main(int argc, char** argv) {
     double roa = 90;
     bool has_sector = false;
     bool png = false, svg = false, tiff = false;
+    bool single = false;
+    bool epsg7755 = false;
     std::string vs_output = "output/viewshed/viewshed.svg";
 
     viewshed_sub->add_option("--lat", vs_lat, "Latitude of the origin")->required();
@@ -42,6 +45,8 @@ int main(int argc, char** argv) {
     viewshed_sub->add_flag("-s", has_sector, "Use sector");
     viewshed_sub->add_option("--loa", loa, "Left of arc (degrees)");
     viewshed_sub->add_option("--roa", roa, "Right of arc (degrees)");
+    viewshed_sub->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
+    viewshed_sub->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
 
     bool no_curvature = false;
     viewshed_sub->add_flag("--use-curvature", no_curvature, "use earth curvature corrections");
@@ -78,7 +83,9 @@ int main(int argc, char** argv) {
     radar_sub->add_option("--roa", roa, "Right of arc (degrees)");
     radar_sub->add_flag("-f,--fast", r_fast, "Execute calculation in fast mode (without image)");
     radar_sub->add_flag("--use-curvature", no_curvature, "use earth curvature corrections");
-    auto rlos_sub = app.add_subcommand("rlos", "Calculate radar Line of Sight (LOS) between a source and a target.");
+    radar_sub->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
+    radar_sub->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
+
     auto rg = radar_sub->add_option_group("output formats available");
     rg->add_flag("--tif", tiff,"geotagged tiff");
     rg->add_flag("--svg",svg, "svg vector");
@@ -95,7 +102,7 @@ int main(int argc, char** argv) {
     double los_max_elev = 30.0;
     double los_max_range = 300.0;
     bool detailed = false;
-
+    auto rlos_sub = app.add_subcommand("rlos", "Calculate radar Line of Sight (LOS) between a source and a target.");
     rlos_sub->add_option("--src-lat", srcLat, "Source (radar) latitude")->required();
     rlos_sub->add_option("--src-lon", srcLon, "Source (radar) longitude")->required();
     rlos_sub->add_option("--tgt-lat", tgtLat, "Target latitude")->required();
@@ -125,6 +132,15 @@ int main(int argc, char** argv) {
      run->add_option("--reduce",reduction_factor, "reduction percentage for output resolution quality");
      run-> add_flag("--png", png,"write output as png as well");
      run->add_flag("-b, --run-benchmark", run_benchmark, "create benchamrk table for all selection, mutation and crossover methods");
+     run->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
+     run->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
+
+     auto sgrid  = app.add_subcommand("sgrid", "create a survaillence grid cooresponding to iadconf");
+
+
+     sgrid->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
+     sgrid->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
+
     try {
         app.parse(argc, argv);
     } catch (const CLI::ParseError &e) {
@@ -154,7 +170,7 @@ int main(int argc, char** argv) {
          if (has_sector) {
              engine->computeViewshed(loa,roa);
              if(tiff){
-                  engine->writeViewshedToGeoTIFF(vs_output,50,OutputCrs::Wgs84);
+                  engine->writeViewshedToGeoTIFF(vs_output,50,epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
              }else if(svg) {
                   engine->writeViewshedToSVG(vs_output);
              } else {
@@ -164,7 +180,7 @@ int main(int argc, char** argv) {
              engine->computeViewshed();
              cout << "writing: " << vs_output <<endl;
              if(tiff){
-                  engine->writeViewshedToGeoTIFF(vs_output,50,OutputCrs::Wgs84);
+                  engine->writeViewshedToGeoTIFF(vs_output,50,epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
              }else if(svg) {
                   engine->writeViewshedToSVG(vs_output);
              } else {
@@ -206,7 +222,7 @@ int main(int argc, char** argv) {
             if (has_sector) {
                 auto res = engine.compute(loa,roa);
                 if(tiff){
-                     engine.writeCoverageToGeoTIFF(res,r_output,50,OutputCrs::Wgs84);
+                     engine.writeCoverageToGeoTIFF(res,r_output,50,epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
                 }else if(svg) {
                      engine.writeToSVG(res,r_output);
                 } else {
@@ -216,7 +232,7 @@ int main(int argc, char** argv) {
                 auto res = engine.compute();
                 cout << "writing: " << r_output <<endl;
                 if(tiff){
-                     engine.writeCoverageToGeoTIFF(res,r_output,50,OutputCrs::Wgs84);
+                     engine.writeCoverageToGeoTIFF(res,r_output,50,epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
                 }else if(svg) {
                      engine.writeToSVG(res,r_output);
                 } else {
@@ -343,26 +359,29 @@ int main(int argc, char** argv) {
             } else if (cfg.homo.is_case) {
                 // Parameters (pop, rates, weights, output) already applied in
                 // GaEngine constructor via applyConfig(); just call the runner.
-                ga.run_homogenous(reduction_factor, png);
+                ga.run_homogenous(reduction_factor, png, epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
             }
             else if (cfg.hetero.is_case) {
                 // Fleet built inside run_heterogenous() from cfg.hetero.radars
-                ga.run_heterogenous(reduction_factor, png);
+                ga.run_heterogenous(reduction_factor, png, epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
             }
             else if (cfg.autoG.is_case) {
                 ga.setAutoOperators(SelectionMethod::TOURNAMENT,
                                     AutoCrossoverMethod::RANDOM_SUBSET,
                                     /*mRate=*/0.10, /*cRate=*/0.85);
                 // Fleet built inside run_auto() from cfg.autoG.radars
-                ga.run_auto(reduction_factor, png);
+                ga.run_auto(reduction_factor, png, epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
             }
             else {
                 std::cerr << "[ga] Config found but no is_case flag is set — "
-                             "falling back to default homogenous run.\n";
-                ga.run_homogenous(/*pathLength=*/2, /*generations=*/50,
-                                  /*opt=*/false, /*num_top_k=*/15);
+                             "exiting\n";
+                return -1;
             }
         }
+    }else if (sgrid) {
+        Global g;
+        g.bin.init();
+        Iad::get_iad_coverage_tif(g, epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
     }
     return 0;
 }
