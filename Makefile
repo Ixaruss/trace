@@ -31,7 +31,7 @@ tool:
 		cli/main.cc common/lineofsight.cc common/image.cc common/coverage.cc render.cc \
 		common/angleviewshed.cc common/radarlos.cc common/mult.cc common/operations.cc \
 		preprocess/jsonParser.cc preprocess/reproject.cc preprocess/preprocess.cc \
-		preprocess/lib/*.cc ga/config.cc \
+		preprocess/lib/*.cc ga/config.cc iad/*.cc \
 		-o $(ADAPT) $(LIBS) $(STD)
 
 
@@ -47,4 +47,4 @@ clean:
 	rm -f $(BIN) $(ADAPT) *.o
 
 dll:
-	g++ -shared -O3 -ffast-math -flto -ffp-contract=fast -fopenmp  -march=native -funroll-loops -fprefetch-loop-arrays -fdata-sections -ffunction-sections -Wl,--gc-sections -Wl,-O2 common/lineofsight.cc common/image.cc common/coverage.cc common/angleviewshed.cc common/radarlos.cc common/mult.cc  common/operations.cc preprocess/jsonParser.cc preprocess/reproject.cc export-dll/export.cc preprocess/preprocess.cc render.cc common/radarfdr.cc preprocess/lib/*.cc ga/config.cc common/lib.cc -o adapt.dll  -ljsoncpp -lgdal -lpng16 -lhdf5 -static-libgcc -static-libstdc++ -Wl,--kill-at -std=c++23
+	g++ -shared -O3 -ffast-math -flto -ffp-contract=fast -fopenmp  -march=native -funroll-loops -fprefetch-loop-arrays -fdata-sections -ffunction-sections -Wl,--gc-sections -Wl,-O2 common/lineofsight.cc common/image.cc common/coverage.cc common/angleviewshed.cc common/radarlos.cc common/mult.cc  common/operations.cc preprocess/jsonParser.cc preprocess/reproject.cc export-dll/export.cc preprocess/preprocess.cc render.cc common/radarfdr.cc preprocess/lib/*.cc ga/config.cc common/lib.cc iad/*.cc -o adapt.dll  -ljsoncpp -lgdal -lpng16 -lhdf5 -static-libgcc -static-libstdc++ -Wl,--kill-at -std=c++23
