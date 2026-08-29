@@ -1,6 +1,7 @@
 #include "config.h"
 #include <fstream>
 #include <filesystem>
+#include <json/reader.h>
 #include <stdexcept>
 using namespace std;
 
@@ -44,6 +45,9 @@ GaConf from_json(const Json::Value& root) {
     config.parameters.save = root["save"].asBool();
     config.parameters.output = root["output"].asString();
     config.parameters.use_curv = root["use_earth_curvature"].asBool();
+    config.parameters.threat_sector = root["threat_sector_flag"].asBool();
+    config.parameters.loa = root["loa"].asDouble();
+    config.parameters.roa = root["roa"].asDouble();
     // --- Weights Sub-Object ---
     Json::Value wNode = root["weights"];
     config.parameters.weights.w1 = wNode["w1"].asDouble();

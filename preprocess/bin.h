@@ -41,7 +41,8 @@ struct FeasibleCell {
     int r;
     int c;
     uint8_t value;
-    int overlap =0;
+    int overlap = 0;
+    bool is_threat_sector = false;
 };
 struct GridPoint {
     int r;
@@ -135,6 +136,8 @@ public:
     bool getGridCoords(double lat, double lng, int& out_r, int& out_c);
 
     int16_t getElevation(double lat, double lng);
+
+    bool getLatLngFromGrid(int r, int c, double& out_lat, double& out_lng);
 
     bool getSlope(double lat, double lng);
 

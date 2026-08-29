@@ -81,7 +81,7 @@ Config Config::from_json(const Json::Value& j) {
     conf.output.elevation_file = j["output"]["elevation_file"].asString();
     conf.output.feasible = j["output"]["feasible"].asString();
     conf.output.slope_file = j["output"]["slope_file"].asString();
-
+    conf.agl_flag = j["agl_flag"].asBool();
     conf.grid.resolution = j["grid"]["resolution"].asInt();
     conf.grid.origin_x   = j["grid"]["origin_x"].asDouble();
     conf.grid.origin_y   = j["grid"]["origin_y"].asDouble();
@@ -154,7 +154,7 @@ Json::Value Config::to_json() const {
     j["case"]["waterlines"] = fcase.waterlines;
     j["case"]["ib"] = fcase.ib;
     j["case"]["slope"] = fcase.slope;
-
+    j["agl_flag"] = agl_flag;
     // input paths
     j["input"]["road"]       = input.road;
     j["input"]["rail"]       = input.rail;

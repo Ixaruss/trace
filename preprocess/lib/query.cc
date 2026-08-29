@@ -18,6 +18,28 @@ bool Bin::getGridCoords(double lat, double lng, int& out_r, int& out_c) {
             out_c >= 0 && out_c < conf.grid.cols);
 }
 
+bool Bin::getLatLngFromGrid(int r, int c, double& out_lat, double& out_lng) {
+    init({ ELEVATION });
+    if (!elevation_loaded || !poCT) return false;
+
+    if (r < 0 || r >= conf.grid.rows || c < 0 || c >= conf.grid.cols)
+        return false;
+
+    // Use cell center, since the forward transform floors to the containing cell
+    double x = conf.grid.origin_x + (c + 0.5) * RESOLUTION;
+    double y = conf.grid.origin_y - (r + 0.5) * RESOLUTION;
+
+    OGRCoordinateTransformation* poCTInv = poCT->GetInverse();
+    if (!poCTInv) return false;
+
+    bool ok = poCTInv->Transform(1, &x, &y);
+    OCTDestroyCoordinateTransformation(poCTInv);
+    if (!ok) return false;
+
+    out_lng = x;
+    out_lat = y;
+    return true;
+}
 int16_t Bin::getElevation(double lat, double lng) {
     init({ ELEVATION });
     if (!elevation_loaded || !poCT) return -9999;

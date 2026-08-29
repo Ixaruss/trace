@@ -11,6 +11,15 @@
  * For a 10 000×10 000 DEM at 300 km range (R≈1 200 cells):
  *   OLD ≈ 200 MB held in RadarEngine lifetime
  *   NEW ≈   5.8 MB, allocated / freed per placement
+ *
+ * Sector coverage (threat_sector_flag):
+ *   RadarEngine has been removed entirely — it required its own
+ *   grid-sized statusBuf/fastBuf allocations, which is exactly what
+ *   this file exists to avoid. Sector-covered-cell counting is now
+ *   done directly on the LocalMask already built for overlap scoring
+ *   (see rc_detail::countSectorCovered): the same (2R+3)² buffer is
+ *   reused, azimuth-filtered against [loa, roa], no extra ray casts,
+ *   no extra allocation.
  */
 #pragma once
 
@@ -23,11 +32,11 @@
 #include <cstring>
 
 #if defined(_OPENMP)
-#  include <omp.h>
+#include <omp.h>
 #endif
 
 #include "../common.h"   // Global, FeasibleGrid, GridPoint, RESOLUTION,
-#include "../operations.h"                      // Bin::writeFeasibleGridOverlapPng
+#include "../operations.h"                      // Bin::writeFeasibleGridOverlapPng, OutputCrs, BandLayout, writeOverlapGeoTIFF
 // ═══════════════════════════════════════════════════════════════════════════
 // Implementation detail — keep out of global namespace
 // ═══════════════════════════════════════════════════════════════════════════
@@ -45,10 +54,9 @@ struct LocalMask {
     int rowMin, rowMax;   // [rowMin, rowMax)
     int colMin, colMax;   // [colMin, colMax)
     int localCols;
+    int R;                // clamped radius (cells) used to build this mask
     std::vector<uint8_t> buf;
 };
-
-// ── Bresenham circle perimeter ────────────────────────────────────────────
 
 inline std::vector<Pt> circleBoundary(int cr, int cc, int R)
 {
@@ -86,32 +94,44 @@ inline std::vector<Pt> circleBoundary(int cr, int cc, int R)
 
     return pts;
 }
-inline std::vector<Pt> angularBoundary(int cr, int cc, int R)
+
+// ── Azimuth helpers (ported from RadarEngine, operations.h/coverage.cc) ──
+//
+// North-based clockwise azimuth from source to (row,col).
+// North = 0°, East = 90°, South = 180°, West = 270°
+inline double normAz(double deg)
 {
-    const double angStep = 1.0 / (double)R;
-    const int    N       = (int)std::ceil(2.0 * M_PI / angStep) + 1;
-
-    std::vector<Pt> pts;
-    pts.reserve(N);
-
-    for (int i = 0; i < N; ++i)
-    {
-        double angle = i * angStep;
-        int er = cr + (int)std::round((double)R * std::cos(angle));
-        int ec = cc + (int)std::round((double)R * std::sin(angle));
-
-        if (!pts.empty() && pts.back().x == er && pts.back().y == ec)
-            continue;
-
-        pts.push_back({er, ec});
-    }
-
-    if (pts.size() > 1 && pts.front().x == pts.back().x
-                       && pts.front().y == pts.back().y)
-        pts.pop_back();
-
-    return pts;
+    double a = std::fmod(deg, 360.0);
+    if (a < 0.0) a += 360.0;
+    return a;
 }
+
+inline double cellAzimuth(int srcRow, int srcCol, int r, int c)
+{
+    const double drow = r - srcRow;
+    const double dcol = c - srcCol;
+    // atan2(east, north) = clockwise from north
+    double az = std::atan2(dcol, -drow) * RAD2DEG;
+    if (az < 0.0) az += 360.0;
+    return az;
+}
+
+// Returns true if azimuth `az` lies on the arc swept clockwise from
+// `leftDeg` to `rightDeg` (both inclusive). North = 0°, clockwise positive.
+// Handles the 0°/360° wraparound: if leftDeg > rightDeg the arc is taken
+// to cross North.
+inline bool inArc(double az, double leftDeg, double rightDeg)
+{
+    az       = normAz(az);
+    leftDeg  = normAz(leftDeg);
+    rightDeg = normAz(rightDeg);
+
+    if (leftDeg <= rightDeg)
+        return az >= leftDeg && az <= rightDeg;
+    // arc wraps through 0°/360°
+    return az >= leftDeg || az <= rightDeg;
+}
+
 // ── Binary ray cast into local bounding-box buffer ───────────────────────
 //
 // statBase is a "virtual origin" pointer such that
@@ -198,7 +218,7 @@ inline LocalMask computeLocalMask(
     int     srcRow,     int srcCol,
     double  antennaH,   double targetH,
     double  minElevDeg, double maxElevDeg,
-    double  maxRangeM,bool use_curv)
+    double  maxRangeM, bool use_curv)
 {
     const int gridCols = g.conf.grid.cols;
     const int gridRows = g.conf.grid.rows;
@@ -228,6 +248,7 @@ inline LocalMask computeLocalMask(
     m.colMin    = std::max(0,        srcCol - R - 1);
     m.colMax    = std::min(gridCols, srcCol + R + 2);
     m.localCols = m.colMax - m.colMin;
+    m.R         = R;
     const int localRows = m.rowMax - m.rowMin;
 
     m.buf.assign(static_cast<size_t>(localRows) * m.localCols, 0);
@@ -267,7 +288,43 @@ inline LocalMask computeLocalMask(
     return m;  // moves the buf vector — no copy
 }
 
+// ── Count covered cells within a sector, reusing an existing LocalMask ───
+//
+// leftDeg/rightDeg: arc swept clockwise from leftDeg to rightDeg,
+//                    North = 0°. leftDeg < 0 || rightDeg < 0 → full 360°.
+//                    leftDeg > rightDeg wraps through North.
+//
+// Walks only the mask's local bounding box (already (2R+3)² at most —
+// no grid-sized buffer, no extra ray casting). This is the direct
+// replacement for RadarEngine::compute(...).countCovered.
+inline int countSectorCovered(
+    const LocalMask& m,
+    int srcRow, int srcCol,
+    double leftDeg, double rightDeg)
+{
+    const bool fullCircle = (leftDeg < 0.0 || rightDeg < 0.0);
+    const long long rSq = static_cast<long long>(m.R) * m.R;
 
+    int count = 0;
+    for (int r = m.rowMin; r < m.rowMax; ++r) {
+        const long long dr = r - srcRow;
+        const uint8_t* rowBuf = m.buf.data() +
+            static_cast<size_t>(r - m.rowMin) * m.localCols;
+
+        for (int c = m.colMin; c < m.colMax; ++c) {
+            const long long dc = c - srcCol;
+            if (dr * dr + dc * dc > rSq) continue;
+            if (!rowBuf[c - m.colMin]) continue;
+
+            if (!fullCircle &&
+                !inArc(cellAzimuth(srcRow, srcCol, r, c), leftDeg, rightDeg))
+                continue;
+
+            ++count;
+        }
+    }
+    return count;
+}
 
 }  // namespace rc_detail
 
@@ -283,11 +340,18 @@ inline LocalMask computeLocalMask(
  * (≈ (2R+3)² bytes), then increments per-cell overlap counters.
  * No grid-sized buffer is ever allocated.
  *
- * Returns result[4]:
+ * If threat_sector_flag is true, also counts (per placement, summed into
+ * result[4]) how many of that placement's covered cells fall within the
+ * [loa, roa] azimuth sector — computed directly off the same local mask,
+ * with no additional allocation or ray casting.
+ *
+ * Returns result[5]:
  *   [0]  number of placement pairs closer than minSpacingCells
  *   [1]  feasible cells covered by exactly 1 radar
  *   [2]  feasible cells covered by exactly 2 radars
  *   [3]  feasible cells covered by 3+ radars
+ *   [4]  sector-covered cell count, summed across placements
+ *        (only populated when threat_sector_flag is true; 0 otherwise)
  *
  * Radar spec (fixed): 50 m AGL antenna, 1 000 m target, 10–30° elevation, 300 km range.
  */
@@ -302,15 +366,19 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     double                        minAngle        = -5,     // degrees
     double                        target          = 1000.0,  // metres
     double                        maxAngle        = 90.0,    // degrees
-    double                        rangeM          = 25000.0, // metres — was wrongly `int range = 25`
+    double                        rangeM          = 25000.0, // metres
     const std::vector<RadarConf>& radarRanges = {},
-    FeasibleGrid                  aoiGrid         = {} ,
+    FeasibleGrid aoiGrid = {} ,
     bool write_png = false,
     int reduction = 50,
-    bool use_curv = true// BY VALUE — unfiltered AOI (allCells=WITHALL); overlap computed here too, purely for the PNG
+    bool use_curv = true,
+    bool threat_sector_flag = false,
+    double loa = 0.5,
+    double roa = 60
 )
 {
-    std::vector<int> result(4, 0);
+    std::vector<int> result(5, 0);
+    int sectorcount = 0;
     if (placements.empty() || grid.cells.empty()) return result;
     for (size_t i = 0; i < placements.size(); ++i)
         for (size_t j = i + 1; j < placements.size(); ++j) {
@@ -356,7 +424,12 @@ inline std::vector<int> calculate_radar_coverage_overlap(
                     r.range * 1000,use_curv);
 
             applyMask(cov, grid.cells);
-            applyMask(cov, aoiGrid.cells); // same mask, no extra ray-casting cost
+            applyMask(cov, aoiGrid.cells);
+
+            // Sector-covered-cell count — reuses `cov`, no RadarEngine,
+            // no grid-sized buffers, no extra ray casting.
+            if (threat_sector_flag)
+                sectorcount += rc_detail::countSectorCovered(cov, p.r, p.c, loa, roa);
         }
     } else {
         // Homogenous path — all radars share the same physical spec.
@@ -375,6 +448,12 @@ inline std::vector<int> calculate_radar_coverage_overlap(
             applyMask(mask, grid.cells);
             applyMask(mask, aoiGrid.cells); // same mask, no extra ray-casting cost
             // mask goes out of scope here — bounding-box memory released immediately
+
+            // Sector-covered-cell count — reuses `mask`, no RadarEngine,
+            // no grid-sized buffers, no extra ray casting.
+
+            if (threat_sector_flag)
+                sectorcount += rc_detail::countSectorCovered(mask, p.r, p.c, loa, roa);
         }
     }
 
@@ -383,6 +462,7 @@ inline std::vector<int> calculate_radar_coverage_overlap(
     // Prefer the full AOI grid when given, so result[]/fitness reflects coverage
     // over the whole Area of Operation, not just the road/rail-feasible subset.
     // (Placement itself is still gated to feasible cells — only the scoring changes.)
+
     const std::vector<FeasibleCell>& statsCells =
         !aoiGrid.cells.empty() ? aoiGrid.cells : grid.cells;
     for (const auto& cell : statsCells) {
@@ -391,7 +471,7 @@ inline std::vector<int> calculate_radar_coverage_overlap(
         else if (cell.overlap >= 3) ++result[3];
         // std::cout<< cell.overlap << std::endl;
     }
-
+    result[4] = sectorcount;
     // ── Optional PNG render ───────────────────────────────────────────────
     // aoiGrid (all AOI cells, with overlap now computed on it) drives the picture;
     // grid (feasible-only) is passed through purely to show roads/rails/water/etc.

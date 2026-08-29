@@ -1,9 +1,10 @@
 #ifndef GA_CONFIG_H_
 #define GA_CONFIG_H_
 
+#include <json/writer.h>
 #include <vector>
 #include <iostream>
-#include <json/json.h>
+
 struct Weights {
     double w1;
     double w2;
@@ -25,6 +26,9 @@ struct Parameters {
     int forgiveFactor;
     int saveSolutions;
     std::string output;
+    bool threat_sector;
+    bool loa;
+    bool roa;
     bool use_curv;
 };
 
@@ -58,6 +62,7 @@ struct autoGenConf {
     std::vector<RadarConf> radars;
 };
 
+
 class GaConf {
     public:
     Parameters parameters;
@@ -67,6 +72,7 @@ class GaConf {
 
     static bool is_available(std::optional <const std::string> path = std::nullopt);
     static GaConf load(std::optional <const std::string> path = std::nullopt);
+
 };
 
 #endif

@@ -72,6 +72,7 @@ class Config {
     public: Grid_Conf grid;
     public: Case fcase;
     public: Distance distance;
+    public:    bool agl_flag;
     public: std::vector<std::pair<double,double>> area_op; // can be a polygon or retangle, if not rectangle find highest breath and hightest height and assign the values to above variable to form a rectangle;
 
     static Config load(std::optional <const std::string> path = std::nullopt);

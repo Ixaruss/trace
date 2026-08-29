@@ -16,8 +16,11 @@
 #include <cstring>
 #include <chrono>
 #include <numeric>
-// Only include common.h for Global, Bin, Config, and FeasibleGrid structures.
-// Local coverage logic has been moved to radar.h — do not re-embed it here.
+#include <filesystem>
+#include <fstream>
+#include <json/json.h>
+
+
 #include "../common.h"
 #include "h5.h"
 #include "radar.h"
@@ -253,6 +256,43 @@ class GaEngine {
                   << "  output=\"" << coverageOutput << "\"\n";
     }
 
+    bool writeResultsToJson( const std::vector<GridPoint>& points, const std::string& filePath = "./output/ga/result.json") {
+        std::filesystem::path targetPath(filePath);
+
+        if (std::filesystem::exists(targetPath)) {
+            std::cout << "File already exists at: " << filePath << ". Skipping write.\n";
+            return false;
+        }
+
+        if (targetPath.has_parent_path()) {
+            std::filesystem::create_directories(targetPath.parent_path());
+        }
+
+        Json::Value jsonArray(Json::arrayValue);
+        for (const auto& point : points) {
+            double x,y;
+            g.bin.getLatLngFromGrid(point.r, point.c, x, y);
+            jsonArray.append(x);
+            jsonArray.append(y);
+        }
+
+        std::ofstream file(targetPath);
+        if (!file.is_open()) {
+            std::cerr << "Failed to create file at: " << filePath << "\n";
+            return false;
+        }
+
+        Json::StreamWriterBuilder builder;
+        builder["commentStyle"] = "None";
+        builder["indentation"] = ""; // Keeps array flat on a single line
+
+        std::unique_ptr<Json::StreamWriter> writer(builder.newStreamWriter());
+        writer->write(jsonArray, &file);
+        file << std::endl;
+
+        std::cout << "[ga] Successfully created file and wrote coordinates to: " << filePath << "\n";
+        return true;
+    }
     static uint64_t hashChromosome(const Chromosome& cn) {
         std::vector<uint64_t> geneHashes;
         geneHashes.reserve(cn.radar.size());
@@ -328,7 +368,11 @@ class GaEngine {
                    rp.maxAngle,
                    rp.range,
                    {},
-                   aoi_grid);
+                   aoi_grid,
+                   false,
+                   0,
+                   true,
+                   true);
         }else
         {
             res = calculate_radar_coverage_overlap(
@@ -343,6 +387,7 @@ class GaEngine {
                double unique       = (double)res[1] / total;
                double low_overlap  = (double)res[2] / total;
                double high_overlap = (double)res[3] / total;
+               double sector = (double)res[4]/ total;
                double spacing_gaps = (double)res[0] / total;
                double overlap_factor = (low_overlap + high_overlap) / unique;
                if (wf == true){
@@ -354,7 +399,7 @@ class GaEngine {
                else{
                    double target_error = abs(0.25 - overlap_factor);
                    double closeness_reward = std::max<double>(0.0, 1.0 - target_error);
-                   cn.fitness = (0.70 * unique) + (0.30 * closeness_reward);
+                   cn.fitness = (0.70 * unique) + (0.30 * closeness_reward) + (0.26 * sector);
                }
     }
 
@@ -1084,6 +1129,13 @@ public:
             applyConfig();
             if(Config::is_available()){
                 g.bin.conf.area_op = Config::load().area_op;
+                g.bin.conf = Config::load();
+                g.bin.flag_ib = g.bin.conf.fcase.ib;
+                g.bin.flag_rail = g.bin.conf.fcase.rails;
+                g.bin.flag_road = g.bin.conf.fcase.roads;
+                g.bin.flag_water_area = g.bin.conf.fcase.waterbodies;
+                g.bin.flag_water_line = g.bin.conf.fcase.waterlines;
+                g.bin.flag_slope = g.bin.conf.fcase.slope;
             }
         }
     }
@@ -1227,7 +1279,7 @@ public:
     // All radar share a single fixed range (set in radar.h defaults).
     // chromosomeLength and generations sourced from config when available.
     // ------------------------------------------------------------------
-    double run_homogenous(int reduction = 50, bool write_png = false, OutputCrs opts = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba, int pathLength   = 2,
+    void run_homogenous(int reduction = 50, bool write_png = false, OutputCrs opts = OutputCrs::Wgs84, BandLayout band = BandLayout::Rgba, int pathLength   = 2,
                         int generations  = 50,
                         bool opt         = false,
                         int  num_top_k   = 15)
@@ -1357,7 +1409,8 @@ public:
             homoParams.range,
             {},
             aoiGrid, write_png, reduction);
-        return finalBest.fitness;
+
+        writeResultsToJson(finalBest.radar);
     }
 
     // ------------------------------------------------------------------
@@ -1476,7 +1529,7 @@ public:
         calculate_radar_coverage_overlap(g, f, finalBest->radar,
                                          5.0, coverageOutput,opts, band,0,0,0,0,0, conf.hetero.radars,
                                          aoiGrid,write_png,reduction);
-
+        writeResultsToJson(finalBest->radar);
     }
 
     // ------------------------------------------------------------------
@@ -1636,6 +1689,7 @@ public:
                                              5.0, coverageOutput, opts, band,
                                              0, 0, 0, 0, 0, radarConfigs,
                                              aoiGrid,write_png,reduction);
+            writeResultsToJson(finalBest->radar);
         }
     int run_benchmark() {
         BoundingBox areaOfOps = { 34.0522, 34.1022, -118.2437, -118.1937 };
@@ -1696,7 +1750,8 @@ public:
             gaEngine.setOperators(c.selection, c.crossover, c.mutation, c.mutationRate, c.crossoverRate);
 
             auto start = std::chrono::high_resolution_clock::now();
-            double resultDistance = gaEngine.run_homogenous();
+            double resultDistance = 0;
+            gaEngine.run_homogenous();
             auto end = std::chrono::high_resolution_clock::now();
 
             std::chrono::duration<double, std::milli> elapsed = end - start;
