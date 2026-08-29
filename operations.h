@@ -177,19 +177,21 @@ private:
     int      centerX;
     int      centerY;
     int      maxRadiusCells;
+    int      rowMin, rowMax, colMin, colMax;
     float    radarHeightMeters;
     bool     useEarthCurvature;
 
     std::vector<uint8_t> viewshedMask;
     std::vector<Point2D> circlePerimeter;
 
-    void castRay(
-        int xEnd, int yEnd,
-        double srcElev,
-        const short* __restrict demPtr,
-        uint8_t*     __restrict maskPtr);
-
     void precomputeCirclePerimeter();
+
+    // Reset only the active bounding box (rowMin..rowMax, colMin..colMax)
+    // of viewshedMask to 0, instead of std::fill-ing the whole grid.
+    // Same optimization as RadarEngine::prefill() / the bounding-box
+    // reset in RadarEngine::computeFast() — keeps repeated calls cheap
+    // even when maxRadiusCells is small relative to the full grid.
+    void prefill();
 
     // Filter circlePerimeter down to the rays whose azimuth (from source)
     // falls on the [leftDeg, rightDeg] arc, swept clockwise, North = 0°.
@@ -233,6 +235,14 @@ public:
             maxRadiusCells = maxPossible;
         }
 
+        // Bounding box around the source, same convention as
+        // RadarEngine::rowMin/rowMax/colMin/colMax (centerX = row,
+        // centerY = col here).
+        rowMin = std::max(0,        centerX - maxRadiusCells - 1);
+        rowMax = std::min(gridRows, centerX + maxRadiusCells + 2);
+        colMin = std::max(0,        centerY - maxRadiusCells - 1);
+        colMax = std::min(gridCols, centerY + maxRadiusCells + 2);
+
         viewshedMask.assign((size_t)gridCols * gridRows, 0);
         precomputeCirclePerimeter();
 
@@ -250,18 +260,18 @@ public:
     // leftDeg/rightDeg: arc swept clockwise from leftDeg to rightDeg,
     //                    North = 0°. leftDeg < 0 || rightDeg < 0 -> full 360.
     //                    leftDeg > rightDeg wraps through North.
-    public: void computeViewshed(double leftDeg = -1.0, double rightDeg = -1.0);
-    public: inline const std::vector<uint8_t>& getMask() const { return viewshedMask; }
-    public: void writeViewshedToSVG(const std::string& filename);
-    public: void writeViewshedToPNG(const std::string& filename);
-    public: static std::string base64Encode(const uint8_t* data, size_t length);
-    public: void writeViewshedToGeoTIFF(
+    void computeViewshed(double leftDeg = -1.0, double rightDeg = -1.0);
+
+    inline const std::vector<uint8_t>& getMask() const { return viewshedMask; }
+
+    void writeViewshedToSVG(const std::string& filename);
+    void writeViewshedToPNG(const std::string& filename);
+    static std::string base64Encode(const uint8_t* data, size_t length);
+    void writeViewshedToGeoTIFF(
             const std::string& filename,
             int reductionPercent = 0,
             OutputCrs outCrs = OutputCrs::Native7755,
             BandLayout bands = BandLayout::Rgba);
-
-
 };
 
 class RadarEngine
@@ -277,6 +287,8 @@ public:
     double  minSlopeRatio, maxSlopeRatio;
     double  maxRangeM, horizonM, srcElev;
     bool use_curvature;
+    bool use_amsl;
+
     std::vector<uint8_t> statusBuf;
     std::vector<uint8_t> fastBuf;
     std::vector<Point2D> boundary;   // full 360 boundary
@@ -344,11 +356,11 @@ public:
         double antennaHeightM,
         double targetHeightM,
         double minElevDeg, double maxElevDeg,
-        double maxRangeKM, bool curv)
+        double maxRangeKM, bool curv, bool amsl)
         : g(globalInstance)
         , antennaHeight(antennaHeightM)
         , targetHeight(targetHeightM)
-        , maxRangeM(maxRangeKM * 1000.0), use_curvature(curv)
+        , maxRangeM(maxRangeKM * 1000.0), use_curvature(curv), use_amsl(amsl)
 
     {
         auto t0=std::chrono::high_resolution_clock::now();
