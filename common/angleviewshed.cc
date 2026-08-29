@@ -19,9 +19,9 @@
 #endif
 
     // ------------------------------------------------------------------
-    // CORRECT MAX-ANGLE HORIZON RAY
+    // CORE RAY — max-angle horizon sweep (LOS visibility)
     //
-    // Walk outward from source toward (xEnd, yEnd).
+    // Walk outward from (srcRow, srcCol) toward (endRow, endCol).
     // Track maxSlope = max(dh/dist) seen so far.
     // Cell visible <=> its slope >= maxSlope.
     //
@@ -31,34 +31,34 @@
     //
     // Earth curvature: subtract d²/2R from terrain elevation.
     // At 300km this is ~7km — significant for radar.
+    //
+    // Free function, same shape as RadarEngine::castRadarRayDiag/Fast in
+    // coverage.cc, rather than a ViewshedEngine member — the loop only
+    // needs the grid geometry and DEM/mask buffers, not any other engine
+    // state, so it's kept out of the class like radar's ray casters.
     // ------------------------------------------------------------------
-    void ViewshedEngine::castRay(
-        int xEnd, int yEnd,
+    static void castViewshedRay(
+        int srcRow, int srcCol,
+        int endRow, int endCol,
         double srcElev,
-        const short* __restrict demPtr,
-        uint8_t*     __restrict maskPtr)
+        int maxRadiusCells,
+        const short* __restrict__ dem,
+        uint8_t*     __restrict__ mask,
+        int COLS, int ROWS, bool use_curvature)
     {
-        int adx = std::abs(xEnd - centerX);
-        int ady = std::abs(yEnd - centerY);
-        int sx  = (centerX < xEnd) ? 1 : -1;
-        int sy  = (centerY < yEnd) ? 1 : -1;
-        int err = adx - ady;
+        int adr = std::abs(endRow - srcRow), adc = std::abs(endCol - srcCol);
+        int sr  = (srcRow < endRow) ? 1 : -1, sc = (srcCol < endCol) ? 1 : -1;
+        int err = adr - adc;
 
-        // centerX = row, centerY = col
         // layout: elev_matrix[row * COLS + col]
-        // stepping row (centerX direction) -> ±COLS
-        // stepping col (centerY direction) -> ±1
-        const std::ptrdiff_t strideX =
-            static_cast<std::ptrdiff_t>(sx) * gridCols;  // row step
-        const std::ptrdiff_t strideY = sy;                // col step
+        const std::ptrdiff_t strideR = static_cast<std::ptrdiff_t>(sr) * COLS;
+        const std::ptrdiff_t strideC = sc;
+        std::ptrdiff_t off = static_cast<std::ptrdiff_t>(srcRow) * COLS + srcCol;
 
-        std::ptrdiff_t off =
-            static_cast<std::ptrdiff_t>(centerX) * gridCols + centerY;
+        const short* demCell  = dem  + off;
+        uint8_t*     maskCell = mask + off;
 
-        const short* dem  = demPtr  + off;
-        uint8_t*     mask = maskPtr + off;
-
-        int    x = centerX, y = centerY;
+        int row = srcRow, col = srcCol;
         double dist     = 0.0;
         double maxSlope = -1e18;
 
@@ -66,34 +66,31 @@
         // updated as: drop(d+step) = drop(d) + (2d*step + step²) / 2R
         double curvDrop = 0.0;
 
-        const double maxDist =
-            static_cast<double>(maxRadiusCells) * RESOLUTION;
+        const double maxDist = static_cast<double>(maxRadiusCells) * RESOLUTION;
 
         while (true)
         {
-            if (x == xEnd && y == yEnd) break;
+            if (row == endRow && col == endCol) break;
 
-            int e2     = 2 * err;
-            bool moveX = (e2 > -ady);
-            bool moveY = (e2 <  adx);
+            int e2 = 2 * err;
+            bool mr = (e2 > -adc);
+            bool mc = (e2 <  adr);
 
-            if (moveX) { err -= ady; x += sx; dem += strideX; mask += strideX; }
-            if (moveY) { err += adx; y += sy; dem += strideY; mask += strideY; }
+            if (mr) { err -= adc; row += sr; demCell += strideR; maskCell += strideR; }
+            if (mc) { err += adr; col += sc; demCell += strideC; maskCell += strideC; }
 
             // exact step length
-            double step = (moveX && moveY)
-                ? RESOLUTION * 1.41421356237
-                : RESOLUTION;
+            double step = (mr && mc) ? RESOLUTION * 1.41421356237 : RESOLUTION;
 
             // incremental curvature update
-            if (useEarthCurvature)
+            if (use_curvature)
                 curvDrop += (2.0 * dist * step + step * step) * INV_2EARTHR;
 
             dist += step;
 
             if (dist > maxDist) break;
 
-            short rawElev = *dem;
+            short rawElev = *demCell;
             if (rawElev < -9000) break;
 
             // corrected terrain elevation
@@ -104,7 +101,7 @@
 
             if (slope >= maxSlope)
             {
-                *mask = 1;
+                *maskCell = 1;
                 if (slope > maxSlope)
                     maxSlope = slope;
             }
@@ -112,38 +109,36 @@
     }
 
     // ------------------------------------------------------------------
+    // Reuses RadarEngine::circleBoundary (same midpoint-circle algorithm,
+    // 8-way symmetry, sort+dedupe) instead of duplicating it here. Both
+    // engines share the same row/col grid convention (centerX = row,
+    // centerY = col <-> srcRow, srcCol), so the points line up directly.
+    // ------------------------------------------------------------------
     void ViewshedEngine::precomputeCirclePerimeter()
     {
-        int x = 0, y = maxRadiusCells, d = 3 - 2 * maxRadiusCells;
+        circlePerimeter = RadarEngine::circleBoundary(centerX, centerY, maxRadiusCells);
+    }
 
-        auto push8 = [&](int px, int py) {
-            circlePerimeter.push_back({centerX+px, centerY+py});
-            circlePerimeter.push_back({centerX-px, centerY+py});
-            circlePerimeter.push_back({centerX+px, centerY-py});
-            circlePerimeter.push_back({centerX-px, centerY-py});
-            circlePerimeter.push_back({centerX+py, centerY+px});
-            circlePerimeter.push_back({centerX-py, centerY+px});
-            circlePerimeter.push_back({centerX+py, centerY-px});
-            circlePerimeter.push_back({centerX-py, centerY-px});
-        };
-
-        while (y >= x) {
-            push8(x, y);
-            x++;
-            if (d > 0) { y--; d += 4*(x-y)+10; }
-            else        {      d += 4*x+6;      }
+    // ------------------------------------------------------------------
+    // PREFILL
+    //
+    // Reset viewshedMask to 0 (not visible) — but only across the active
+    // bounding box (rowMin..rowMax, colMin..colMax), not the whole grid.
+    // Mirrors RadarEngine::prefill() / the per-row memset reset in
+    // RadarEngine::computeFast(): the mask here is already binary, so
+    // there's no separate "outside sector" value to write — a sector
+    // that's smaller than 360° just leaves more of the reset area at 0,
+    // which castViewshedRay never touches anyway. The win is the same as
+    // radar's: repeated computeViewshed() calls on a small radius stay
+    // cheap instead of paying for a full-grid std::fill every time.
+    // ------------------------------------------------------------------
+    void ViewshedEngine::prefill()
+    {
+        #pragma omp parallel for schedule(static, 32)
+        for (int r = rowMin; r < rowMax; r++) {
+            uint8_t* p = viewshedMask.data() + (size_t)r * gridCols + colMin;
+            std::memset(p, 0, colMax - colMin);
         }
-
-        // deduplicate
-        std::sort(circlePerimeter.begin(), circlePerimeter.end(),
-            [](const Point2D& a, const Point2D& b){
-                return a.x < b.x || (a.x == b.x && a.y < b.y);
-            });
-        auto last = std::unique(circlePerimeter.begin(), circlePerimeter.end(),
-            [](const Point2D& a, const Point2D& b){
-                return a.x == b.x && a.y == b.y;
-            });
-        circlePerimeter.erase(last, circlePerimeter.end());
     }
 
 
@@ -208,7 +203,9 @@
 
         // Reset mask so repeated calls (e.g. different sectors on the same
         // engine) don't leak stale visible cells from a previous call.
-        std::fill(viewshedMask.begin(), viewshedMask.end(), 0);
+        // Bounding-box prefill instead of a full-grid std::fill — see
+        // ViewshedEngine::prefill().
+        prefill();
 
         // centerX = row, centerY = col
         size_t srcIdx =
@@ -231,19 +228,24 @@
         uint8_t*     maskPtr = viewshedMask.data();
         const int    COLS    = gridCols;
         const int    ROWS    = gridRows;
+        const int    MRC     = maxRadiusCells;
+        const bool   UC      = useEarthCurvature;
 
         // rays are independent — safe to parallelize
         // each ray only writes cells it visits (no two rays share a cell
         // on the same Bresenham path), and both write value=1 if they do
         #pragma omp parallel for schedule(dynamic, 64) default(none) \
             shared(demPtr, maskPtr, activePerimeter) \
-            firstprivate(N, COLS, ROWS, srcElev)
+            firstprivate(N, COLS, ROWS, srcElev, MRC, UC, centerX, centerY)
         for (size_t i = 0; i < N; ++i)
         {
-            int tx = activePerimeter[i].x;
-            int ty = activePerimeter[i].y;
-            if (tx >= 0 && tx < COLS && ty >= 0 && ty < ROWS)
-                castRay(tx, ty, srcElev, demPtr, maskPtr);
+            // activePerimeter stores (row, col) in (.x, .y) — see
+            // precomputeCirclePerimeter / RadarEngine::circleBoundary.
+            int er = activePerimeter[i].x;
+            int ec = activePerimeter[i].y;
+            if (er >= 0 && er < ROWS && ec >= 0 && ec < COLS)
+                castViewshedRay(centerX, centerY, er, ec, srcElev, MRC,
+                                 demPtr, maskPtr, COLS, ROWS, UC);
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();

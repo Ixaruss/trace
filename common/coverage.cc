@@ -73,7 +73,8 @@ static void castRadarRayDiag(
     int maxRadiusCells,
     const short*  __restrict__ dem,
     uint8_t*      __restrict__ stat,
-    int COLS, int ROWS, bool use_curvature)
+    int COLS, int ROWS, bool use_curvature,
+    bool useAMSL)
 {
     int adr=std::abs(endRow-srcRow), adc=std::abs(endCol-srcCol);
     int sr=(srcRow<endRow)?1:-1, sc=(srcCol<endCol)?1:-1;
@@ -108,18 +109,19 @@ static void castRadarRayDiag(
         double drow = static_cast<double>(row-srcRow);
         double dcol = static_cast<double>(col-srcCol);
         double dist = std::sqrt(drow*drow+dcol*dcol) * RESOLUTION;
-        double curvDrop = (dist*dist) * INV_2_KEFFR;
+        const double curvDrop = use_curvature ? (dist * dist) * INV_2_KEFFR : 0;
 
         if(dist>maxRangeM){ *statCell=(uint8_t)CoverageStatus::OUTSIDE_RANGE; continue; }
-        if(use_curvature){
-        if(dist>horizonM) break;  // pre-filled as BEYOND_HORIZON
-        }
+        if(use_curvature) if(dist>horizonM) break;
+
         short raw=*demCell;
         if(raw<-9000) break;
 
         double terrainElev  = static_cast<double>(raw) - curvDrop;
         double terrainSlope = (terrainElev - srcElev) / dist;
-        double targetSlope  = terrainSlope + targetHeight / dist;
+        double targetSlope  = useAMSL
+            ? (targetHeight - srcElev) / dist
+            : terrainSlope + targetHeight / dist;
 
         uint8_t s;
         if     (maxTerrainSlope > targetSlope) s=(uint8_t)CoverageStatus::TERRAIN_MASKED;
@@ -144,7 +146,7 @@ static void castRadarRayFast(
     double horizonM, int maxRadiusCells,
     const short* __restrict__ dem,
     uint8_t*     __restrict__ stat,
-    int COLS, int ROWS, bool use_curvature)
+    int COLS, int ROWS, bool use_curvature,bool useAMSL)
 {
     int adr=std::abs(endRow-srcRow), adc=std::abs(endCol-srcCol);
     int sr=(srcRow<endRow)?1:-1, sc=(srcCol<endCol)?1:-1;
@@ -177,7 +179,7 @@ static void castRadarRayFast(
         double drow = static_cast<double>(row-srcRow);
         double dcol = static_cast<double>(col-srcCol);
         double dist = std::sqrt(drow*drow+dcol*dcol) * RESOLUTION;
-        double curvDrop = (dist*dist) * INV_2_KEFFR;
+        const double curvDrop = use_curvature ? (dist * dist) * INV_2_KEFFR : 0;
 
         if(use_curvature)
             if(dist>horizonM) break;
@@ -187,7 +189,9 @@ static void castRadarRayFast(
 
         double terrainElev  = static_cast<double>(raw) - curvDrop;
         double terrainSlope = (terrainElev - srcElev) / dist;
-        double targetSlope  = terrainSlope + targetHeight / dist;
+        double targetSlope  = useAMSL
+            ? (targetHeight - srcElev) / dist
+            : terrainSlope + targetHeight / dist;
 
         if(maxTerrainSlope<=targetSlope && targetSlope>=minSlope && targetSlope<=maxSlope)
             *statCell = 1;
@@ -298,14 +302,14 @@ static void castRadarRayFast(
 
         #pragma omp parallel for schedule(dynamic,64) default(none) \
             shared(demPtr,statPtr,activeBoundary) \
-            firstprivate(N,COLS,ROWS,SE,TH,MNS,MXS,MXR,HOR,MRC)
+            firstprivate(N,COLS,ROWS,SE,TH,MNS,MXS,MXR,HOR,MRC,use_curvature,use_amsl)
         for(size_t i=0;i<N;++i){
             int er=activeBoundary[i].x, ec=activeBoundary[i].y;
             if(er>=0&&ec>=0&&er<ROWS&&ec<COLS)
                 castRadarRayDiag(
                     srcRow,srcCol,er,ec,
                     SE,TH,MNS,MXS,MXR,HOR,MRC,
-                    demPtr,statPtr,COLS,ROWS,use_curvature);
+                    demPtr,statPtr,COLS,ROWS,use_curvature,use_amsl);
         }
 
         auto t1=std::chrono::high_resolution_clock::now();
@@ -386,14 +390,14 @@ static void castRadarRayFast(
 
         #pragma omp parallel for schedule(dynamic,64) default(none) \
             shared(demPtr,statPtr,activeBoundary) \
-            firstprivate(N,COLS,ROWS,SE,TH,MNS,MXS,HOR,MRC)
+            firstprivate(N,COLS,ROWS,SE,TH,MNS,MXS,HOR,MRC,use_curvature,use_amsl)
         for(size_t i=0;i<N;++i){
             int er=activeBoundary[i].x,ec=activeBoundary[i].y;
             if(er>=0&&ec>=0&&er<ROWS&&ec<COLS)
                 castRadarRayFast(
                     srcRow,srcCol,er,ec,
                     SE,TH,MNS,MXS,HOR,MRC,
-                    demPtr,statPtr,COLS,ROWS,use_curvature);
+                    demPtr,statPtr,COLS,ROWS,use_curvature,use_amsl);
         }
 
         auto t1=std::chrono::high_resolution_clock::now();

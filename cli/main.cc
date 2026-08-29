@@ -28,13 +28,14 @@ int main(int argc, char** argv) {
     double vs_lon = 74.7742;
     float vs_range = 300.0f;
     float vs_ant_height = 30.0f;
-    bool vs_curvature = true;
+    bool vs_curvature = false;
     double loa = 0;
     double roa = 90;
     bool has_sector = false;
     bool png = false, svg = false, tiff = false;
     bool single = false;
     bool epsg7755 = false;
+    bool use_amsl = false;
     std::string vs_output = "output/viewshed/viewshed.svg";
 
     viewshed_sub->add_option("--lat", vs_lat, "Latitude of the origin")->required();
@@ -48,8 +49,7 @@ int main(int argc, char** argv) {
     viewshed_sub->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
     viewshed_sub->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
 
-    bool no_curvature = false;
-    viewshed_sub->add_flag("--use-curvature", no_curvature, "use earth curvature corrections");
+    viewshed_sub->add_flag("--use-curvature", vs_curvature, "use earth curvature corrections");
 
     auto vg = viewshed_sub->add_option_group("output formats available");
     vg->add_flag("--tif", tiff,"geotagged tiff");
@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
     radar_sub->add_option("--lat", r_lat, "Latitude of radar base")->required();
     radar_sub->add_option("--lon", r_lon, "Longitude of radar base")->required();
     radar_sub->add_option("-a,--antenna", r_ant_agl, "Antenna height AGL (meters)");
-    radar_sub->add_option("-t,--target", r_tgt_agl, "Target aircraft height AGL (meters)");
+    radar_sub->add_option("-t,--target", r_tgt_agl, "Target/threat aircraft height AGL (meters)");
     radar_sub->add_option("--min-elev", r_min_elev, "Minimum elevation angle (degrees)");
     radar_sub->add_option("--max-elev", r_max_elev, "Maximum elevation angle (degrees)");
     radar_sub->add_option("-r,--range", r_max_range, "Maximum radar range (kilometers)");
@@ -82,9 +82,10 @@ int main(int argc, char** argv) {
     radar_sub->add_option("--loa", loa, "Left of arc (degrees)");
     radar_sub->add_option("--roa", roa, "Right of arc (degrees)");
     radar_sub->add_flag("-f,--fast", r_fast, "Execute calculation in fast mode (without image)");
-    radar_sub->add_flag("--use-curvature", no_curvature, "use earth curvature corrections");
+    radar_sub->add_flag("--use-curvature", vs_curvature, "use earth curvature corrections");
     radar_sub->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
     radar_sub->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
+    radar_sub->add_flag("--use-amsl", use_amsl, "use AMSL height instead of AGL for target/threat height");
 
     auto rg = radar_sub->add_option_group("output formats available");
     rg->add_flag("--tif", tiff,"geotagged tiff");
@@ -150,7 +151,6 @@ int main(int argc, char** argv) {
 
     if (*viewshed_sub) {
         Global g;
-        vs_curvature = !no_curvature; // Flip state if flag passed
         auto engine = std::make_unique<ViewshedEngine>(
             g, vs_lat, vs_lon, vs_range, vs_ant_height, vs_curvature
         );
@@ -195,7 +195,7 @@ int main(int argc, char** argv) {
         Global g;
         g.bin.init({ ELEVATION });
         RadarEngine engine(
-            g, r_lat, r_lon, r_ant_agl, r_tgt_agl, r_min_elev, r_max_elev, r_max_range, no_curvature
+            g, r_lat, r_lon, r_ant_agl, r_tgt_agl, r_min_elev, r_max_elev, r_max_range, vs_curvature,use_amsl
         );
         string output_ext;
         if(tiff){
