@@ -1,0 +1,73 @@
+// config.json : map build ("adapt build") and grid description.
+// Read by Config::load(). Paths are examples; use your own.
+{
+    // [bool] Heights are above ground level (AGL). Not referenced in the sources reviewed, check Config parser.
+    "agl_flag": false,
+
+    // [bool] Which constraint layers are enforced when marking cells feasible.
+    // false = layer ignored for feasibility.
+    "case": {
+        "ib": false,          // international border
+        "rails": false,
+        "roads": false,
+        "slope": false,
+        "waterbodies": false, // water-areas shapefile
+        "waterlines": false   // rivers / canals
+    },
+
+    // [int, metres] Buffer / exclusion distance around each layer.
+    // NOTE: build code treats a value <= 0 as "use built-in default"
+    // (road 1000, rail 1000, water 1000, ib 10000), NOT as "no buffer".
+    "distance": {
+        "from_ib": 1000,
+        "from_rail": 1000,
+        "from_road": 1000,
+        "from_water": 1000
+    },
+
+    // Grid written by the build step. rows/cols/min_*/max_* are normally
+    // filled in automatically after the elevation raster is warped.
+    "grid": {
+        "block_size": 4096,     // [int, cells] tile size. >0 = tiled storage (map_tiles/, elev_tiles/); 0 = single flat .bin
+        "rows": 10000,          // [int] raster height in cells
+        "cols": 10000,          // [int] raster width in cells
+        "resolution": 90,       // [number, m] cell size
+        "min_x": 0.0,           // [number] extent, projected CRS (EPSG:7755) metres
+        "min_y": 0.0,
+        "max_x": 900000.0,
+        "max_y": 900000.0,
+        "origin_x": 0.0,        // [number] top-left corner (x = min_x, y = max_y)
+        "origin_y": 900000.0
+    },
+
+    // [string, path] Source data. DEM is a GeoTIFF, the rest are shapefiles.
+    "input": {
+        "elevation": "/path/to/alt.tif",
+        "ib": "/path/to/ib.shp",
+        "rail": "/path/to/rails.shp",
+        "road": "/path/to/roads.shp",
+        "water_area": "/path/to/water-areas.shp",
+        "water_lines": "/path/to/water-lines.shp"
+    },
+
+    // [number[]] Area of interest polygon as flat (lat, lon) pairs, in WGS84.
+    // NOTE: lat first, then lon. Needs at least 3 distinct vertices.
+    "operation_area": [
+        0.0, 0.0,   // lat1, lon1
+        0.0, 0.0,   // lat2, lon2
+        0.0, 0.0,   // lat3, lon3
+        0.0, 0.0    // lat4, lon4
+    ],
+
+    // [string, path] Files produced by the build and loaded at run time.
+    // With block_size > 0 these paths give the prefix/folder for the tiles.
+    "output": {
+        "elevation_file": "/path/to/bin/elev.bin",
+        "feasible": "/path/to/bin/feasible.bin",
+        "matrix_file": "/path/to/bin/map.bin",   // constraint layers, 1 byte per cell
+        "slope_file": "/path/to/bin/slope.bin"
+    },
+
+    // [string] Build action, e.g. "build".
+    "target": "build"
+}

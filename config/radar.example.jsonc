@@ -1,0 +1,27 @@
+// radar.json (Rconf) : coverage of one radar at a fixed position ("adapt radar").
+{
+  "srcLat": 0.0,    // [number, deg] radar latitude (WGS84)
+  "srcLon": 0.0,    // [number, deg] radar longitude
+
+  "antenna": 20,        // [number, m] antenna height
+  "min-angle": 0.5,     // [number, deg]
+  "max-angle": 60,      // [number, deg]
+  "range": 100,         // [number, km]
+  "target": 2500,       // [number, m] target altitude
+
+  "peak_power": 1,             // radar-model parameters, used only if use_radar_model is true
+  "antenna_gain": 30,
+  "wavelength": 0.1,
+  "crossSection": 1,
+  "detachable_threshold": -13,
+
+  "use_earth_curvature": false,  // [bool]
+  "use_radar_model": false,      // [bool]
+  "useAMSL": false,              // [bool] target altitude is AMSL, not AGL
+
+  "sector_flag": false,          // [bool] also report coverage within a threat sector
+  "loa": 0,                      // [deg] sector left of axis
+  "roa": 180,                    // [deg] sector right of axis
+
+  "output": "./output/radar/radar.tif"  // [string, path]
+}

@@ -1,0 +1,86 @@
+// gaconf.json : genetic algorithm ("adapt run"). Fixed path ./config/gaconf.json.
+// Re-read before each GA run (reloadConfig), so edits apply without restart.
+{
+  // Exactly one of auto / heterogenous / homogenous should have "case": true.
+
+  // AUTO: GA picks both how many radars and which types, within [min-radar, max-radar].
+  "auto": {
+    "case": false,
+    "min-radar": 2,     // [int]
+    "max-radar": 20,    // [int]
+    "radars": [         // radar types the GA may choose from
+      { "radar": {
+          "antenna": 10,              // [number, m] antenna height above ground
+          "min-angle": 0,             // [number, deg] lower elevation limit
+          "max-angle": 60,            // [number, deg] upper elevation limit
+          "range": 75,                // [number, km] max range (ignored if use_radar_model is true)
+          "target": 2500,             // [number, m] target altitude to cover
+          "peak_power": 1,            // [number] radar-model: Pt
+          "antenna_gain": 30,         // [number, dB] radar-model: G
+          "wavelength": 0.1,          // [number, m] radar-model: lambda
+          "crossSection": 1,          // [number, m^2] radar-model: target RCS
+          "detachable_threshold": 3   // [number, dB] radar-model: detection threshold
+      } },
+      { "radar": { "antenna": 10, "min-angle": 0, "max-angle": 60, "range": 35, "target": 2500,
+                   "peak_power": 1, "antenna_gain": 30, "wavelength": 0.1, "crossSection": 1, "detachable_threshold": 3 } }
+    ]
+  },
+
+  // HETEROGENOUS: fixed mix of radar types and counts.
+  "heterogenous": {
+    "case": false,
+    "chromosome-length": 4,   // [int] total radars = sum of "quantity" below
+    "target": 1000,           // [number, m] target altitude
+    "radars": [
+      { "radar": { "antenna": 100, "min-angle": 0.5, "max-angle": 30,
+                   "quantity": 3,   // [int] how many of this type
+                   "range": 75,
+                   "peak_power": 1, "antenna_gain": 30, "wavelength": 0.1, "crossSection": 1, "detachable_threshold": 3 } },
+      { "radar": { "antenna": 100, "min-angle": 0.5, "max-angle": 30, "quantity": 1, "range": 30,
+                   "peak_power": 1, "antenna_gain": 30, "wavelength": 0.1, "crossSection": 1, "detachable_threshold": 3 } }
+    ]
+  },
+
+  // HOMOGENOUS: N identical radars.
+  "homogenous": {
+    "case": true,
+    "chromosome-length": 3,   // [int] number of radars to place
+    "radar": { "antenna": 10, "min-angle": 0.5, "max-angle": 60, "range": 125, "target": 2500,
+               "peak_power": 1, "antenna_gain": 30, "wavelength": 0.1, "crossSection": 1, "detachable_threshold": 3 }
+  },
+
+  // ---- GA hyper-parameters ----
+  "num-population": 150,   // [int] individuals per generation
+  "num-generation": 1000,  // [int] max generations
+  "crossover-rate": 0.9,   // [0..1]
+  "mutation-rate": 0.1,    // [0..1]
+
+  // Early stop: variance of best-fitness history over a short window stays
+  // below variance-threshold for "forgive-factor" consecutive generations.
+  "variance-threshold": 0.000001,        // [number]
+  "variance-threshold-forgive-factor": 20, // [int]
+
+  // ---- Fitness ----
+  "overlap-factor": 0.25,  // [0..1] target overlap, (2-radar + 3+radar cells) / single-coverage cells
+  "weights": {
+    "w1": 0.7,    // reward for covered area (unique + double coverage)
+    "w2": 0.3,    // reward for matching overlap-factor
+    "w3": 0.85,   // reward for threat-sector coverage (only if threat_sector_flag)
+    "w4": 0.92,   // penalty for 3+ overlap
+    "x": 0.0001   // per-radar cost (auto mode: extra radar kept only if it adds > x/w1 of the AOI)
+  },
+
+  // ---- Model switches ----
+  "use_earth_curvature": false,  // [bool] include earth curvature in LOS
+  "use_radar_model": false,      // [bool] derive range from the radar equation instead of "range"
+  "useAMSL": false,              // [bool] target altitude is above mean sea level, not ground
+  "threat_sector_flag": false,   // [bool] reward coverage inside the threat sector
+  "loa": 0,                      // [deg] left of axis (threat sector)
+  "roa": 180,                    // [deg] right of axis (threat sector)
+
+  // ---- Output ----
+  "output": "output/ga/ga.tif",  // [string, path] coverage GeoTIFF of the best layout
+  "display_solutions": 5,        // [int] how many top solutions to print
+  "save": false,                 // [bool] save solutions
+  "save_solutions": 15           // [int] how many top solutions to save
+}

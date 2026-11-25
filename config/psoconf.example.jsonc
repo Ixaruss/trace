@@ -1,0 +1,43 @@
+// psoconf.json : single-radar PSO siting ("adapt run single"). Fixed path ./config/psoconf.json.
+// Fitness = share of AOI uniquely covered by the one radar.
+{
+  "radar": {
+    "antenna": 20,               // [number, m] antenna height
+    "min-angle": 0.5,            // [number, deg]
+    "max-angle": 60,             // [number, deg]
+    "range": 100,                // [number, km]
+    "target": 2000,              // [number, m] target altitude
+    "peak_power": 1,             // radar-model parameters, used only if use_radar_model is true
+    "antenna_gain": 30,
+    "wavelength": 0.1,
+    "crossSection": 1,
+    "detachable_threshold": 3
+  },
+
+  "use_earth_curvature": true,   // [bool]
+  "use_radar_model": false,      // [bool]
+  "useAMSL": false,              // [bool]
+
+  "output": "output/pso/pso.tif", // [string, path] coverage GeoTIFF of the best site
+  "write_png": true,              // [bool] also write a PNG
+  "reduction": 50,                // [int, %] output resolution reduction
+
+  "pso_hyperparameters": {
+    "cognitive_weight_c1": 1.494,   // [number] pull toward particle's own best
+    "social_weight_c2": 1.494,      // [number] pull toward swarm/neighbourhood best
+    "inertia_weight_w": 0.729,      // [number] base inertia
+    "velocity_clamp_fraction": 0.05 // [0..1] max velocity as fraction of the search area
+  },
+
+  "pso_global_settings": {
+    "swarm_size": 40,   // [int] particles
+    "iterations": 25,   // [int]
+    "seed": 0           // [int] RNG seed
+  },
+
+  "pso_strategy": {
+    "topology": "global",         // "global" | "ring"
+    "inertia": "linear_decay",    // "constant" | "linear_decay" | "jitter"
+    "boundary": "bounce"          // "clamp" | "bounce"
+  }
+}
