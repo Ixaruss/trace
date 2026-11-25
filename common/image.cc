@@ -403,7 +403,7 @@ void RadarEngine::writeToSVG(
      <<" stroke-dasharray=\"20,15\" opacity=\"0.4\"/>\n"
      // horizon circle
      <<"  <circle cx=\""<<cx<<"\" cy=\""<<cy
-     <<"\" r=\""<<(int)(horizonM/RESOLUTION)
+     <<"\" r=\""<<(int)(horizonM/(double)g.bin.cell_m)
      <<"\" fill=\"none\" stroke=\"#9b59b6\" stroke-width=\"2\""
      <<" stroke-dasharray=\"10,8\" opacity=\"0.5\"/>\n";
 

@@ -24,7 +24,7 @@ const double VEC_MAX_Y    = 5368236.2448166199;
 const double VEC_ORIGIN_X = 2653415.3157514133;  // min_x
 const double VEC_ORIGIN_Y = 5368236.2448166199;  // max_y
 
-const int   DISTANCE_FROM_IB = 10000;
+const int   DISTANCE_FROM_IB = 1000;
 const int   DISTANCE_FROM_WATER = 1000;
 const int   DISTANCE_FROM_RAIL = 1000;
 const int   DISTANCE_FROM_ROAD = 1000;
@@ -61,6 +61,8 @@ namespace lib {
     int calc_rows (int resolution);
 
     int calc_cols (int resolution);
+
+    int grid_resolution();
 
     std::vector<double> get_min_max_coordiantes(std::string path, int type =0);
 

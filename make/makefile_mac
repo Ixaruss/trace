@@ -35,30 +35,29 @@ PNG_LIBS    := $(shell pkg-config --libs libpng)
 # Common Preprocess Shared Sources
 PREPROCESS_SRC := preprocess/jsonParser.cc preprocess/reproject.cc preprocess/lib/*.cc
 
-.PHONY: all bin test tool deploy ga astar pso gen_bin clean
+.PHONY: all bin test tool deploy multi-radar-deployment astar single-radar-deployment gen_bin clean
 
 all: tool
 
 # =====================================================
-# Main Adapt CLI (with Optimized OpenMP parallel processing)
+# Main Trace CLI (with Optimized OpenMP parallel processing)
 # =====================================================
 tool:
 	$(CXX) $(CXXFLAGS) -flto $(OMP_FLAGS) \
 	$(HOMEBREW_INCLUDES) \
 	$(JSON_CFLAGS) $(PNG_CFLAGS) $(GDAL_CFLAGS) \
 	cli/main.cc \
-	ga/config.cc \
+	multi-radar-deployment/config.cc \
 	common/lineofsight.cc \
 	common/image.cc \
 	common/coverage.cc \
 	common/angleviewshed.cc \
 	common/radarlos.cc \
-	common/mult.cc \
 	common/operations.cc \
 	preprocess/preprocess.cc \
 	render.cc \
 	$(PREPROCESS_SRC) \
-	-o adapt \
+	-o trace \
 	$(JSON_LIBS) $(PNG_LIBS) $(GDAL_LIBS) \
 	$(OMP_LIBS) $(HDF5_LIBS) \
 	-fdata-sections -ffunction-sections \
@@ -67,9 +66,9 @@ tool:
 # =====================================================
 # Genetic Algorithm (GA) Build with HDF5
 # =====================================================
-ga:
-	$(CXX) $(CXXFLAGS) $(OMP_FLAGS) ga/main.cc \
-	ga/config.cc \
+multi-radar-deployment:
+	$(CXX) $(CXXFLAGS) $(OMP_FLAGS) multi-radar-deployment/main.cc \
+	multi-radar-deployment/config.cc \
 	common/coverage.cc \
 	$(PREPROCESS_SRC) \
 	$(HOMEBREW_INCLUDES) \
@@ -103,14 +102,12 @@ init:
 
 # =====================================================
 # Particle Swarm Optimization (PSO) Single Radar
+# single-radar-deployment/pso.h is header-only (no main()) and is driven
+# through the CLI tool's `run single` subcommand — build `tool` and run
+# `./trace run single` instead of a standalone pso target.
 # =====================================================
-pso:
-	$(CXX) $(CXXFLAGS) pso/main.cc \
-	$(PREPROCESS_SRC) \
-	$(HOMEBREW_INCLUDES) \
-	$(GDAL_CFLAGS) \
-	-o pso_run \
-	$(HOMEBREW_LIBS) && ./pso_run
+single-radar-deployment:
+	@echo "PSO is header-only now; run './trace run single' after 'make tool' instead."
 
 init:
 	mkdir -p ./output/radar ./output/viewshed ./output/pso ./output/ga ./output/radarfd ./output/path ./output/simdata ./output/gbadws ./output/heatmap ./output/preprocess
@@ -119,4 +116,4 @@ init:
 # Cleanup
 # =====================================================
 clean:
-	rm -f preproc x_test adapt x_deploy x_ga astar_run pso_run gen_bin ga-gbadws/tactical_planner_ga-gbadws
+	rm -f preproc x_test trace x_deploy x_ga astar_run pso_run gen_bin ga-gbadws/tactical_planner_ga-gbadws

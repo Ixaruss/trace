@@ -1,9 +1,11 @@
 #include "cli.h"
 #include "../common.h"
 #include "../operations.h"
-#include "../ga/config.h"
-#include "../ga/ga.h"
-#include "../iad/coverage.h"
+#include "../multi-radar-deployment/config.h"
+#include "../multi-radar-deployment/ga.h"
+#include "../single-radar-deployment/pso.h"
+#include <cstddef>
+#include <ostream>
 int main(int argc, char** argv) {
 
     CLI::App app{"Geospatial Analysis and Radar CLI Tool"};
@@ -58,40 +60,9 @@ int main(int argc, char** argv) {
     vg->require_option(1);
     auto radar_sub = app.add_subcommand("radar", "Calculate radar profile coverage.");
 
-    double r_lat = 33.9871;
-    double r_lon = 74.7742;
-    double r_ant_agl = 50.0;
-    double r_tgt_agl = 1000.0;
-    double r_min_elev = 10.0;
-    double r_max_elev = 30.0;
-    double r_max_range = 300.0;
-
-    std::string r_output = "radar_output.svg";
-    bool r_fast = false;
 
 
-    radar_sub->add_option("--lat", r_lat, "Latitude of radar base")->required();
-    radar_sub->add_option("--lon", r_lon, "Longitude of radar base")->required();
-    radar_sub->add_option("-a,--antenna", r_ant_agl, "Antenna height AGL (meters)");
-    radar_sub->add_option("-t,--target", r_tgt_agl, "Target/threat aircraft height AGL (meters)");
-    radar_sub->add_option("--min-elev", r_min_elev, "Minimum elevation angle (degrees)");
-    radar_sub->add_option("--max-elev", r_max_elev, "Maximum elevation angle (degrees)");
-    radar_sub->add_option("-r,--range", r_max_range, "Maximum radar range (kilometers)");
-    radar_sub->add_option("-o,--output", r_output, "Output SVG filename");
-    radar_sub->add_flag("-s", has_sector, "Use sector");
-    radar_sub->add_option("--loa", loa, "Left of arc (degrees)");
-    radar_sub->add_option("--roa", roa, "Right of arc (degrees)");
-    radar_sub->add_flag("-f,--fast", r_fast, "Execute calculation in fast mode (without image)");
-    radar_sub->add_flag("--use-curvature", vs_curvature, "use earth curvature corrections");
-    radar_sub->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
-    radar_sub->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
-    radar_sub->add_flag("--use-amsl", use_amsl, "use AMSL height instead of AGL for target/threat height");
 
-    auto rg = radar_sub->add_option_group("output formats available");
-    rg->add_flag("--tif", tiff,"geotagged tiff");
-    rg->add_flag("--svg",svg, "svg vector");
-    rg->add_flag("--png", png, "png image (default)");
-    rg->require_option(1);
 
     double srcLat = 34.017346;
     double srcLon = 74.50587999;
@@ -123,7 +94,6 @@ int main(int argc, char** argv) {
     los_sub->add_option("--tgt-lon", tgtLon, "Target longitude")->required();
     los_sub->add_option("-a,--antenna", los_ant_height, "Radar antenna height AGL (meters)");
     los_sub->add_option("-t,--target", los_tgt_height, "Target aircraft height AGL (meters)");
-    los_sub->add_flag("-d,--detailed", detailed, "Execute detailed profile and print cell telemetry");
 
     auto run  = app.add_subcommand("run", "run ga cases via config");
     int gen = 0;
@@ -135,12 +105,8 @@ int main(int argc, char** argv) {
      run->add_flag("-b, --run-benchmark", run_benchmark, "create benchamrk table for all selection, mutation and crossover methods");
      run->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
      run->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
-
-     auto sgrid  = app.add_subcommand("sgrid", "create a survaillence grid cooresponding to iadconf");
-
-
-     sgrid->add_flag("--single-band", single, "create single band tiff instead of default multi-band");
-     sgrid->add_flag("--epsg-7755", epsg7755, "reproject tiff to epsg 7755 instead of deafult epsg 4326");
+     auto run_single = run->add_subcommand("single", "find the best location for a single radar with PSO (config: ./config/psoconf.json)");
+     auto run_single_bench = run_single->add_subcommand("benchmark", "run every PSO strategy profile (topology x inertia x boundary) and print a ranking");
 
     try {
         app.parse(argc, argv);
@@ -151,6 +117,7 @@ int main(int argc, char** argv) {
 
     if (*viewshed_sub) {
         Global g;
+        g.load({ELEVATION}, OperationType::UNBOUNDED, vs_lat, vs_lon, vs_range);
         auto engine = std::make_unique<ViewshedEngine>(
             g, vs_lat, vs_lon, vs_range, vs_ant_height, vs_curvature
         );
@@ -192,54 +159,34 @@ int main(int argc, char** argv) {
     // Route 2: Execution for Radar
     else if (*radar_sub) {
 
+
+        auto rconf = Rconf::load();
+        string output_ext = rconf.output.substr(rconf.output.size()-3, 3);
+
+        string path = rconf.output.substr(0,rconf.output.size()-3);
         Global g;
-        g.bin.init({ ELEVATION });
-        RadarEngine engine(
-            g, r_lat, r_lon, r_ant_agl, r_tgt_agl, r_min_elev, r_max_elev, r_max_range, vs_curvature,use_amsl
-        );
-        string output_ext;
+        g.load({ELEVATION}, OperationType::UNBOUNDED, rconf.srcLat, rconf.srcLon, rconf.range);
+        RadarEngine engine(g);
+        if(!Rconf::is_available()){
+            std::cerr<<"[ERROR] radar conf not found\n";
+            return -1;
+        }
+
+        if(output_ext == "tif" || output_ext == "iff") tiff = true;
+        else if(output_ext == "svg") svg = true;
+        else png = true;
+        string r_output = path + output_ext;
+        auto res = engine.compute();
+        cout << "writing: " << r_output <<endl;
         if(tiff){
-            output_ext = ".tif";
+             engine.writeCoverageToGeoTIFF(res,r_output,50,epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
         }else if(svg) {
-            output_ext = ".svg";
+             engine.writeToSVG(res,r_output);
         } else {
-            output_ext = ".png";
+            engine.writeToPNG(res,r_output);
         }
-        if (r_fast) {
-            if (has_sector) {
 
-                engine.computeFast(loa,roa);
-            } else {
-                engine.computeFast();
-            }
-        } else {
-            if (radar_sub->count("--output") == 0 && has_sector) {
-                r_output = "output/radar/radar_sector" +  output_ext;
-            } else if (radar_sub->count("--output") == 0) {
-                r_output = "output/radar/radar_360" + output_ext;
-            }
 
-            if (has_sector) {
-                auto res = engine.compute(loa,roa);
-                if(tiff){
-                     engine.writeCoverageToGeoTIFF(res,r_output,50,epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
-                }else if(svg) {
-                     engine.writeToSVG(res,r_output);
-                } else {
-                    engine.writeToPNG(res,r_output);
-                }
-            } else {
-                auto res = engine.compute();
-                cout << "writing: " << r_output <<endl;
-                if(tiff){
-                     engine.writeCoverageToGeoTIFF(res,r_output,50,epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
-                }else if(svg) {
-                     engine.writeToSVG(res,r_output);
-                } else {
-                    engine.writeToPNG(res,r_output);
-                }
-            }
-        }
     }
     else if (*pre_sub) {
         int i = -1;
@@ -253,6 +200,10 @@ int main(int argc, char** argv) {
     }
     else if (*rlos_sub) {
         Global g;
+        // Window must be resolved before any Bin access (ensureLoaded()
+        // aborts otherwise) -- radius matches this subcommand's own
+        // --range flag, since radarLOS/radarLOSDetailed never look past it.
+        g.load({ELEVATION}, OperationType::UNBOUNDED, srcLat, srcLon, los_max_range);
         if (!detailed) {
             // 1. Fast LOS Workflow
             auto res = RadarEngine::radarLOS(
@@ -298,78 +249,57 @@ int main(int argc, char** argv) {
     }
     else if (*los_sub) {
         Global g;
-        auto res = g.lineOfVisibilityopt(srcLat, srcLon, los_ant_height, tgtLat, tgtLon, los_tgt_height);
-        auto target = res.back();
-        float srcTerrain = g.bin.getElevation(srcLat, srcLon);
-        double srcElev = srcTerrain + los_ant_height;
-           if (detailed) {
-               std::cout << "=========================================\n";
-                  std::cout << "Target Status : " << (target.visible ? "VISIBLE" : "BLOCKED") << "\n";
-                  std::cout << "Total Distance: " << std::fixed << std::setprecision(2) << target.dist << " meters\n";
-                  std::cout << "Final Angle   : " << target.angle << "°\n";
-                  std::cout << "Max Obstacle  : " << target.maxAngle << "°\n";
-                  std::cout << "Src elev      : " << srcElev << "m\n";
-                  std::cout << "Target Elev   : " << target.elev << "m\n";
-                  std::cout << "=========================================\n\n";
-
-               size_t totalCells = res.size();
-                 size_t printCount = (totalCells < 10) ? totalCells : 10;
-                 size_t startIndex = totalCells - printCount;
-
-                 std::cout << "--- Printing Last " << printCount << " Path Cells ---\n";
-
-                 // Table Header
-                 std::cout << std::setw(6)  << "Idx"
-                           << std::setw(12) << "Coord (X,Y)"
-                           << std::setw(10) << "Dist(m)"
-                           << std::setw(9)  << "Elev(m)"
-                           << std::setw(9)  << "Angle"
-                           << std::setw(10) << "MaxAng"
-                           << std::setw(9)  << "Visible" << "\n";
-                 std::cout << std::string(65, '-') << "\n";
-
-                 // Print rows
-                 for (size_t i = startIndex; i < totalCells; ++i) {
-                     const auto& cell = res[i];
-                     std::string coordStr = "(" + std::to_string(cell.x) + "," + std::to_string(cell.y) + ")";
-
-                     std::cout << std::setw(6)  << i
-                               << std::setw(12) << coordStr
-                               << std::setw(10) << std::fixed << std::setprecision(1) << cell.dist
-                               << std::setw(9)  << cell.elev
-                               << std::setw(9)  << std::setprecision(2) << cell.angle
-                               << std::setw(10) << cell.maxAngle
-                               << std::setw(9)  << (cell.visible ? "Yes" : "No") << "\n";
-                 }
-                 std::cout << std::string(65, '-') << "\n";
-           }else {
-               std::cout << "Target Status : " << (target.visible ? "VISIBLE" : "BLOCKED") << "\n";
-               std::cout << "Total Distance: " << std::fixed << std::setprecision(2) << target.dist << " meters\n";
-               std::cout << "Total cells : " << res.size() << "\n";
-           }
+        // Same window-must-be-resolved requirement as rlos, but this
+        // subcommand has no --range flag -- size the window from the
+        // actual source-target great-circle distance (haversine, since no
+        // CRS/poCT exists yet before load()) plus a safety margin.
+        {
+            const double dLat = Global::deg2rad(tgtLat - srcLat);
+            const double dLon = Global::deg2rad(tgtLon - srcLon);
+            const double a = std::sin(dLat / 2) * std::sin(dLat / 2) +
+                              std::cos(Global::deg2rad(srcLat)) * std::cos(Global::deg2rad(tgtLat)) *
+                              std::sin(dLon / 2) * std::sin(dLon / 2);
+            const double srcTgtKm = 2.0 * 6371.0 * std::atan2(std::sqrt(a), std::sqrt(1.0 - a));
+            g.load({ELEVATION}, OperationType::UNBOUNDED, srcLat, srcLon, srcTgtKm + 5.0);
+        }
+        // lineOfVisibilityopt/lineOfVisibility/lineOfVisibilityOptimized were
+        // duplicate LOS implementations never updated for windowed/tiled
+        // loading (same bug as radarLOS above) and have been removed --
+        // Global::lineOfSight (lineofsight.cc) is the one real two-point LOS
+        // check left, already correct for tiled mode via getElevationRC().
+        // It prints its own src/target elevation + timing breakdown.
+        bool visible = g.lineOfSight(srcLat, srcLon, (int)los_ant_height,
+                                      tgtLat, tgtLon, (int)los_tgt_height);
+        std::cout << "Target Status : " << (visible ? "VISIBLE" : "BLOCKED") << "\n";
+    }else if (*run_single) {
+        // checked BEFORE *run: a nested subcommand also makes its parent truthy
+        return pso_radar::runAll(*run_single_bench ? true : false);   // `run single benchmark` -> all profiles
     }else if (*run) {
         ThreadPool pool;
         GaEngine ga(pool);
         if (GaConf::is_available()) {
             GaConf cfg = GaConf::load();
             if(run_benchmark) {
-                ga.run_benchmark();
+                if (cfg.homo.is_case)
+                    ga.run_benchmark(BenchmarkCase::HOMOGENOUS);
+                else if (cfg.hetero.is_case)
+                    ga.run_benchmark(BenchmarkCase::HETEROGENOUS);
+                else if (cfg.autoG.is_case)
+                    ga.run_benchmark(BenchmarkCase::AUTO);
             }else if (gen != 0) {
                  ga.run_native_random_simulation(gen);
             } else if (cfg.homo.is_case) {
-                // Parameters (pop, rates, weights, output) already applied in
-                // GaEngine constructor via applyConfig(); just call the runner.
                 ga.run_homogenous(reduction_factor, png, epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
             }
             else if (cfg.hetero.is_case) {
-                // Fleet built inside run_heterogenous() from cfg.hetero.radars
+
                 ga.run_heterogenous(reduction_factor, png, epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
             }
             else if (cfg.autoG.is_case) {
                 ga.setAutoOperators(SelectionMethod::TOURNAMENT,
                                     AutoCrossoverMethod::RANDOM_SUBSET,
                                     /*mRate=*/0.10, /*cRate=*/0.85);
-                // Fleet built inside run_auto() from cfg.autoG.radars
+
                 ga.run_auto(reduction_factor, png, epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
             }
             else {
@@ -378,10 +308,6 @@ int main(int argc, char** argv) {
                 return -1;
             }
         }
-    }else if (sgrid) {
-        Global g;
-        g.bin.init();
-        Iad::get_iad_coverage_tif(g, epsg7755 ? OutputCrs::Native7755 : OutputCrs::Wgs84, single ? BandLayout::SingleBandPalette : BandLayout::Rgba);
     }
     return 0;
 }

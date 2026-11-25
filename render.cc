@@ -49,11 +49,24 @@
  * the geotransform's pixel size is scaled to match. Nothing shifts,
  * so a reduced raster still lines up with a full-resolution one.
  *
- * WINDOWED RASTERS: writeOverlapGeoTIFF and the two reverse-raycast
- * writers emit only their own sub-window of the DEM grid (the AOI's
- * AABB, or the mask's rowMin/colMin box) rather than the full grid.
- * The geotransform origin is shifted by that window's row/col offset,
- * so these still overlay the full-grid products correctly.
+ * WINDOWED RASTERS: writeOverlapGeoTIFF emits only its own sub-window of
+ * the DEM grid (the AOI's AABB) rather than the full grid. The
+ * geotransform origin is shifted by that window's row/col offset, so it
+ * still overlays the full-grid products correctly.
+ *
+ * WINDOWED-LOADING REVIEW NOTE (added when Bin gained AOI/UNBOUNDED
+ * partial-grid loading): writeOverlapGeoTIFF/writeOverlapCoreTIFF both
+ * take their row/col window as an EXPLICIT caller-supplied parameter
+ * (FeasibleGrid's origin_r/c) that was already global before this change
+ * and still is — no edit needed for those two.
+ * ViewshedEngine::writeViewshedToGeoTIFF, RadarEngine::writeCoverageToGeoTIFF,
+ * and RadarEngine::writeFastToGeoTIFF instead read rowMin/colMin off a
+ * LOCAL bbox scan (computeCoverageBBox) combined with the engine's own
+ * window-local gridCols/srcRow/centerX etc., and were combining that with
+ * the FULL grid's origin_x/origin_y — correct only when the window IS the
+ * full grid. Fixed by adding each engine's winR0/winC0 (global origin of
+ * its window) into the origin calculation; see the fixed originX/originY
+ * lines below for the pattern.
  *
  * OUTPUT CRS (outCrs): every writer also takes an optional OutputCrs
  * (Native7755 / Wgs84 / Both). The raster is always *rasterized* once,
@@ -71,7 +84,6 @@
  */
 
 #include "operations.h"
-#include "common/radarfdr.h"
 
 #include <gdal_priv.h>
 #include <ogr_spatialref.h>
@@ -778,10 +790,25 @@ void ViewshedEngine::writeViewshedToGeoTIFF(
     const int winCols = colMax - colMin + 1;
     const int winRows = rowMax - rowMin + 1;
 
+    // CHANGED: rowMin/colMin here are LOCAL to this engine's window
+    // (computeCoverageBBox scans viewshedMask, which is window-sized).
+    // g.conf.grid.origin_x/y is the FULL grid's origin, so the window's
+    // own offset (winR0/winC0, global row/col of this window's cell 0,0)
+    // must be added — otherwise the raster is geotagged as if this
+    // window started at the full grid's top-left, which is only true
+    // when the window IS the full grid (the FULL operation type).
+    // CHANGED: previously branched on is_full with two near-identical
+    // formulas that only differed by +winC0/+winR0. Since winR0/winC0 now
+    // come from g.bin.data_window (set in the ViewshedEngine constructor)
+    // and ARE 0 in full-grid mode by construction, adding them
+    // unconditionally is correct in both modes — one formula, no branch
+    // to keep in sync, and RESOLUTION replaced with g.bin.cell_m (the
+    // resolution the grid was actually built at).
+    const double cellM = static_cast<double>(g.bin.cell_m);
     const double originX = static_cast<double>(g.conf.grid.origin_x)
-                          + static_cast<double>(colMin) * RESOLUTION;
+                          + static_cast<double>(colMin + winC0) * cellM;
     const double originY = static_cast<double>(g.conf.grid.origin_y)
-                          - static_cast<double>(rowMin) * RESOLUTION;
+                          - static_cast<double>(rowMin + winR0) * cellM;
 
     writeRGBAGeoTIFF(
         filename,
@@ -789,7 +816,7 @@ void ViewshedEngine::writeViewshedToGeoTIFF(
         /*coveredValue=*/1, GREEN, TRANSPARENT,
         winCols, winRows,
         originX, originY,
-        static_cast<double>(RESOLUTION),
+        cellM,
         reductionPercent,
         /*markerRow=*/centerX - rowMin, /*markerCol=*/centerY - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
@@ -841,10 +868,15 @@ void RadarEngine::writeCoverageToGeoTIFF(
     const int winCols = colMax - colMin + 1;
     const int winRows = rowMax - rowMin + 1;
 
+    // CHANGED: same collapse as ViewshedEngine's writer above — res.winC0/
+    // res.winR0 (carried through from RadarEngine::compute(), itself from
+    // data_window) are 0 in full-grid mode, so one unconditional formula
+    // is correct in both modes. cell_m, not RESOLUTION.
+    const double cellM = static_cast<double>(g.bin.cell_m);
     const double originX = static_cast<double>(g.conf.grid.origin_x)
-                          + static_cast<double>(colMin) * RESOLUTION;
+                          + static_cast<double>(colMin + res.winC0) * cellM;
     const double originY = static_cast<double>(g.conf.grid.origin_y)
-                          - static_cast<double>(rowMin) * RESOLUTION;
+                          - static_cast<double>(rowMin + res.winR0) * cellM;
 
     writeRGBAGeoTIFF(
         filename,
@@ -852,7 +884,7 @@ void RadarEngine::writeCoverageToGeoTIFF(
         coveredValue, GREEN, TRANSPARENT,
         winCols, winRows,
         originX, originY,
-        static_cast<double>(RESOLUTION),
+        cellM,
         reductionPercent,
         /*markerRow=*/res.srcRow - rowMin, /*markerCol=*/res.srcCol - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
@@ -860,6 +892,7 @@ void RadarEngine::writeCoverageToGeoTIFF(
         /*srcStride=*/res.gridCols,
         outCrs,
         bands);
+
 }
 
 // ----------------------------------------------------------------------
@@ -891,10 +924,15 @@ void RadarEngine::writeFastToGeoTIFF(
     const int winCols = colMax - colMin + 1;
     const int winRows = rowMax - rowMin + 1;
 
+    // Window-origin fix, same pattern as the two writers above. Reads
+    // winR0/winC0 straight off the engine since it's a live member
+    // function, not a free function working from a saved result. Zero in
+    // full-grid mode by construction, so no is_full branch needed.
+    const double cellM = static_cast<double>(g.bin.cell_m);
     const double originX = static_cast<double>(g.conf.grid.origin_x)
-                          + static_cast<double>(colMin) * RESOLUTION;
+                          + static_cast<double>(colMin + winC0) * cellM;
     const double originY = static_cast<double>(g.conf.grid.origin_y)
-                          - static_cast<double>(rowMin) * RESOLUTION;
+                          - static_cast<double>(rowMin + winR0) * cellM;
 
     writeRGBAGeoTIFF(
         filename,
@@ -902,7 +940,7 @@ void RadarEngine::writeFastToGeoTIFF(
         /*coveredValue=*/1, GREEN, TRANSPARENT,
         winCols, winRows,
         originX, originY,
-        static_cast<double>(RESOLUTION),
+        cellM,
         reductionPercent,
         /*markerRow=*/srcRow - rowMin, /*markerCol=*/srcCol - colMin,
         /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
@@ -912,345 +950,53 @@ void RadarEngine::writeFastToGeoTIFF(
         bands);
 }
 
-// ======================================================================
-// Reverse ray cast (castRayReverse / get_coverage_reverse) exports
-// ======================================================================
-//
-// Both of these emit a WINDOWED raster: only the [rowMin,rowMax) x
-// [colMin,colMax) box the rays were cast across, not the full DEM grid.
-// The geotransform origin is offset by that box's row/col so the result
-// still registers against the full-grid products -- same convention as
-// writeOverlapGeoTIFF.
-// ----------------------------------------------------------------------
+// Primary implementation: writes straight from a dense, row-major
+// counts buffer (height*width, one byte per cell, 0 == no coverage).
+// This is what OverlapAccum::counts already is, so
+// calculate_radar_coverage_multi can hand it in directly -- no
+// FeasibleGrid cell list, and no second height*width scratch buffer
+// built inside this function (the old `overlapBuf` scatter is gone;
+// `counts` IS that buffer now).
 
-// LocalMask straight out of computeLocalMaskReverse: 0/1 covered, laid
-// out over the mask's own window, row 0 = mask.rowMin = north.
-// srcRow/srcCol are FULL-GRID coords (the radar site); pass -1 for both
-// to omit the site marker.
-bool writeReverseMaskGeoTIFF(
-    Global&                     g,
-    const rc_detail::LocalMask& mask,
-    int                         srcRow,
-    int                         srcCol,
-    const std::string&          filename,
-    int                         reductionPercent,
-    OutputCrs                   outCrs,
-    BandLayout                  bands)
-{
-    const int cols = mask.localCols;
-    const int rows = mask.rowMax - mask.rowMin;
-
-    if (cols <= 0 || rows <= 0) {
-        std::cerr << "[reverse-tif] FAIL: invalid mask window "
-                  << cols << " x " << rows << "\n";
-        return false;
-    }
-    if (mask.buf.size() != static_cast<size_t>(rows) * cols) {
-        std::cerr << "[reverse-tif] FAIL: mask buffer is "
-                  << mask.buf.size() << " bytes but the window implies "
-                  << static_cast<size_t>(rows) * cols
-                  << " -- rowMin/rowMax/localCols disagree with buf\n";
-        return false;
-    }
-
-    // Window origin = full-grid origin shifted by the mask's own offset.
-    const double originX = static_cast<double>(g.conf.grid.origin_x)
-                          + static_cast<double>(mask.colMin) * RESOLUTION;
-    const double originY = static_cast<double>(g.conf.grid.origin_y)
-                          - static_cast<double>(mask.rowMin) * RESOLUTION;
-
-    // Site marker in window-local pixels. Guarded rather than assumed:
-    // a clamped R can pull the window in, and a marker outside it would
-    // otherwise get snapped onto an edge pixel and quietly lie.
-    int markerRow = -1, markerCol = -1;
-    if (srcRow >= 0 && srcCol >= 0) {
-        const int lr = srcRow - mask.rowMin;
-        const int lc = srcCol - mask.colMin;
-        if (lr >= 0 && lr < rows && lc >= 0 && lc < cols) {
-            markerRow = lr;
-            markerCol = lc;
-        } else {
-            std::cerr << "[reverse-tif] WARN: source (" << srcRow << ","
-                      << srcCol << ") is outside the mask window -- "
-                         "marker omitted\n";
-        }
-    }
-
-    return writeRGBAGeoTIFF(
-        filename,
-        mask.buf.data(),
-        /*coveredValue=*/1, GREEN, TRANSPARENT,
-        cols, rows,
-        originX, originY,
-        static_cast<double>(RESOLUTION),
-        reductionPercent,
-        markerRow, markerCol,
-        /*markerRadiusCells=*/8, {255,0,0,255}, {255,255,255,255}, 2,
-        /*palette=*/nullptr, /*srcStride=*/-1,
-        outCrs,
-        bands);
-}
-
-// Break points from get_coverage_reverse, rendered the same way
-// Bin::writeReverseBreakPointsPng renders them: a green SEGMENT from
-// the source out to each break point, with a red dot at the break
-// point itself.
-//
-// The segments are what make the footprint solid. A break point is one
-// cell out of ~28 million, so stamping only the points gives you a
-// visually empty raster -- the filled blob you see in the PNG comes
-// entirely from the source->breakpoint lines.
-//
-// The Bresenham stepping rule here is character-for-character the one
-// in castRayReverse's path walk and in the PNG renderer, so the three
-// agree on which cells a given ray touches.
-//
-// NOTE ON SEMANTICS: this fills every cell from the source up to and
-// including the break point, matching what castRayReverse itself writes
-// into its mask. Cells that are shadowed but nearer than the farthest
-// visible cell are therefore drawn as covered. That's the existing
-// definition of this product, not a rendering artifact -- if you want
-// strictly-visible cells only, that's computeLocalMaskReverse's mask
-// via writeReverseMaskGeoTIFF, which is a different (and slower) thing.
-//
-// Window args mirror writeReverseBreakPointsPng's, so the call site can
-// hand both the same numbers:
-//   (winRowMin, winColMin, winCols, winRows, srcRow, srcCol, breakPoints)
-bool writeReverseBreakPointsGeoTIFF(
-    Global&                       g,
-    const std::string&            filename,
-    int                           winRowMin,
-    int                           winColMin,
-    int                           winCols,
-    int                           winRows,
-    int                           srcRow,
-    int                           srcCol,
-    const std::vector<GridPoint>& breakPoints,
-    int                           reductionPercent,
-    int                           dotRadiusCells,
-    bool                          fillToBreakPoints,
-    OutputCrs                     outCrs,
-    BandLayout                    bands)
-{
-    if (winCols <= 0 || winRows <= 0) {
-        std::cerr << "[breakpoint-tif] FAIL: invalid window "
-                  << winCols << " x " << winRows << "\n";
-        return false;
-    }
-    if (dotRadiusCells < 0) dotRadiusCells = 0;
-
-    if (breakPoints.empty())
-        std::cerr << "[breakpoint-tif] WARN: no break points -- writing an "
-                     "empty raster with just the source marker\n";
-
-    // Single-band stamp buffer over the window (1 byte/cell -- the same
-    // footprint LocalMask would take for the same R).
-    std::vector<uint8_t> buf(static_cast<size_t>(winRows) * winCols, V_EMPTY);
-
-    const int localSrcR = srcRow - winRowMin;
-    const int localSrcC = srcCol - winColMin;
-    const bool srcInWindow =
-        (localSrcR >= 0 && localSrcR < winRows &&
-         localSrcC >= 0 && localSrcC < winCols);
-
-    if (!srcInWindow)
-        std::cerr << "[breakpoint-tif] WARN: source (" << srcRow << ","
-                  << srcCol << ") is outside the window -- segments and "
-                     "marker omitted\n";
-
-    // Highest value wins on collision, so a break-point dot is never
-    // overwritten by a segment from a neighbouring ray.
-    auto stamp = [&](int lr, int lc, uint8_t v) {
-        if ((unsigned)lr >= (unsigned)winRows ||
-            (unsigned)lc >= (unsigned)winCols) return;
-        uint8_t& dst = buf[static_cast<size_t>(lr) * winCols + lc];
-        if (v > dst) dst = v;
-    };
-
-    // Same stepping rule as castRayReverse's path walk.
-    auto drawSegment = [&](int r0, int c0, int r1, int c1) {
-        const int adr = std::abs(r1 - r0), adc = std::abs(c1 - c0);
-        const int sr  = (r0 < r1) ? 1 : -1;
-        const int sc  = (c0 < c1) ? 1 : -1;
-        int err = adr - adc;
-        int row = r0, col = c0;
-        while (true) {
-            stamp(row, col, V_SEGMENT);
-            if (row == r1 && col == c1) break;
-            const int e2 = 2 * err;
-            if (e2 > -adc) { err -= adc; row += sr; }
-            if (e2 <  adr) { err += adr; col += sc; }
-        }
-    };
-
-    const long long dotRSq =
-        static_cast<long long>(dotRadiusCells) * dotRadiusCells;
-
-    int skipped = 0;
-    for (const auto& p : breakPoints) {
-        const int lr = p.r - winRowMin;
-        const int lc = p.c - winColMin;
-        if (lr < 0 || lr >= winRows || lc < 0 || lc >= winCols) { ++skipped; continue; }
-
-        // 1. Covered segment, source -> break point. This is the fill.
-        if (fillToBreakPoints && srcInWindow)
-            drawSegment(localSrcR, localSrcC, lr, lc);
-
-        // 2. Break-point dot on top.
-        const int yLo = std::max(0,           lr - dotRadiusCells);
-        const int yHi = std::min(winRows - 1, lr + dotRadiusCells);
-        const int xLo = std::max(0,           lc - dotRadiusCells);
-        const int xHi = std::min(winCols - 1, lc + dotRadiusCells);
-
-        for (int y = yLo; y <= yHi; ++y) {
-            const long long dy  = y - lr;
-            const long long dy2 = dy * dy;
-            for (int x = xLo; x <= xHi; ++x) {
-                const long long dx = x - lc;
-                if (dx * dx + dy2 <= dotRSq) stamp(y, x, V_BREAKPOINT);
-            }
-        }
-    }
-    if (skipped > 0)
-            std::cerr << "[breakpoint-tif] WARN: " << skipped << " of "
-                      << breakPoints.size() << " break points fell outside the "
-                      << winCols << "x" << winRows << " window and were skipped\n";
-
-        // Tighten to what actually got drawn (segments + dots), rather than
-        // writing the caller's full search window verbatim.
-        int bRowMin, bRowMax, bColMin, bColMax;
-        if (!computeCoverageBBox(buf.data(), winCols, winRows, V_SEGMENT,
-                                 bRowMin, bRowMax, bColMin, bColMax)) {
-            // V_SEGMENT alone may miss an isolated dot with no fill segment
-            // (fillToBreakPoints == false); fall back to scanning for any
-            // non-empty cell in that case.
-            auto anyDrawn = [&](int& r0, int& r1, int& c0, int& c1) {
-                r0 = winRows; r1 = -1; c0 = winCols; c1 = -1;
-                for (int y = 0; y < winRows; ++y)
-                    for (int x = 0; x < winCols; ++x)
-                        if (buf[static_cast<size_t>(y) * winCols + x] != V_EMPTY) {
-                            r0 = std::min(r0, y); r1 = std::max(r1, y);
-                            c0 = std::min(c0, x); c1 = std::max(c1, x);
-                        }
-                return r1 >= r0;
-            };
-            if (!anyDrawn(bRowMin, bRowMax, bColMin, bColMax)) {
-                std::cerr << "[breakpoint-tif] WARN: nothing drawn -- skipping "
-                          << filename << "\n";
-                return false;
-            }
-        }
-        if (srcInWindow) {
-            bRowMin = std::min(bRowMin, localSrcR);
-            bRowMax = std::max(bRowMax, localSrcR);
-            bColMin = std::min(bColMin, localSrcC);
-            bColMax = std::max(bColMax, localSrcC);
-        }
-        const int kPad = std::max(10, dotRadiusCells + 2);
-        bRowMin = std::max(0,            bRowMin - kPad);
-        bColMin = std::max(0,            bColMin - kPad);
-        bRowMax = std::min(winRows - 1, bRowMax + kPad);
-        bColMax = std::min(winCols - 1, bColMax + kPad);
-
-        const int cropCols = bColMax - bColMin + 1;
-        const int cropRows = bRowMax - bRowMin + 1;
-
-        const double originX = static_cast<double>(g.conf.grid.origin_x)
-                              + static_cast<double>(winColMin + bColMin) * RESOLUTION;
-        const double originY = static_cast<double>(g.conf.grid.origin_y)
-                              - static_cast<double>(winRowMin + bRowMin) * RESOLUTION;
-
-        RGBA palette[256];
-        for (auto& e : palette) e = TRANSPARENT;
-        palette[V_SEGMENT]    = GREEN;
-        palette[V_BREAKPOINT] = BREAK_DOT;
-
-        const bool ok = writeRGBAGeoTIFF(
-            filename,
-            buf.data() + static_cast<size_t>(bRowMin) * winCols + bColMin,
-            /*coveredValue=*/0, TRANSPARENT, TRANSPARENT,
-            cropCols, cropRows,
-            originX, originY,
-            static_cast<double>(RESOLUTION),
-            reductionPercent,
-            srcInWindow ? localSrcR - bRowMin : -1,
-            srcInWindow ? localSrcC - bColMin : -1,
-            /*markerRadiusCells=*/8,
-            /*markerColor=*/RGBA{255, 0, 255, 255},
-            /*markerRingColor=*/RGBA{0, 0, 0, 255},
-            /*markerRingThicknessCells=*/2,
-            palette,
-            /*srcStride=*/winCols,
-            outCrs,
-            bands);
-
-    if (ok)
-        std::cout << "[breakpoint-tif] "
-                  << (static_cast<int>(breakPoints.size()) - skipped)
-                  << " break point(s), segments "
-                  << (fillToBreakPoints ? "filled" : "omitted")
-                  << ", dot radius " << dotRadiusCells << " cell(s)\n";
-    return ok;
-}
-
-// ======================================================================
-// AOI overlap counts
-// ======================================================================
-
-bool writeOverlapGeoTIFF(
+bool writeOverlapCoreTIFF(
     Global&                        g,
-    const FeasibleGrid&            aoiGrid,
+    const uint8_t*                 counts,      // row-major, height*width
+    int                            origin_r,
+    int                            origin_c,
+    int                            height,
+    int                            width,
     const std::string&             filename,
     const std::vector<GridPoint>&  placements,
     int                            reductionPercent,
     OutputCrs                      outCrs,
     BandLayout                     bands)
 {
-    if (aoiGrid.height <= 0 || aoiGrid.width <= 0) {
+    if (height <= 0 || width <= 0 || !counts) {
         std::cerr << "[overlap-tif] FAIL: invalid grid dimensions "
-                  << aoiGrid.width << " x " << aoiGrid.height << "\n";
+                  << width << " x " << height << "\n";
         return false;
     }
 
-    const int width  = aoiGrid.width;
-    const int height = aoiGrid.height;
     const bool paletted = (bands == BandLayout::SingleBandPalette);
 
     reductionPercent = clampReduction(reductionPercent, "writeOverlapGeoTIFF");
     const int outWidth  = reducedDim(width,  reductionPercent);
     const int outHeight = reducedDim(height, reductionPercent);
 
-    // Dense local overlap buffer, scoped to the AOI's own bounding box
-    // only -- not the full DEM grid (same allocation philosophy as
-    // rc_detail::LocalMask). Default 0 == "no coverage" == transparent.
-    // Still built at native resolution; the reduction happens at write
-    // time so the source counts stay exact.
-    std::vector<uint8_t> overlapBuf(static_cast<size_t>(height) * width, 0);
-
-    int skipped = 0;
-    for (const auto& cell : aoiGrid.cells) {
-        int lr = cell.r - aoiGrid.origin_r;
-        int lc = cell.c - aoiGrid.origin_c;
-        if (lr < 0 || lr >= height || lc < 0 || lc >= width) { ++skipped; continue; }
-        overlapBuf[static_cast<size_t>(lr) * width + lc] =
-            static_cast<uint8_t>(std::min(cell.overlap, 255));
-    }
-    if (skipped > 0)
-        std::cerr << "[overlap-tif] WARN: " << skipped
-                  << " AOI cells fell outside the " << width << "x" << height
-                  << " AABB and were skipped\n";
-
     // Local geotransform origin = full-grid origin, offset by this AABB's
     // own row/col offset -- same convention as the rest of this file
     // (row 0 = north/top, col grows east). Unaffected by downsampling:
     // the top-left corner doesn't move, only the pixel size grows.
+    // cell_m, not RESOLUTION — origin_r/origin_c come from FeasibleGrid,
+    // already global, untouched by this windowing pass.
+    const double cellM = static_cast<double>(g.bin.cell_m);
     const double originX = static_cast<double>(g.conf.grid.origin_x)
-                          + static_cast<double>(aoiGrid.origin_c) * RESOLUTION;
+                          + static_cast<double>(origin_c) * cellM;
     const double originY = static_cast<double>(g.conf.grid.origin_y)
-                          - static_cast<double>(aoiGrid.origin_r) * RESOLUTION;
+                          - static_cast<double>(origin_r) * cellM;
 
-    const double pixelW = static_cast<double>(RESOLUTION) * width  / outWidth;
-    const double pixelH = static_cast<double>(RESOLUTION) * height / outHeight;
+    const double pixelW = cellM * width  / outWidth;
+    const double pixelH = cellM * height / outHeight;
 
     GDALAllRegister();
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("GTiff");
@@ -1295,8 +1041,8 @@ bool writeOverlapGeoTIFF(
     std::vector<LocalMarker> markers;
     markers.reserve(placements.size());
     for (const auto& p : placements) {
-        const int lr = p.r - aoiGrid.origin_r;
-        const int lc = p.c - aoiGrid.origin_c;
+        const int lr = p.r - origin_r;
+        const int lc = p.c - origin_c;
         markers.push_back({
             scaleIndex(lr, height, outHeight),
             scaleIndex(lc, width,  outWidth)
@@ -1354,7 +1100,7 @@ bool writeOverlapGeoTIFF(
             // is the honest summary here.
             uint8_t best = 0;
             for (int sy = sy0; sy < sy1; ++sy) {
-                const uint8_t* srcRow = overlapBuf.data() + static_cast<size_t>(sy) * width;
+                const uint8_t* srcRow = counts + static_cast<size_t>(sy) * width;
                 for (int sx = colLo[x]; sx < colHi[x]; ++sx)
                     if (srcRow[sx] > best) best = srcRow[sx];
             }
@@ -1412,4 +1158,48 @@ bool writeOverlapGeoTIFF(
     std::cout << ")\n";
 
     return finalizeCrsOutputs(plan, paletted);
+}
+
+// Compatibility wrapper for any existing caller still passing a
+// FeasibleGrid. Scatters it into a dense buffer once and forwards to the
+// primary overload above. calculate_radar_coverage_multi does NOT use
+// this path any more -- it calls the dense-buffer overload directly with
+// OverlapAccum::counts, skipping this copy entirely.
+bool writeOverlapGeoTIFF(
+    Global&                        g,
+    const FeasibleGrid&            aoiGrid,
+    const std::string&             filename,
+    const std::vector<GridPoint>&  placements,
+    int                            reductionPercent,
+    OutputCrs                      outCrs,
+    BandLayout                     bands)
+{
+    if (aoiGrid.height <= 0 || aoiGrid.width <= 0) {
+        std::cerr << "[overlap-tif] FAIL: invalid grid dimensions "
+                  << aoiGrid.width << " x " << aoiGrid.height << "\n";
+        return false;
+    }
+
+    std::vector<uint8_t> dense(
+        static_cast<size_t>(aoiGrid.height) * aoiGrid.width, 0);
+
+    int skipped = 0;
+    for (const auto& cell : aoiGrid.cells) {
+        const int lr = cell.r - aoiGrid.origin_r;
+        const int lc = cell.c - aoiGrid.origin_c;
+        if (lr < 0 || lr >= aoiGrid.height || lc < 0 || lc >= aoiGrid.width) {
+            ++skipped; continue;
+        }
+        dense[static_cast<size_t>(lr) * aoiGrid.width + lc] =
+            static_cast<uint8_t>(std::min(cell.overlap, 255));
+    }
+    if (skipped > 0)
+        std::cerr << "[overlap-tif] WARN: " << skipped
+                  << " AOI cells fell outside the " << aoiGrid.width << "x"
+                  << aoiGrid.height << " AABB and were skipped\n";
+
+    return writeOverlapCoreTIFF(
+        g, dense.data(), aoiGrid.origin_r, aoiGrid.origin_c,
+        aoiGrid.height, aoiGrid.width,
+        filename, placements, reductionPercent, outCrs, bands);
 }

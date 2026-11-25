@@ -1,21 +1,60 @@
 #include "../lib.h"
+#include <iostream>
+#include <cstdlib>
 
 using namespace std;
 
-int lib::calc_rows(int resolution) {
-    if (Config::is_available()) {
+// The grid resolution actually in force, in metres.
+//
+// Cached in a function-local static: Config::load() parses JSON, so this
+// must not be called per-cell in an inner loop without hoisting. The
+// static initialiser is thread-safe from C++11 onward, and the resolution
+// cannot change during a run, so caching for the process lifetime is safe.
+//
+// No fallback to the compile-time RESOLUTION: that constant is what
+// produced a 100m grid silently computed over 30m data. If config isn't
+// available or grid.resolution isn't set, every caller needs to know that
+// loudly, not receive a plausible-looking wrong number.
+int lib::grid_resolution() {
+    static const int res = []() -> int {
+        if (!Config::is_available()) {
+            std::cerr << "[lib] ERROR: grid_resolution() requires a config — "
+                         "none available. Aborting.\n";
+            std::exit(EXIT_FAILURE);
+        }
         Config cfg = Config::load();
-        return (int)ceil((cfg.grid.max_y - cfg.grid.min_y) / resolution);
+        if (cfg.grid.resolution <= 0) {
+            std::cerr << "[lib] ERROR: grid_resolution() — config grid.resolution "
+                         "is not set. Aborting.\n";
+            std::exit(EXIT_FAILURE);
+        }
+        return cfg.grid.resolution;
+    }();
+    return res;
+}
+
+// Currently unused within this codebase (grid dims come from cfg.grid.rows/
+// cols directly wherever a config exists — see preprocess.cc). Kept for
+// any external caller that still derives dims from extent/resolution; same
+// no-fallback policy applies.
+int lib::calc_rows(int resolution) {
+    if (!Config::is_available()) {
+        std::cerr << "[lib] ERROR: calc_rows() requires a config (grid.min_y/"
+                     "max_y) — none available. Aborting.\n";
+        std::exit(EXIT_FAILURE);
     }
-    return (int)ceil((VEC_MAX_Y - VEC_MIN_Y) / resolution);
+    Config cfg = Config::load();
+    return (int)ceil((cfg.grid.max_y - cfg.grid.min_y) / resolution);
 }
 
 int lib::calc_cols(int resolution) {
-    if (Config::is_available()) {
-        Config cfg = Config::load();
-        return (int)ceil((cfg.grid.max_x - cfg.grid.min_x) / resolution);
+    if (!Config::is_available()) {
+        std::cerr << "[lib] ERROR: calc_cols() requires a config (grid.min_x/"
+                     "max_x) — none available. Aborting.\n";
+        std::exit(EXIT_FAILURE);
     }
-    return (int)ceil((VEC_MAX_X - VEC_MIN_X) / resolution);
+    Config cfg = Config::load();
+    return (int)ceil((cfg.grid.max_x - cfg.grid.min_x) / resolution);
 }
 
 vector<double> lib::get_min_max_coordiantes(string path, int type) {

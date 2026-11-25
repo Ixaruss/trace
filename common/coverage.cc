@@ -73,8 +73,8 @@ static void castRadarRayDiag(
     int maxRadiusCells,
     const short*  __restrict__ dem,
     uint8_t*      __restrict__ stat,
-    int COLS, int ROWS, bool use_curvature,
-    bool useAMSL)
+    int COLS, int ROWS, bool use_curvature,bool useAMSL,
+    double cellM)   // grid resolution in metres (Bin::cell_m), NOT RESOLUTION
 {
     int adr=std::abs(endRow-srcRow), adc=std::abs(endCol-srcCol);
     int sr=(srcRow<endRow)?1:-1, sc=(srcCol<endCol)?1:-1;
@@ -108,7 +108,7 @@ static void castRadarRayDiag(
         // an octagon instead of a circle at any fixed threshold).
         double drow = static_cast<double>(row-srcRow);
         double dcol = static_cast<double>(col-srcCol);
-        double dist = std::sqrt(drow*drow+dcol*dcol) * RESOLUTION;
+        double dist = std::sqrt(drow*drow+dcol*dcol) * cellM;
         const double curvDrop = use_curvature ? (dist * dist) * INV_2_KEFFR : 0;
 
         if(dist>maxRangeM){ *statCell=(uint8_t)CoverageStatus::OUTSIDE_RANGE; continue; }
@@ -146,7 +146,8 @@ static void castRadarRayFast(
     double horizonM, int maxRadiusCells,
     const short* __restrict__ dem,
     uint8_t*     __restrict__ stat,
-    int COLS, int ROWS, bool use_curvature,bool useAMSL)
+    int COLS, int ROWS, bool use_curvature,bool useAMSL,
+    double cellM)   // grid resolution in metres (Bin::cell_m), NOT RESOLUTION
 {
     int adr=std::abs(endRow-srcRow), adc=std::abs(endCol-srcCol);
     int sr=(srcRow<endRow)?1:-1, sc=(srcCol<endCol)?1:-1;
@@ -178,7 +179,7 @@ static void castRadarRayFast(
         // True straight-line ground distance from source (see castRadarRayDiag).
         double drow = static_cast<double>(row-srcRow);
         double dcol = static_cast<double>(col-srcCol);
-        double dist = std::sqrt(drow*drow+dcol*dcol) * RESOLUTION;
+        double dist = std::sqrt(drow*drow+dcol*dcol) * cellM;
         const double curvDrop = use_curvature ? (dist * dist) * INV_2_KEFFR : 0;
 
         if(use_curvature)
@@ -271,12 +272,16 @@ static void castRadarRayFast(
     //                    North = 0°. leftDeg < 0 || rightDeg < 0 → full 360.
     //                    leftDeg > rightDeg wraps through North.
     // ------------------------------------------------------------------
-    RadarCoverageResult RadarEngine::compute(double leftDeg, double rightDeg)
+    RadarCoverageResult RadarEngine::compute()
     {
-        bool fullCircle = (leftDeg < 0.0 || rightDeg < 0.0);
 
+        bool fullCircle = !use_sector;
+        if(!use_sector) {
+            leftDeg =-1.0;
+            rightDeg =-1.0;
+        }
         auto activeBoundary = sectorBoundary(leftDeg, rightDeg);
-
+        std::cout<< leftDeg << " === " << rightDeg << std::endl;
         std::cout<<"[RADAR] Sector        : ";
         if(fullCircle) std::cout<<"360° (full)\n";
         else std::cout<<normAz(leftDeg)<<"° -> "<<normAz(rightDeg)
@@ -299,17 +304,18 @@ static void castRadarRayFast(
         const double MNS=minSlopeRatio,MXS=maxSlopeRatio;
         const double MXR=maxRangeM,HOR=horizonM;
         const int    MRC=maxRadiusCells;
+        const double CM=(double)g.bin.cell_m;   // hoisted: used once per ray STEP
 
         #pragma omp parallel for schedule(dynamic,64) default(none) \
             shared(demPtr,statPtr,activeBoundary) \
-            firstprivate(N,COLS,ROWS,SE,TH,MNS,MXS,MXR,HOR,MRC,use_curvature,use_amsl)
+            firstprivate(N,COLS,ROWS,SE,TH,MNS,MXS,MXR,HOR,MRC,CM)
         for(size_t i=0;i<N;++i){
             int er=activeBoundary[i].x, ec=activeBoundary[i].y;
             if(er>=0&&ec>=0&&er<ROWS&&ec<COLS)
                 castRadarRayDiag(
                     srcRow,srcCol,er,ec,
                     SE,TH,MNS,MXS,MXR,HOR,MRC,
-                    demPtr,statPtr,COLS,ROWS,use_curvature,use_amsl);
+                    demPtr,statPtr,COLS,ROWS,use_curvature,use_amsl,CM);
         }
 
         auto t1=std::chrono::high_resolution_clock::now();
@@ -319,6 +325,14 @@ static void castRadarRayFast(
         res.srcRow=srcRow; res.srcCol=srcCol;
         res.radiusCells=maxRadiusCells;
         res.gridCols=gridCols; res.gridRows=gridRows;
+        // CHANGED: carry the window's global origin through to the result.
+        // srcRow/srcCol/gridCols/gridRows above are window-local (see the
+        // constructor in operations.h) — render.cc's writeCoverageToGeoTIFF
+        // needs winR0/winC0 to compute the correct geographic origin for
+        // the exported GeoTIFF; without it the raster's pixel content is
+        // right but it gets tagged at the wrong location whenever this
+        // isn't a FULL window.
+        res.winR0=winR0; res.winC0=winC0;
         res.sectorLeftDeg  = fullCircle ? -1.0 : normAz(leftDeg);
         res.sectorRightDeg = fullCircle ? -1.0 : normAz(rightDeg);
         res.countCovered=res.countTerrainMasked=0;
@@ -365,9 +379,9 @@ static void castRadarRayFast(
     // ------------------------------------------------------------------
     // FAST COMPUTE — binary, no diagnostic
     // ------------------------------------------------------------------
-    std::vector<uint8_t> RadarEngine::computeFast(double leftDeg, double rightDeg)
+    std::vector<uint8_t> RadarEngine::computeWithAllPoints()
     {
-        bool fullCircle = (leftDeg < 0.0 || rightDeg < 0.0);
+        bool fullCircle = (!use_sector);
         auto activeBoundary = sectorBoundary(leftDeg, rightDeg);
 
         auto t0=std::chrono::high_resolution_clock::now();
@@ -387,17 +401,18 @@ static void castRadarRayFast(
         const double MNS=minSlopeRatio,MXS=maxSlopeRatio;
         const double HOR=horizonM;
         const int    MRC=maxRadiusCells;
+        const double CM=(double)g.bin.cell_m;   // hoisted: used once per ray STEP
 
         #pragma omp parallel for schedule(dynamic,64) default(none) \
             shared(demPtr,statPtr,activeBoundary) \
-            firstprivate(N,COLS,ROWS,SE,TH,MNS,MXS,HOR,MRC,use_curvature,use_amsl)
+            firstprivate(N,COLS,ROWS,SE,TH,MNS,MXS,HOR,MRC,CM)
         for(size_t i=0;i<N;++i){
             int er=activeBoundary[i].x,ec=activeBoundary[i].y;
             if(er>=0&&ec>=0&&er<ROWS&&ec<COLS)
                 castRadarRayFast(
                     srcRow,srcCol,er,ec,
                     SE,TH,MNS,MXS,HOR,MRC,
-                    demPtr,statPtr,COLS,ROWS,use_curvature,use_amsl);
+                    demPtr,statPtr,COLS,ROWS,use_curvature,use_amsl,CM);
         }
 
         auto t1=std::chrono::high_resolution_clock::now();

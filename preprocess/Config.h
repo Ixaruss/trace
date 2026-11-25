@@ -49,13 +49,18 @@ struct Case {
     bool slope;
 };
 struct Grid_Conf {
-  int resolution;
-  float origin_x;
-  float origin_y;
-  double min_x, max_x;
-  double min_y, max_y;
-  int   rows;
-  int   cols;
+  int resolution = 0;
+  float origin_x = 0;
+  float origin_y = 0;
+  double min_x = 0, max_x = 0;
+  double min_y = 0, max_y = 0;
+  int   rows = 0;
+  int   cols = 0;
+  // 0 = single flat bins (elev.bin/slope.bin/map.bin); >0 = tiled folders.
+  // Must default to 0: if the JSON has no "block_size" key this used to be
+  // whatever garbage was on the stack, i.e. tiling switched itself on or off.
+  int block_size = 0;
+
 };
 
 struct Distance {
@@ -72,7 +77,8 @@ class Config {
     public: Grid_Conf grid;
     public: Case fcase;
     public: Distance distance;
-    public:    bool agl_flag;
+    public: bool agl_flag;
+
     public: std::vector<std::pair<double,double>> area_op; // can be a polygon or retangle, if not rectangle find highest breath and hightest height and assign the values to above variable to form a rectangle;
 
     static Config load(std::optional <const std::string> path = std::nullopt);

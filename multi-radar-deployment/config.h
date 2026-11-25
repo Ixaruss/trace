@@ -1,0 +1,84 @@
+#ifndef GA_CONFIG_H_
+#define GA_CONFIG_H_
+
+#include <json/writer.h>
+#include <vector>
+#include <iostream>
+
+struct Weights {
+    double w1;
+    double w2;
+    double w3;
+    double w4;
+    double x;
+};
+
+struct Parameters {
+    double crossoverRate;
+    double mutationRate;
+    int numGenerations;
+    int numPopulation;
+    Weights weights;
+    double overlapFactor;
+    bool save;
+    int displaySolutions;
+    double varianceThreshold;
+    int forgiveFactor;
+    int saveSolutions;
+    std::string output;
+    bool threat_sector;
+    double loa;
+    double roa;
+    bool use_curv;
+    bool use_heatmap;
+    bool use_radar_model;
+    bool useAMSL;
+    double warm_seed_percentage;
+};
+
+struct RadarConf {
+    int range;
+    int antennaHeight;
+    float minAngle;
+    int target;
+    float maxAngle;
+    int quantity;
+    int peak_power; int antenna_gain; double wavelength;
+    int crossSection; double detachable_threshold;
+};
+
+struct HomogenousConf {
+    int chromosomeLength;
+    bool is_case;
+    RadarConf radar;
+};
+
+struct HeterogenousConf {
+    int chromosomeLength;
+    bool is_case;
+    int target;
+    std::vector<RadarConf> radars;
+};
+
+struct autoGenConf {
+    int minRadars;
+    int maxRadars;
+    int target;
+    bool is_case;
+    std::vector<RadarConf> radars;
+};
+
+
+class GaConf {
+    public:
+    Parameters parameters;
+    HomogenousConf homo;
+    HeterogenousConf hetero;
+    autoGenConf autoG;
+
+    static bool is_available(std::optional <const std::string> path = std::nullopt);
+    static GaConf load(std::optional <const std::string> path = std::nullopt);
+
+};
+
+#endif

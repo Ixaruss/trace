@@ -96,6 +96,7 @@ Config Config::from_json(const Json::Value& j) {
     conf.distance.from_rail = j["distance"]["from_rail"].asInt();
     conf.distance.from_water = j["distance"]["from_water"].asInt();
     conf.distance.from_ib = j["distance"]["from_ib"].asInt();
+    conf.grid.block_size = j["grid"]["block_size"].asInt();
 
     const Json::Value array = j["operation_area"];
     if (array.isArray()) {
@@ -131,7 +132,7 @@ Json::Value Config::to_json() const {
     j["grid"]["max_x"]               = grid.max_x;
     j["grid"]["min_y"]               = grid.min_y;
     j["grid"]["max_y"]               = grid.max_y;
-
+    j["grid"]["block_size"] = grid.block_size;
     // elevation grid — populated by build_elevation_matrix
     j["grid"]["rows"]       = grid.rows;
     j["grid"]["cols"]       = grid.cols;

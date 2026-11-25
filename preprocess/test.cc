@@ -52,9 +52,9 @@ using namespace std;
 int main() {
     Global g;
     g.bin.init();
+    cout << "elev at lat: 33.987 lng: 74.7742 elev: " << g.bin.getElevation(33.9871, 74.7742) << "\n";
     // int x,y;
     // g.bin.getGridCoords(33.9871, 74.7742,x,y);
-    RadarEngine::get_coverage_reverse(g, 33.9871, 74.7742,50,1000,0.5,30,300000,"./output/radar/new-fdr.tif", "./output/radar/new-fdr.png");
     // Bin::getonlyFeasibleGrid(b); // output: feasible.bin in root folder based on constraints defined for PSO
     // Bin::write_heatmap_bin_h5(); // withall option for all cells without feasibility check for heatmap : output aoi_cells.h5 in root folder
     return 0;

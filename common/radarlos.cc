@@ -50,10 +50,7 @@ RadarLOSResult RadarEngine::radarLOS(
     res.blockRow = -1;
     res.blockCol = -1;
 
-    const int COLS = g.conf.grid.cols;
-    const int ROWS = g.conf.grid.rows;
-
-    // -- grid coords --
+    // -- grid coords (global) --
     int srcRow, srcCol, tgtRow, tgtCol;
     if(!g.bin.getGridCoords(srcLat, srcLon, srcRow, srcCol) ||
        !g.bin.getGridCoords(tgtLat, tgtLon, tgtRow, tgtCol)){
@@ -62,8 +59,21 @@ RadarLOSResult RadarEngine::radarLOS(
         return res;
     }
 
+    // elev_matrix holds only the resident window (tiled/windowed loading),
+    // same as Bin::getElevationRC and RadarEngine::compute() in coverage.cc --
+    // global (r,c) must go through data_window, never g.conf.grid.cols.
+    const GridWindow& dw = g.bin.data_window;
+    if(!dw.contains(srcRow, srcCol) || !dw.contains(tgtRow, tgtCol)){
+        res.status  = LOSStatus::NO_DATA;
+        res.visible = false;
+        return res;
+    }
+    const int COLS = dw.cols;   // window stride, not the full grid's
+    const int localSrcRow = dw.toLocalRow(srcRow), localSrcCol = dw.toLocalCol(srcCol);
+    const int localTgtRow = dw.toLocalRow(tgtRow), localTgtCol = dw.toLocalCol(tgtCol);
+
     // -- source elevation --
-    short srcTerrain = g.bin.elev_matrix[(size_t)srcRow * COLS + srcCol];
+    short srcTerrain = g.bin.elev_matrix[(size_t)localSrcRow * COLS + localSrcCol];
     if(srcTerrain < -9000){
         res.status  = LOSStatus::NO_DATA;
         res.visible = false;
@@ -72,7 +82,7 @@ RadarLOSResult RadarEngine::radarLOS(
     double srcElev = static_cast<double>(srcTerrain) + antennaHeightM;
 
     // -- target elevation --
-    short tgtTerrain = g.bin.elev_matrix[(size_t)tgtRow * COLS + tgtCol];
+    short tgtTerrain = g.bin.elev_matrix[(size_t)localTgtRow * COLS + localTgtCol];
     if(tgtTerrain < -9000){
         res.status  = LOSStatus::NO_DATA;
         res.visible = false;
@@ -150,10 +160,14 @@ RadarLOSResult RadarEngine::radarLOS(
         static_cast<std::ptrdiff_t>(sr) * COLS;
     const std::ptrdiff_t strideC = sc;
     std::ptrdiff_t off =
-        static_cast<std::ptrdiff_t>(srcRow) * COLS + srcCol;
+        static_cast<std::ptrdiff_t>(localSrcRow) * COLS + localSrcCol;
 
     const short* demCell = g.bin.elev_matrix.data() + off;
 
+    // row/col track GLOBAL position (reported in res.blockRow/blockCol);
+    // demCell independently walks the LOCAL/window buffer via the same
+    // per-step (sr,sc) deltas -- translation-invariant, so both stay in
+    // sync without mixing the two coordinate spaces.
     int    row = srcRow, col = srcCol;
     double dist = 0.0, curvDrop = 0.0;
     double maxTerrainSlope = -1e18;
@@ -234,9 +248,6 @@ RadarLOSDetailedResult RadarEngine::radarLOSDetailed(
     out.summary.blockRow = -1;
     out.summary.blockCol = -1;
 
-    const int COLS = g.conf.grid.cols;
-    const int ROWS = g.conf.grid.rows;
-
     int srcRow, srcCol, tgtRow, tgtCol;
     if(!g.bin.getGridCoords(srcLat, srcLon, srcRow, srcCol) ||
        !g.bin.getGridCoords(tgtLat, tgtLon, tgtRow, tgtCol)){
@@ -245,8 +256,21 @@ RadarLOSDetailedResult RadarEngine::radarLOSDetailed(
         return out;
     }
 
-    short srcTerrain = g.bin.elev_matrix[(size_t)srcRow*COLS+srcCol];
-    short tgtTerrain = g.bin.elev_matrix[(size_t)tgtRow*COLS+tgtCol];
+    // elev_matrix holds only the resident window -- same data_window
+    // translation as radarLOS() above and RadarEngine::compute() in
+    // coverage.cc, not raw row*g.conf.grid.cols+col.
+    const GridWindow& dw = g.bin.data_window;
+    if(!dw.contains(srcRow, srcCol) || !dw.contains(tgtRow, tgtCol)){
+        out.summary.status  = LOSStatus::NO_DATA;
+        out.summary.visible = false;
+        return out;
+    }
+    const int COLS = dw.cols;
+    const int localSrcRow = dw.toLocalRow(srcRow), localSrcCol = dw.toLocalCol(srcCol);
+    const int localTgtRow = dw.toLocalRow(tgtRow), localTgtCol = dw.toLocalCol(tgtCol);
+
+    short srcTerrain = g.bin.elev_matrix[(size_t)localSrcRow*COLS+localSrcCol];
+    short tgtTerrain = g.bin.elev_matrix[(size_t)localTgtRow*COLS+localTgtCol];
     if(srcTerrain < -9000 || tgtTerrain < -9000){
         out.summary.status  = LOSStatus::NO_DATA;
         out.summary.visible = false;
@@ -294,9 +318,11 @@ RadarLOSDetailedResult RadarEngine::radarLOSDetailed(
 
     const std::ptrdiff_t strideR = static_cast<std::ptrdiff_t>(sr)*COLS;
     const std::ptrdiff_t strideC = sc;
-    std::ptrdiff_t off = static_cast<std::ptrdiff_t>(srcRow)*COLS+srcCol;
+    std::ptrdiff_t off = static_cast<std::ptrdiff_t>(localSrcRow)*COLS+localSrcCol;
     const short* demCell = g.bin.elev_matrix.data() + off;
 
+    // row/col track GLOBAL position (reported in out.cells/summary);
+    // demCell independently walks the LOCAL/window buffer -- see radarLOS().
     int    row=srcRow, col=srcCol;
     double dist=0.0, curvDrop=0.0;
     double maxTerrainSlope=-1e18;

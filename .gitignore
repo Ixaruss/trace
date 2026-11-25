@@ -7,10 +7,11 @@ preprocess/maps/new/
 *.png
 *.svg
 *.ppm
-adapt
+trace
 z
 __MACOSX/
 *.xml
 *.tif
 *.tiff
 *.h5
+/output/

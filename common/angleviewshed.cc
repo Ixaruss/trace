@@ -25,9 +25,11 @@
     // Track maxSlope = max(dh/dist) seen so far.
     // Cell visible <=> its slope >= maxSlope.
     //
-    // dist is accumulated correctly:
-    //   axis step     -> RESOLUTION
-    //   diagonal step -> RESOLUTION * sqrt(2)
+    // dist is the TRUE straight-line distance from the source,
+    //   sqrt(drow^2 + dcol^2) * cellM
+    // NOT the accumulated Bresenham path length (axis step = 1 cell,
+    // diagonal step = sqrt(2) cells) — that overestimates by up to ~8%
+    // off-axis and carved the visible area into an octagon.
     //
     // Earth curvature: subtract d²/2R from terrain elevation.
     // At 300km this is ~7km — significant for radar.
@@ -44,7 +46,8 @@
         int maxRadiusCells,
         const short* __restrict__ dem,
         uint8_t*     __restrict__ mask,
-        int COLS, int ROWS, bool use_curvature)
+        int COLS, int ROWS, bool use_curvature,
+        double cellM)   // grid resolution in metres (Bin::cell_m), NOT RESOLUTION
     {
         int adr = std::abs(endRow - srcRow), adc = std::abs(endCol - srcCol);
         int sr  = (srcRow < endRow) ? 1 : -1, sc = (srcCol < endCol) ? 1 : -1;
@@ -59,14 +62,9 @@
         uint8_t*     maskCell = mask + off;
 
         int row = srcRow, col = srcCol;
-        double dist     = 0.0;
         double maxSlope = -1e18;
 
-        // incremental curvature: drop = dist² / 2R
-        // updated as: drop(d+step) = drop(d) + (2d*step + step²) / 2R
-        double curvDrop = 0.0;
-
-        const double maxDist = static_cast<double>(maxRadiusCells) * RESOLUTION;
+        const double maxDist = static_cast<double>(maxRadiusCells) * cellM;
 
         while (true)
         {
@@ -79,16 +77,32 @@
             if (mr) { err -= adc; row += sr; demCell += strideR; maskCell += strideR; }
             if (mc) { err += adr; col += sc; demCell += strideC; maskCell += strideC; }
 
-            // exact step length
-            double step = (mr && mc) ? RESOLUTION * 1.41421356237 : RESOLUTION;
-
-            // incremental curvature update
-            if (use_curvature)
-                curvDrop += (2.0 * dist * step + step * step) * INV_2EARTHR;
-
-            dist += step;
+            // FIX: this used to accumulate the Bresenham PATH LENGTH
+            // (RESOLUTION per axial step, RESOLUTION*sqrt(2) per diagonal)
+            // and treat it as distance from the source. Those are only
+            // equal on the axes and the exact diagonals; in between, the
+            // path is longer than the straight line — by up to ~8% around
+            // 22.5°. Since the range cut-off below is `dist > maxDist`,
+            // rays at intermediate angles terminated early while rays at
+            // the 8 symmetry directions ran full length, carving the
+            // visible area into an OCTAGON instead of a circle. It also
+            // inflated the denominator of the slope term, understating
+            // elevation angles off-axis.
+            //
+            // True straight-line ground distance instead — the same thing
+            // RadarEngine's castRayFast computes, which is why radar
+            // coverage was already circular.
+            const double drow = static_cast<double>(row - srcRow);
+            const double dcol = static_cast<double>(col - srcCol);
+            const double dist = std::sqrt(drow * drow + dcol * dcol) * cellM;
 
             if (dist > maxDist) break;
+
+            // Curvature drop, direct rather than incremental. The old
+            // incremental update telescoped to exactly dist^2/2R, so this
+            // is the same formula — it was only wrong before because the
+            // `dist` feeding it was the path length.
+            const double curvDrop = use_curvature ? (dist * dist) * INV_2EARTHR : 0.0;
 
             short rawElev = *demCell;
             if (rawElev < -9000) break;
@@ -207,7 +221,12 @@
         // ViewshedEngine::prefill().
         prefill();
 
-        // centerX = row, centerY = col
+        // centerX = row, centerY = col — and, as of the windowed-loading
+        // change, both are WINDOW-LOCAL (translated in the ViewshedEngine
+        // constructor), with gridCols/gridRows equal to the window's
+        // dimensions rather than the full grid's. No change needed here:
+        // this arithmetic is correct as long as it stays consistent with
+        // whatever gridCols/centerX/centerY the constructor set.
         size_t srcIdx =
             static_cast<size_t>(centerX) * gridCols + centerY;
 
@@ -230,13 +249,14 @@
         const int    ROWS    = gridRows;
         const int    MRC     = maxRadiusCells;
         const bool   UC      = useEarthCurvature;
+        const double CM      = (double)g.bin.cell_m;   // hoisted: used every ray step
 
         // rays are independent — safe to parallelize
         // each ray only writes cells it visits (no two rays share a cell
         // on the same Bresenham path), and both write value=1 if they do
         #pragma omp parallel for schedule(dynamic, 64) default(none) \
             shared(demPtr, maskPtr, activePerimeter) \
-            firstprivate(N, COLS, ROWS, srcElev, MRC, UC, centerX, centerY)
+            firstprivate(N, COLS, ROWS, srcElev, MRC, UC, CM, centerX, centerY)
         for (size_t i = 0; i < N; ++i)
         {
             // activePerimeter stores (row, col) in (.x, .y) — see
@@ -245,7 +265,7 @@
             int ec = activePerimeter[i].y;
             if (er >= 0 && er < ROWS && ec >= 0 && ec < COLS)
                 castViewshedRay(centerX, centerY, er, ec, srcElev, MRC,
-                                 demPtr, maskPtr, COLS, ROWS, UC);
+                                 demPtr, maskPtr, COLS, ROWS, UC, CM);
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();

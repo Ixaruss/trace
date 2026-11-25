@@ -39,7 +39,12 @@ bool Global::lineOfSight(double lat0, double long0, int h0,
 
     double dx       = x1 - x0;
     double dy       = y1 - y0;
-    double distance = sqrt(dx*dx + dy*dy) / RESOLUTION;
+    // FIX: was `sqrt(dx*dx+dy*dy) / RESOLUTION`. dx/dy are already in CELL
+    // units (x0,y0,x1,y1 come from getGridCoords), so this needs to
+    // MULTIPLY by the cell size to get metres, not divide by it — dividing
+    // produced a dimensionless, meaningless number. Also cell_m (what the
+    // grid was actually built at), not RESOLUTION.
+    double distance = sqrt(dx*dx + dy*dy) * bin.cell_m;
 
     int src_elev  = bin.getElevation(lat0, long0) + h0;
     int targ_elev = bin.getElevation(lat1, long1) + h1;
@@ -56,8 +61,19 @@ bool Global::lineOfSight(double lat0, double long0, int h0,
 
     for (size_t i = 0; i < cells.size(); i++) {
         int lineh = src_elev + (int)(delta * i);
-        int cellh = bin.elev_matrix[
-            (size_t)cells[i].first * conf.grid.cols + cells[i].second];
+        // FIX: was a direct elev_matrix[row*conf.grid.cols+col] index —
+        // that's the FULL-grid layout, only correct by coincidence in
+        // load_full mode (data_window == full grid there). In tiled mode
+        // elev_matrix holds only data_window, so this read went out of
+        // bounds. getElevationRC() indexes via data_window and is correct
+        // in both layouts.
+        int cellh = bin.getElevationRC(cells[i].first, cells[i].second);
+        if (cellh <= -9999) {
+            cerr << "[los] WARN: cell (" << cells[i].first << ", "
+                 << cells[i].second << ") is not resident or has no data — "
+                    "treating as blocking\n";
+            return false;
+        }
         if (cellh > lineh) return false;
     }
 

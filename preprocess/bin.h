@@ -3,6 +3,10 @@
 
 
 #include <functional>
+#include <set>
+#include <cstring>
+#include <climits>
+#include <type_traits>
 #include <gdal_priv.h>
 #include <ogr_spatialref.h>
 #include <iostream>
@@ -12,6 +16,7 @@
 #include <cstdint>
 #include <cmath>
 #include <string>
+#include "tile.h"
 #include "./lib.h"
 #include <png.h>
 // Global constants
@@ -55,7 +60,11 @@ enum LoadOptions {
     ELEVATION,
     SLOPE_
 };
-
+enum OperationType {
+    AOI,
+    UNBOUNDED,
+    FULL
+};
 struct FeasibleGrid {
     std::vector<FeasibleCell> cells;
     int origin_r;    // top-left of AABB in original matrix
@@ -63,6 +72,35 @@ struct FeasibleGrid {
     int height;      // jAABB dimensions in cells
     int width;
 };
+// The sub-rectangle of the global grid currently resident in memory.
+// elev_matrix / slope_matrix are indexed through this, NOT by
+// (r * grid.cols + c) — that only works when the whole grid is loaded.
+struct GridWindow {
+    int r0   = 0;   // global row of the window's first row
+    int c0   = 0;   // global col of the window's first col
+    int rows = 0;
+    int cols = 0;
+
+    bool contains(int r, int c) const {
+        return r >= r0 && r < r0 + rows && c >= c0 && c < c0 + cols;
+    }
+    // caller must check contains() first
+    size_t index(int r, int c) const {
+        return (size_t)(r - r0) * cols + (c - c0);
+    }
+    size_t count() const { return (size_t)rows * cols; }
+    bool   full(int grid_rows, int grid_cols) const {
+        return r0 == 0 && c0 == 0 && rows == grid_rows && cols == grid_cols;
+    }
+
+    int toLocalRow(int global_r) const { return global_r - r0; }
+    int toLocalCol(int global_c) const { return global_c - c0; }
+    int toGlobalRow(int local_r)  const { return local_r + r0; }
+    int toGlobalCol(int local_c)  const { return local_c + c0; }
+
+};
+
+
 class Bin {
     // In-memory data caches
     public: std::vector<uint8_t> vec_matrix;
@@ -85,16 +123,50 @@ class Bin {
     public: bool flag_ib = false;
     public: bool flag_slope = false;
 
-    public: BoundingBox mbr;
+    public: GridWindow    op_window;             // REGION OF INTEREST (feasible scan bounds)
+    public: OperationType op_type = FULL;
+    public: int  GRID_ROWS = 0;                  // full grid dims, from config
+    public: int  GRID_COLS = 0;
+    public: bool window_valid = false;
 
+    // Layout of what is actually RESIDENT in elev_matrix / vec_matrix /
+    // slope_matrix. Tiled mode: identical to op_window. load_full mode: the
+    // WHOLE grid ({0, 0, GRID_ROWS, GRID_COLS}), because the flat bins are
+    // loaded in full regardless of the operation's region.
+    //
+    // ALL matrix indexing goes through data_window, never op_window. The two
+    // differ in load_full mode, and indexing a full-grid buffer through a
+    // sub-window's origin/stride is exactly the bug the scattered
+    // `if (load_full)` branches were each trying to patch around. With
+    // data_window = full grid, index(r,c) reduces to r*GRID_COLS + c — the
+    // legacy layout — so one code path is correct in both modes.
+    public: GridWindow    data_window;
+
+    // Grid resolution in metres as the data was actually BUILT
+    // (cfg.grid.resolution). ALL geometry — ray distances, radii in cells,
+    // lat/lng <-> cell conversion, GeoTIFF georeferencing — must use this.
+    // Never the compile-time RESOLUTION, which is only a fallback when no
+    // config exists and silently disagrees with 30m data.
+    public: int cell_m = 0;
+
+    public: BoundingBox mbr;
+    bool load_full = true;
 
     OGRCoordinateTransformation* poCT;
 
 public:
     Bin() : poCT(nullptr) {
         GDALAllRegister();
-        if(Config::is_available())
-            conf = Config::load();
+        if(Config::is_available()) {
+            conf      = Config::load();
+            load_full = conf.grid.block_size == 0;
+            cell_m    = conf.grid.resolution;   // 0 if unset — treated as invalid below
+        } else {
+            std::cerr << "[bin] ERROR: no config available at construction — "
+                         "grid resolution/layout are unknown. cell_m left at 0; "
+                         "every load path (computeWindow, load_vec/elev/slope) "
+                         "will refuse to run until a config is available.\n";
+        }
         // Instantiate spatial converter from standard Lat/Lng (WGS84) to your local project grid (EPSG:7755)
         OGRSpatialReference oSourceSRS, oTargetSRS;
         oSourceSRS.importFromEPSG(4326);
@@ -113,11 +185,33 @@ public:
     ~Bin() {
         if (poCT) OGRCoordinateTransformation::DestroyCT(poCT);
     }
-    public: void init(std::set<LoadOptions> Options = {});
+    public: void init(std::set<LoadOptions> Options = {},
+                      OperationType type       = FULL,
+                      double        center_lat = 0.0,
+                      double        center_lng = 0.0,
+                      double        range_km   = 0.0);
+
+    // Drop the resident window AND every windowed matrix (elev, slope, vec).
+    // vec_matrix is windowed now, so it can never outlive its window.
+    // `drop_vec` is ignored; kept so existing callers still compile.
+    void unload(bool drop_vec = false);
+
+    // Move to a different region in place. Invalidates every (r,c) and raw
+    // index captured against the previous window — rebuild any engine that
+    // cached gridCols/gridRows or a window-local centre.
+    void reload(std::set<LoadOptions> Options = {},
+                OperationType type       = FULL,
+                double        center_lat = 0.0,
+                double        center_lng = 0.0,
+                double        range_km   = 0.0);
 
     public: static int build_matrix();
 
-    public: static int build_elevation_matrix(bool split = 1);
+    // block_size > 0  -> elev_tiles/ + slope_tiles/ (fixed-size tiles)
+    // block_size == 0 -> single flat elev.bin / slope.bin (pre-tiling format)
+    // block_size < 0  -> (default) take it from cfg.grid.block_size, so the
+    //                    elevation, slope and map layouts always agree.
+    public: static int build_elevation_matrix(bool split = 1, int block_size = -1);
 
     public: static int refresh_road_layer(std::optional<std::string> path);
 
@@ -132,6 +226,8 @@ public:
     public: static bool point_in_polygon(double px, double py, const std::vector<std::pair<double,double>>& proj_poly);
 
     static void write_heatmap_bin_h5 ();
+
+    uint8_t getConstraintRC(int r, int c);
 
     bool getGridCoords(double lat, double lng, int& out_r, int& out_c);
 
@@ -165,9 +261,18 @@ public:
 
     int getTerrianResolution();
 
-    bool lineOfSight(int x1, int y1, int x2, int y2);
-
     void visualize(const std::string& output_path);
+
+    int16_t getElevationRC(int r, int c);
+    float   getSlopeValueRC(int r, int c);
+    float   getSlopeValue(double lat, double lng);
+
+    void ensureLoaded(std::set<LoadOptions> options = {});
+
+    // Resolve the window for an operation type without loading anything.
+    bool computeWindow(OperationType type,
+                       double center_lat, double center_lng, double range_km,
+                       GridWindow& out);
 
     static void get_elevation_color(int16_t alt, uint8_t& r, uint8_t& g, uint8_t& b);
 
