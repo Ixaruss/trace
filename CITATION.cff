@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Trace: terrain-constrained radar deployment planning"
+type: software
+authors:
+  - family-names: "Sharma"
+    given-names: "Aarush"
+    orcid: "https://orcid.org/0009-0006-8821-6640"
+    affiliation: "Meerut Institute of Engineering and Technology, Meerut, India"
+  - family-names: "Saha"
+    given-names: "Babloo"
+    orcid: "https://orcid.org/0000-0002-1814-4841"
+    affiliation: "DRDO - Institute for Systems Studies and Analyses, Delhi, India"
+repository-code: "https://github.com/Ixaruss/trace"
+license: MIT         
+version: "1.0.0"
+date-released: "2026-11-25"
+abstract: "C++ library for terrain-aware radar coverage analysis, with genetic-algorithm multi-radar siting and particle-swarm single-radar siting."
+keywords:
+  - radar siting
+  - terrain
+  - viewshed
+  - genetic algorithm
+  - particle swarm optimization
